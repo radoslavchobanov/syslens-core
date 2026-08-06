@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to package and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,6 +30,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -34,7 +42,7 @@ jobs:
 
       - name: Build Debian package
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ inputs.release_tag || github.ref_name }}
         run: |
           version="${VERSION#v}"
           packaging/debian/build-deb.sh \
@@ -60,5 +68,5 @@ jobs:
       - name: Publish packages
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
         run: gh release create "${TAG}" dist/**/*.deb --generate-notes
