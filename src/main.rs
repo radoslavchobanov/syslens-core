@@ -1,15 +1,18 @@
+use chrono::{Datelike, Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
 use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS, Transport};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::net::UdpSocket;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -19,6 +22,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PROC: &str = "/proc";
 const SYS: &str = "/sys";
 const SECTOR_BYTES: f64 = 512.0;
+const HOUR_SECONDS: f64 = 60.0 * 60.0;
+const DAY_SECONDS: f64 = 24.0 * HOUR_SECONDS;
+const HOURLY_BUCKET_RETENTION: i64 = 24;
+const DAILY_BUCKET_RETENTION: i64 = 30;
+const PROCESS_CPU_RESPONSE_SECONDS: f64 = 120.0;
+static PCI_GPU_MODEL_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static EMBEDDED_GPU_MODEL: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,6 +77,26 @@ enum Command {
     },
     /// Publish snapshots continuously to MQTT.
     Agent(AgentArgs),
+    /// Manage the optional privileged hardware-inventory helper.
+    Inventory {
+        #[command(subcommand)]
+        command: InventoryCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InventoryCommand {
+    /// Install the root-owned DMI probe and daily systemd timer.
+    Enable,
+    /// Stop scheduled hardware inventory collection and clear its cached data.
+    Disable,
+    /// Internal: write the sanitised inventory cache. Used by the system service.
+    Probe {
+        #[arg(long, default_value = "/var/cache/syslens/hardware-inventory.json")]
+        output: PathBuf,
+    },
+    /// Show whether the managed inventory cache is available.
+    Status,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -205,6 +235,293 @@ fn now_epoch() -> f64 {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MetricSample {
+    t: f64,
+    v: f64,
+    #[serde(default)]
+    n: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct WeightedAverage {
+    #[serde(default)]
+    mean: f64,
+    #[serde(default)]
+    n: u64,
+}
+
+impl WeightedAverage {
+    fn observe(&mut self, value: f64) {
+        self.merge(value, 1);
+    }
+
+    fn merge(&mut self, mean: f64, n: u64) {
+        if n == 0 || !finite(mean) {
+            return;
+        }
+        let total = self.n.saturating_add(n);
+        if total == 0 {
+            return;
+        }
+        self.mean += (mean - self.mean) * n as f64 / total as f64;
+        self.n = total;
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MetricHistory {
+    // Legacy five-minute buckets. They are read once and migrated to compact
+    // hourly/daily weighted aggregates on the next snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    samples: Vec<MetricSample>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hourly: BTreeMap<i64, WeightedAverage>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    daily: BTreeMap<i64, WeightedAverage>,
+    #[serde(default)]
+    all_time: WeightedAverage,
+    // Pre-aggregate schema fields retained only for backwards-compatible
+    // deserialization; they are intentionally omitted from new state files.
+    #[serde(default, skip_serializing)]
+    running_n: u64,
+    #[serde(default, skip_serializing)]
+    running_mean: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct TrafficBucket {
+    #[serde(default)]
+    rx_bytes: u64,
+    #[serde(default)]
+    tx_bytes: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct NetworkInterfaceHistory {
+    #[serde(default)]
+    rx_bytes: u64,
+    #[serde(default)]
+    tx_bytes: u64,
+    #[serde(default)]
+    updated_at: f64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct NetworkHistory {
+    #[serde(default)]
+    boot_id: String,
+    #[serde(default)]
+    interfaces: HashMap<String, NetworkInterfaceHistory>,
+    #[serde(default)]
+    daily: BTreeMap<String, TrafficBucket>,
+    #[serde(default)]
+    weekly: BTreeMap<String, TrafficBucket>,
+    #[serde(default)]
+    monthly: BTreeMap<String, TrafficBucket>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProcessHistory {
+    #[serde(default)]
+    cpu_average_percent: f64,
+    #[serde(default)]
+    last_seen: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RamModule {
+    #[serde(default)]
+    slot: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    capacity: Option<String>,
+    #[serde(default)]
+    ram_type: Option<String>,
+    #[serde(default)]
+    nominal_data_rate: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RamInventory {
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    modules: Vec<RamModule>,
+    #[serde(default)]
+    manufacturer: Option<String>,
+    #[serde(default)]
+    ram_type: Option<String>,
+    #[serde(default)]
+    slots_populated: Option<usize>,
+    #[serde(default)]
+    slots_total: Option<usize>,
+    #[serde(default)]
+    nominal_data_rate: Option<String>,
+    #[serde(default)]
+    slot_layout: Option<String>,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct NvmeHealth {
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    remaining_percent: Option<u8>,
+    #[serde(default)]
+    data_written_bytes: Option<u64>,
+    #[serde(default)]
+    critical_warning: Option<String>,
+    #[serde(default)]
+    power_on_hours: Option<u64>,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CollectorState {
+    #[serde(default)]
+    metrics: HashMap<String, MetricHistory>,
+    #[serde(default)]
+    maximums: HashMap<String, f64>,
+    #[serde(default)]
+    network: NetworkHistory,
+    #[serde(default)]
+    processes: HashMap<String, ProcessHistory>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HardwareInventory {
+    schema_version: u8,
+    collected_at: f64,
+    ram: RamInventory,
+    #[serde(default)]
+    disk_health: Option<NvmeHealth>,
+}
+
+fn state_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("syslens-core/state.json")
+}
+
+fn load_state() -> CollectorState {
+    fs::read_to_string(state_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(state: &CollectorState) {
+    let path = state_path();
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+    let temporary = path.with_extension("tmp");
+    let Ok(serialized) = serde_json::to_vec(state) else {
+        return;
+    };
+    if fs::write(&temporary, serialized).is_ok() {
+        let _ = fs::rename(&temporary, &path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn finite(value: f64) -> bool {
+    value.is_finite()
+}
+
+fn time_bucket(timestamp: f64, seconds: f64) -> i64 {
+    (timestamp / seconds).floor() as i64
+}
+
+fn weighted_bucket_average<'a>(buckets: impl Iterator<Item = &'a WeightedAverage>) -> Option<f64> {
+    let mut aggregate = WeightedAverage::default();
+    for bucket in buckets {
+        aggregate.merge(bucket.mean, bucket.n);
+    }
+    (aggregate.n > 0).then_some(round(aggregate.mean, 1))
+}
+
+fn migrate_metric_history(history: &mut MetricHistory) {
+    if history.all_time.n == 0 && history.running_n > 0 {
+        history
+            .all_time
+            .merge(history.running_mean, history.running_n);
+    }
+    let rebuild_all_time_from_samples = history.all_time.n == 0;
+    for sample in history.samples.drain(..).filter(|sample| finite(sample.v)) {
+        let sample_count = sample.n.max(1) as u64;
+        history
+            .hourly
+            .entry(time_bucket(sample.t, HOUR_SECONDS))
+            .or_default()
+            .merge(sample.v, sample_count);
+        history
+            .daily
+            .entry(time_bucket(sample.t, DAY_SECONDS))
+            .or_default()
+            .merge(sample.v, sample_count);
+        if rebuild_all_time_from_samples {
+            history.all_time.merge(sample.v, sample_count);
+        }
+    }
+    history.running_n = 0;
+    history.running_mean = 0.0;
+}
+
+fn metric_averages(state: &mut CollectorState, key: &str, value: Option<f64>) -> Value {
+    let Some(value) = value.filter(|value| finite(*value)) else {
+        return json!({"period1":Value::Null,"period2":Value::Null,"overall":Value::Null});
+    };
+    let now = now_epoch();
+    let history = state.metrics.entry(key.to_owned()).or_default();
+    migrate_metric_history(history);
+    let hour = time_bucket(now, HOUR_SECONDS);
+    let day = time_bucket(now, DAY_SECONDS);
+    history
+        .hourly
+        .retain(|bucket, _| *bucket > hour - HOURLY_BUCKET_RETENTION);
+    history
+        .daily
+        .retain(|bucket, _| *bucket > day - DAILY_BUCKET_RETENTION);
+    history.hourly.entry(hour).or_default().observe(value);
+    history.daily.entry(day).or_default().observe(value);
+    history.all_time.observe(value);
+    json!({
+        "period1":weighted_bucket_average(history.hourly.values()),
+        "period2":weighted_bucket_average(history.daily.values()),
+        "overall":(history.all_time.n > 0).then(|| round(history.all_time.mean,1))
+    })
+}
+
+fn read_boot_id() -> String {
+    read(format!("{PROC}/sys/kernel/random/boot_id")).unwrap_or_default()
+}
+
 fn read(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -292,6 +609,93 @@ fn cpu_info() -> BTreeMap<String, String> {
     result
 }
 
+fn cpu_list_count(list: &str) -> Option<usize> {
+    let mut identifiers = std::collections::BTreeSet::new();
+    for item in list.trim().split(',').filter(|item| !item.is_empty()) {
+        let (first, last) = match item.split_once('-') {
+            Some((first, last)) => (
+                first.trim().parse::<usize>().ok()?,
+                last.trim().parse::<usize>().ok()?,
+            ),
+            None => {
+                let identifier = item.trim().parse::<usize>().ok()?;
+                (identifier, identifier)
+            }
+        };
+        if last < first {
+            return None;
+        }
+        identifiers.extend(first..=last);
+    }
+    (!identifiers.is_empty()).then_some(identifiers.len())
+}
+
+fn sysfs_cpu_count(name: &str) -> Option<usize> {
+    read(format!("{SYS}/devices/system/cpu/{name}")).and_then(|value| cpu_list_count(&value))
+}
+
+fn arm_cpu_model() -> Option<String> {
+    if !matches!(std::env::consts::ARCH, "aarch64" | "arm") {
+        return None;
+    }
+    let root = Path::new(SYS).join("devices/system/cpu");
+    let mut families = BTreeMap::<String, usize>::new();
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("cpu")
+            || !name[3..]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
+            continue;
+        }
+        let Some(compatible) = read(entry.path().join("of_node/compatible")) else {
+            continue;
+        };
+        let Some(family) = compatible
+            .split('\0')
+            .find(|value| value.starts_with("arm,cortex-"))
+        else {
+            continue;
+        };
+        let label = match family {
+            "arm,cortex-a55" => "Cortex-A55".to_owned(),
+            "arm,cortex-a76" => "Cortex-A76".to_owned(),
+            _ => family
+                .strip_prefix("arm,")
+                .map(|value| {
+                    let mut characters = value.chars();
+                    characters
+                        .next()
+                        .map(|first| {
+                            format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
+                        })
+                        .unwrap_or_else(|| "ARM CPU".to_owned())
+                })
+                .unwrap_or_else(|| family.to_owned()),
+        };
+        *families.entry(label).or_default() += 1;
+    }
+    (!families.is_empty()).then(|| {
+        let description = families
+            .into_iter()
+            .map(|(family, count)| format!("{count}\u{00d7} {family}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        format!("ARM {description}")
+    })
+}
+
+fn cpu_vendor(info: &BTreeMap<String, String>) -> Option<String> {
+    match info.get("CPU implementer").map(String::as_str) {
+        Some("0x41") => Some("ARM".to_owned()),
+        _ => info
+            .get("vendor_id")
+            .or_else(|| info.get("CPU implementer"))
+            .cloned(),
+    }
+}
+
 fn current_cpu_mhz() -> Vec<f64> {
     let mut values = Vec::new();
     let root = Path::new(SYS).join("devices/system/cpu");
@@ -326,7 +730,86 @@ fn current_cpu_mhz() -> Vec<f64> {
     values
 }
 
-fn cpu_snapshot(before: &[Vec<u64>], after: &[Vec<u64>]) -> Value {
+#[derive(Clone)]
+struct RaplCounter {
+    path: PathBuf,
+    name: String,
+    energy_uj: u64,
+    max_energy_uj: u64,
+}
+
+fn rapl_counters() -> Vec<RaplCounter> {
+    let mut candidates = Vec::new();
+    for root in [
+        Path::new(SYS).join("class/powercap"),
+        Path::new(SYS).join("devices/virtual/powercap"),
+    ] {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let mut paths = vec![entry.path()];
+            if let Ok(children) = fs::read_dir(entry.path()) {
+                paths.extend(children.flatten().map(|child| child.path()));
+            }
+            for path in paths {
+                let Some(energy_uj) = read_i64(path.join("energy_uj")).filter(|value| *value >= 0)
+                else {
+                    continue;
+                };
+                let name = read(path.join("name")).unwrap_or_default();
+                if !name.to_ascii_lowercase().contains("package") {
+                    continue;
+                }
+                let canonical = fs::canonicalize(&path).unwrap_or(path);
+                candidates.push(RaplCounter {
+                    path: canonical.clone(),
+                    name,
+                    energy_uj: energy_uj as u64,
+                    max_energy_uj: read_i64(canonical.join("max_energy_range_uj"))
+                        .filter(|value| *value > 0)
+                        .map(|value| value as u64)
+                        .unwrap_or(0),
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    candidates.dedup_by(|left, right| left.path == right.path);
+    candidates
+}
+
+fn rapl_power_watts(before: &[RaplCounter], after: &[RaplCounter], elapsed: f64) -> Option<f64> {
+    if elapsed <= 0.0 {
+        return None;
+    }
+    let before_by_path: HashMap<&Path, &RaplCounter> = before
+        .iter()
+        .map(|counter| (counter.path.as_path(), counter))
+        .collect();
+    let mut total_uj = 0_u64;
+    let mut matched = false;
+    for current in after {
+        let Some(previous) = before_by_path.get(current.path.as_path()) else {
+            continue;
+        };
+        let delta = if current.energy_uj >= previous.energy_uj {
+            current.energy_uj - previous.energy_uj
+        } else if current.max_energy_uj > previous.energy_uj {
+            current
+                .max_energy_uj
+                .saturating_sub(previous.energy_uj)
+                .saturating_add(current.energy_uj)
+        } else {
+            continue;
+        };
+        total_uj = total_uj.saturating_add(delta);
+        matched = true;
+    }
+    matched.then(|| round(total_uj as f64 / 1_000_000.0 / elapsed, 2))
+}
+
+fn cpu_snapshot(before: &[Vec<u64>], after: &[Vec<u64>], power_watts: Option<f64>) -> Value {
     let usage = if before.is_empty() || after.is_empty() {
         0.0
     } else {
@@ -340,19 +823,21 @@ fn cpu_snapshot(before: &[Vec<u64>], after: &[Vec<u64>]) -> Value {
         .collect();
     let info = cpu_info();
     let clocks = current_cpu_mhz();
-    let logical = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or_else(|_| per_core.len().max(1));
+    let logical = sysfs_cpu_count("online")
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .ok()
+        })
+        .unwrap_or_else(|| per_core.len().max(1));
     let model = info
         .get("model name")
         .or_else(|| info.get("Hardware"))
         .or_else(|| info.get("Processor"))
         .cloned()
+        .or_else(arm_cpu_model)
         .unwrap_or_else(|| "Unknown CPU".into());
-    let vendor = info
-        .get("vendor_id")
-        .or_else(|| info.get("CPU implementer"))
-        .cloned();
+    let vendor = cpu_vendor(&info);
     let cpufreq = json!({
         "available": !clocks.is_empty(),
         "current_mhz_avg": clocks.iter().copied().reduce(|left, right| left + right).map(|sum| round(sum / clocks.len() as f64, 1)),
@@ -368,11 +853,11 @@ fn cpu_snapshot(before: &[Vec<u64>], after: &[Vec<u64>]) -> Value {
         // CPU feature flags are very large and not rendered by SysLens.  Keep
         // the stable field but omit them so MQTT snapshots fit conservative
         // broker packet limits (including the 10 KiB Mosquitto default here).
-        "logical_cores": logical, "physical_cores": physical_core_count(&info).unwrap_or(logical), "flags": Vec::<String>::new(),
+        "logical_cores": logical, "physical_cores": physical_core_count(&info).or_else(|| sysfs_cpu_count("present")).or_else(|| sysfs_cpu_count("possible")).unwrap_or(logical), "flags": Vec::<String>::new(),
         "microcode": info.get("microcode"), "cache": info.get("cache size"), "usage_percent": usage,
         "per_core_percent": per_core, "current_mhz_avg": cpufreq["current_mhz_avg"],
         "current_mhz_min": cpufreq["current_mhz_min"], "current_mhz_max": cpufreq["current_mhz_max"],
-        "cpufreq": cpufreq, "load_average": load_average(), "power_watts": Value::Null,
+        "cpufreq": cpufreq, "load_average": load_average(), "power_watts": power_watts,
         "usage_average_percent": {"period1": Value::Null, "period2": Value::Null, "overall": Value::Null},
         "power_watts_average": {"period1": Value::Null, "period2": Value::Null, "overall": Value::Null},
         "usage_average_coverage_seconds": {"1d": 0, "1mo": 0, "overall": 0}
@@ -419,6 +904,166 @@ fn load_average() -> Value {
     json!({"1m": values.first().copied(), "5m": values.get(1).copied(), "15m": values.get(2).copied()})
 }
 
+fn usable_dmi_value(value: Option<&String>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "unknown" | "not specified" | "none" | "n/a"
+        ))
+    .then(|| value.to_owned())
+}
+
+fn ram_model_summary(modules: &[RamModule]) -> Option<String> {
+    (!modules.is_empty()).then(|| {
+        if let Some(model) = modules[0].model.as_deref().filter(|model| {
+            modules
+                .iter()
+                .all(|module| module.model.as_deref() == Some(*model))
+        }) {
+            if modules.len() == 1 {
+                model.to_owned()
+            } else {
+                format!("{} × {model}", modules.len())
+            }
+        } else {
+            modules
+                .iter()
+                .map(|module| {
+                    format!(
+                        "{}: {}",
+                        module.slot,
+                        module.model.as_deref().unwrap_or("Not exposed")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        }
+    })
+}
+
+fn dmi_memory_inventory(output: &str) -> Option<RamInventory> {
+    let mut manufacturers = std::collections::BTreeSet::new();
+    let mut types = std::collections::BTreeSet::new();
+    let mut speeds = std::collections::BTreeSet::new();
+    let mut total_slots = 0_usize;
+    let mut populated_slots = 0_usize;
+    let mut modules = Vec::new();
+
+    for block in output.split("\n\n") {
+        if !block.lines().any(|line| line.trim() == "Memory Device") {
+            continue;
+        }
+        total_slots += 1;
+        let fields = block
+            .lines()
+            .filter_map(|line| line.trim().split_once(':'))
+            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let Some(size) = usable_dmi_value(fields.get("Size")) else {
+            continue;
+        };
+        let is_populated = !size.eq_ignore_ascii_case("No Module Installed")
+            && size
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 0);
+        if !is_populated {
+            continue;
+        }
+        populated_slots += 1;
+        let ram_type = usable_dmi_value(fields.get("Type"));
+        let nominal_data_rate = usable_dmi_value(
+            fields
+                .get("Configured Memory Speed")
+                .or_else(|| fields.get("Speed")),
+        );
+        let slot = usable_dmi_value(fields.get("Locator"))
+            .unwrap_or_else(|| format!("DIMM {populated_slots}"));
+        modules.push(RamModule {
+            slot,
+            model: usable_dmi_value(fields.get("Part Number")),
+            capacity: Some(size),
+            ram_type: ram_type.clone(),
+            nominal_data_rate: nominal_data_rate.clone(),
+        });
+        if let Some(value) = usable_dmi_value(fields.get("Manufacturer")) {
+            manufacturers.insert(value);
+        }
+        if let Some(value) = ram_type {
+            types.insert(value);
+        }
+        if let Some(value) = nominal_data_rate {
+            speeds.insert(value);
+        }
+    }
+
+    (total_slots > 0).then(|| RamInventory {
+        available: populated_slots > 0,
+        model: ram_model_summary(&modules),
+        modules,
+        manufacturer: (!manufacturers.is_empty())
+            .then(|| manufacturers.into_iter().collect::<Vec<_>>().join(" / ")),
+        ram_type: (!types.is_empty()).then(|| types.into_iter().collect::<Vec<_>>().join(" / ")),
+        slots_populated: Some(populated_slots),
+        slots_total: Some(total_slots),
+        nominal_data_rate: (!speeds.is_empty())
+            .then(|| speeds.into_iter().collect::<Vec<_>>().join(" / ")),
+        slot_layout: None,
+        source: "dmi".into(),
+        detail: None,
+    })
+}
+
+fn unavailable_ram_inventory() -> RamInventory {
+    let has_dmi = Path::new("/sys/firmware/dmi/tables/DMI").exists();
+    RamInventory {
+        available: false,
+        model: None,
+        modules: Vec::new(),
+        manufacturer: (!has_dmi).then(|| "Board-integrated".into()),
+        ram_type: None,
+        slots_populated: None,
+        slots_total: None,
+        nominal_data_rate: None,
+        slot_layout: (!has_dmi).then(|| "Board-integrated".into()),
+        source: if has_dmi {
+            "dmi-access-required".into()
+        } else {
+            "firmware-unavailable".into()
+        },
+        detail: Some(if has_dmi {
+            "DMI inventory requires the optional read-only helper".into()
+        } else {
+            "Firmware does not expose DIMM inventory".into()
+        }),
+    }
+}
+
+fn hardware_inventory_path() -> PathBuf {
+    PathBuf::from(INVENTORY_CACHE)
+}
+
+fn managed_ram_inventory() -> Option<RamInventory> {
+    fs::read_to_string(hardware_inventory_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HardwareInventory>(&raw).ok())
+        .filter(|inventory| inventory.schema_version == 1)
+        .map(|inventory| inventory.ram)
+}
+
+fn collected_ram_inventory() -> RamInventory {
+    ProcessCommand::new("/usr/sbin/dmidecode")
+        .args(["--type", "17", "--quiet"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| dmi_memory_inventory(&output))
+        .unwrap_or_else(unavailable_ram_inventory)
+}
+
 fn memory_snapshot() -> Value {
     let fields = parse_kv(&format!("{PROC}/meminfo"), ':');
     let kib = |name: &str| {
@@ -437,6 +1082,7 @@ fn memory_snapshot() -> Value {
         "available": total > 0, "total_bytes": total, "used_bytes": used, "free_bytes": kib("MemFree") * 1024,
         "available_bytes": available, "usage_percent": pct(used as f64, total as f64), "buffers_bytes": kib("Buffers") * 1024,
         "cached_bytes": kib("Cached") * 1024, "dirty_bytes": kib("Dirty") * 1024, "slab_bytes": kib("Slab") * 1024,
+        "inventory": managed_ram_inventory().unwrap_or_else(unavailable_ram_inventory),
         "swap": {"available": swap_total > 0, "total_bytes": swap_total, "used_bytes": swap_total.saturating_sub(swap_free), "free_bytes": swap_free, "usage_percent": pct(swap_total.saturating_sub(swap_free) as f64, swap_total as f64), "zswap_bytes": kib("Zswap") * 1024, "zswapped_bytes": kib("Zswapped") * 1024},
         "usage_average_percent": {"period1": Value::Null, "period2": Value::Null, "overall": Value::Null}
     })
@@ -668,6 +1314,17 @@ fn disk_counters() -> HashMap<String, DiskCounters> {
         {
             continue;
         }
+        // `/proc/diskstats` reports both whole drives and their partitions.
+        // Presenting both doubles I/O in the UI and turns one physical disk
+        // into a noisy table, so keep only block-device level readings.
+        if Path::new(SYS)
+            .join("class/block")
+            .join(name)
+            .join("partition")
+            .exists()
+        {
+            continue;
+        }
         let parsed = |index: usize| {
             fields
                 .get(index)
@@ -701,6 +1358,202 @@ fn root_usage() -> Value {
     json!({"mount":"/", "total_bytes":total, "used_bytes":used, "free_bytes":free, "reserved_bytes": total.saturating_sub(used).saturating_sub(free), "usage_percent": pct(used as f64, (used + free) as f64), "usage_percent_total": pct(used as f64, total as f64)})
 }
 
+fn root_block_device() -> Option<PathBuf> {
+    let mounts = read(format!("{PROC}/mounts"))?;
+    let source = mounts
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.get(1) == Some(&"/")).then(|| fields.first().copied())?
+        })
+        .find(|source| source.starts_with("/dev/"))?;
+    let device = Path::new(source).file_name()?.to_str()?;
+    let class_path = Path::new(SYS).join("class/block").join(device);
+    let canonical = fs::canonicalize(&class_path).ok()?;
+    if class_path.join("partition").exists() {
+        canonical.parent().map(Path::to_path_buf)
+    } else {
+        Some(canonical)
+    }
+}
+
+fn disk_kind(name: &str, device: &Path) -> Option<String> {
+    if name.starts_with("nvme") {
+        return Some("NVMe SSD".into());
+    }
+    if name.starts_with("mmcblk") {
+        return Some("eMMC / SD".into());
+    }
+    match read(device.join("queue/rotational")).as_deref() {
+        Some("0") => Some("Solid-state drive".into()),
+        Some("1") => Some("Hard disk drive".into()),
+        _ => None,
+    }
+}
+
+fn pci_link_speed(start: &Path) -> Option<String> {
+    let mut current = fs::canonicalize(start).ok()?;
+    while current.starts_with(SYS) {
+        let speed = read(current.join("current_link_speed"));
+        let width = read(current.join("current_link_width"));
+        if speed.is_some() || width.is_some() {
+            return match (speed, width) {
+                (Some(speed), Some(width)) => Some(format!("{speed} ×{width}")),
+                (Some(speed), None) => Some(speed),
+                (None, Some(width)) => Some(format!("PCIe ×{width}")),
+                (None, None) => None,
+            };
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct NvmePassthruCmd {
+    opcode: u8,
+    flags: u8,
+    rsvd1: u16,
+    nsid: u32,
+    cdw2: u32,
+    cdw3: u32,
+    metadata: u64,
+    addr: u64,
+    metadata_len: u32,
+    data_len: u32,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+    timeout_ms: u32,
+    result: u32,
+}
+
+fn nvme_admin_ioctl() -> libc::c_ulong {
+    const IOC_WRITE: u64 = 1;
+    const IOC_READ: u64 = 2;
+    const IOC_NRSHIFT: u64 = 0;
+    const IOC_TYPESHIFT: u64 = 8;
+    const IOC_SIZESHIFT: u64 = 16;
+    const IOC_DIRSHIFT: u64 = 30;
+    ((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT
+        | (std::mem::size_of::<NvmePassthruCmd>() as u64) << IOC_SIZESHIFT
+        | (b'N' as u64) << IOC_TYPESHIFT
+        | 0x41 << IOC_NRSHIFT) as libc::c_ulong
+}
+
+fn nvme_controller_for_block_device(name: &str) -> Option<&str> {
+    let suffix = name.strip_prefix("nvme")?;
+    let controller_digits = suffix
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    (controller_digits > 0 && suffix.get(controller_digits..)?.starts_with('n'))
+        .then(|| &name[..4 + controller_digits])
+}
+
+fn little_endian_u128(bytes: &[u8]) -> u128 {
+    bytes
+        .iter()
+        .take(16)
+        .enumerate()
+        .fold(0_u128, |value, (index, byte)| {
+            value | ((*byte as u128) << (index * 8))
+        })
+}
+
+fn nvme_critical_warning(warning: u8) -> String {
+    if warning == 0 {
+        return "No warnings".into();
+    }
+    let labels = [
+        (0, "Spare below threshold"),
+        (1, "Temperature critical"),
+        (2, "Reliability degraded"),
+        (3, "Media read-only"),
+        (4, "Volatile memory backup failed"),
+    ];
+    let mut reported = labels
+        .iter()
+        .filter_map(|(bit, label)| (warning & (1 << bit) != 0).then_some(*label))
+        .collect::<Vec<_>>();
+    if warning & !0b1_1111 != 0 {
+        reported.push("Vendor warning");
+    }
+    format!("Warning: {}", reported.join(", "))
+}
+
+fn parse_nvme_smart_log(log: &[u8]) -> Option<NvmeHealth> {
+    (log.len() >= 144).then(|| {
+        let percentage_used = log[5];
+        let written_units = little_endian_u128(&log[48..64]);
+        let written_bytes = written_units.saturating_mul(512_000).min(u64::MAX as u128) as u64;
+        let power_on_hours = little_endian_u128(&log[128..144]).min(u64::MAX as u128) as u64;
+        NvmeHealth {
+            available: true,
+            remaining_percent: Some(100_u8.saturating_sub(percentage_used.min(100))),
+            data_written_bytes: Some(written_bytes),
+            critical_warning: Some(nvme_critical_warning(log[0])),
+            power_on_hours: Some(power_on_hours),
+            source: "nvme-smart".into(),
+            detail: None,
+        }
+    })
+}
+
+fn nvme_health_for_block_device(name: &str) -> Option<NvmeHealth> {
+    let controller = nvme_controller_for_block_device(name)?;
+    let device = fs::OpenOptions::new()
+        .read(true)
+        .open(format!("/dev/{controller}"))
+        .ok()?;
+    let mut log = [0_u8; 512];
+    let mut command = NvmePassthruCmd {
+        opcode: 0x02,
+        nsid: u32::MAX,
+        addr: log.as_mut_ptr() as u64,
+        data_len: log.len() as u32,
+        // Get Log Page: LID 0x02 (SMART / health), NUMD 127 for 512 bytes.
+        cdw10: 0x02 | (127 << 16),
+        ..Default::default()
+    };
+    let result = unsafe { libc::ioctl(device.as_raw_fd(), nvme_admin_ioctl(), &mut command) };
+    (result == 0).then(|| parse_nvme_smart_log(&log)).flatten()
+}
+
+fn managed_disk_health() -> Option<NvmeHealth> {
+    fs::read_to_string(hardware_inventory_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HardwareInventory>(&raw).ok())
+        .filter(|inventory| inventory.schema_version == 1)
+        .and_then(|inventory| inventory.disk_health)
+}
+
+fn root_disk_inventory() -> Value {
+    let Some(device) = root_block_device() else {
+        return json!({"available":false});
+    };
+    let name = device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let hardware = device.join("device");
+    json!({
+        "available":true,
+        "device":name,
+        "model":read(hardware.join("model")),
+        "manufacturer":read(hardware.join("vendor")),
+        "type":disk_kind(name, &device),
+        "link_speed":pci_link_speed(&hardware),
+        "health":managed_disk_health(),
+    })
+}
+
 fn disk_snapshot(
     before: &HashMap<String, DiskCounters>,
     after: &HashMap<String, DiskCounters>,
@@ -725,7 +1578,7 @@ fn disk_snapshot(
         write_total += write;
         devices.push(json!({"name":name, "read_bytes_per_sec":round(read,1), "write_bytes_per_sec":round(write,1), "reads_per_sec":round(current.reads.saturating_sub(previous.reads) as f64/elapsed,1), "writes_per_sec":round(current.writes.saturating_sub(previous.writes) as f64/elapsed,1), "busy_percent":pct(current.io_ms.saturating_sub(previous.io_ms) as f64, elapsed * 1000.0)}));
     }
-    json!({"available":!devices.is_empty(),"root":root_usage(),"total_read_bytes_per_sec":round(read_total,1),"total_write_bytes_per_sec":round(write_total,1),"devices":devices})
+    json!({"available":!devices.is_empty(),"root":root_usage(),"inventory":root_disk_inventory(),"total_read_bytes_per_sec":round(read_total,1),"total_write_bytes_per_sec":round(write_total,1),"devices":devices})
 }
 
 #[derive(Clone, Default)]
@@ -825,6 +1678,102 @@ fn network_snapshot(
     json!({"available":!interfaces.is_empty(),"interfaces":interfaces,"traffic_interfaces":traffic,"interface_count":after.len(),"virtual_interface_count":after.keys().filter(|name| is_virtual_interface(name)).count(),"primary":primary,"download_bytes_per_sec":round(rx_total,1),"upload_bytes_per_sec":round(tx_total,1),"local_ipv4":local_ipv4(),"global_ipv4":{"available":false,"address":Value::Null},"totals":{"daily":{},"weekly":{},"monthly":{}},"download_average":{"period1":Value::Null,"period2":Value::Null,"overall":Value::Null},"upload_average":{"period1":Value::Null,"period2":Value::Null,"overall":Value::Null}})
 }
 
+fn driver_name(device: &Path) -> Option<String> {
+    read(device.join("uevent")).and_then(|uevent| {
+        uevent
+            .lines()
+            .find_map(|line| line.strip_prefix("DRIVER=").map(str::to_owned))
+    })
+}
+
+fn pci_gpu_model(device: &Path) -> Option<String> {
+    let slot = read(device.join("uevent")).and_then(|uevent| {
+        uevent
+            .lines()
+            .find_map(|line| line.strip_prefix("PCI_SLOT_NAME=").map(str::to_owned))
+    })?;
+    let cache = PCI_GPU_MODEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(model) = cache.get(&slot)
+    {
+        return model.clone();
+    }
+    let model = ProcessCommand::new("lspci")
+        .args(["-nn", "-s", &slot])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| output.lines().next().map(str::to_owned))
+        .and_then(|line| line.split_once(": ").map(|(_, value)| value.to_owned()))
+        .map(|value| {
+            value
+                .rsplit_once(" [")
+                .map(|(model, _)| model)
+                .unwrap_or(&value)
+                .split(" (rev ")
+                .next()
+                .unwrap_or(&value)
+                .trim()
+                .to_owned()
+        })
+        .filter(|model| !model.is_empty());
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(slot, model.clone());
+    }
+    model
+}
+
+fn embedded_gpu_model() -> Option<String> {
+    EMBEDDED_GPU_MODEL
+        .get_or_init(|| {
+            let compatible = fs::read("/proc/device-tree/compatible").ok()?;
+            let mut entries = compatible
+                .split(|byte| *byte == 0)
+                .filter_map(|value| std::str::from_utf8(value).ok());
+            entries
+                .any(|entry| matches!(entry, "rockchip,rk3588" | "rockchip,rk3588s"))
+                .then(|| "ARM Mali-G610 MP4".into())
+        })
+        .clone()
+}
+
+fn gpu_model(device: &Path) -> Option<String> {
+    pci_gpu_model(device).or_else(embedded_gpu_model)
+}
+
+fn active_dpm_clock_mhz(content: &str) -> Option<f64> {
+    content.lines().find_map(|line| {
+        line.contains('*').then(|| {
+            line.split_whitespace().find_map(|token| {
+                token
+                    .strip_suffix("Mhz")
+                    .or_else(|| token.strip_suffix("MHz"))
+                    .and_then(|value| value.parse::<f64>().ok())
+            })
+        })?
+    })
+}
+
+fn gpu_hwmon_frequency_mhz(device: &Path) -> Option<f64> {
+    fs::read_dir(device.join("hwmon"))
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            read_f64(entry.path().join("freq1_input")).map(|hertz| hertz / 1_000_000.0)
+        })
+}
+
+fn gpu_clock_mhz(device: &Path, dpm_file: &str) -> Option<f64> {
+    read(device.join(dpm_file))
+        .and_then(|content| active_dpm_clock_mhz(&content))
+        .or_else(|| {
+            (dpm_file == "pp_dpm_sclk")
+                .then(|| gpu_hwmon_frequency_mhz(device))
+                .flatten()
+        })
+}
+
 fn gpu_snapshot() -> Value {
     let mut devices = Vec::new();
     let root = Path::new(SYS).join("class/drm");
@@ -851,13 +1800,13 @@ fn gpu_snapshot() -> Value {
                         .and_then(|value| value.lines().next().map(str::to_owned))
                 })
                 .unwrap_or_else(|| name.clone());
-            devices.push(json!({"name":name,"vendor_id":read(device.join("vendor")),"device_id":read(device.join("device")),"label":label,"usage_percent":usage.map(|value|round(value,1)),"vram_used_bytes":used,"vram_total_bytes":total,"vram_usage_percent":match (used,total) {(Some(used),Some(total)) => pct(used as f64,total as f64), _ => None}}));
+            devices.push(json!({"name":name,"model":gpu_model(&device),"driver":driver_name(&device),"vendor_id":read(device.join("vendor")),"device_id":read(device.join("device")),"label":label,"core_clock_mhz":gpu_clock_mhz(&device,"pp_dpm_sclk").map(|value|round(value,0)),"vram_clock_mhz":gpu_clock_mhz(&device,"pp_dpm_mclk").map(|value|round(value,0)),"usage_percent":usage.map(|value|round(value,1)),"vram_used_bytes":used,"vram_total_bytes":total,"vram_usage_percent":match (used,total) {(Some(used),Some(total)) => pct(used as f64,total as f64), _ => None}}));
         }
     }
     json!({"available":!devices.is_empty(),"devices":devices,"usage_average_percent":{"period1":Value::Null,"period2":Value::Null,"overall":Value::Null},"vram_average_percent":{"period1":Value::Null,"period2":Value::Null,"overall":Value::Null}})
 }
 
-fn power_snapshot() -> Value {
+fn power_snapshot(cpu_power_watts: Option<f64>, rapl: &[RaplCounter]) -> Value {
     let mut supplies = Vec::new();
     let root = Path::new(SYS).join("class/power_supply");
     if let Ok(entries) = fs::read_dir(root) {
@@ -869,7 +1818,11 @@ fn power_snapshot() -> Value {
             supplies.push(json!({"name":name,"type":kind,"status":read(path.join("status")),"capacity_percent":read_f64(path.join("capacity")),"power_watts":power.map(|value|round(value,3)),"energy_now_wh":read_f64(path.join("energy_now")).map(|value|round(value/1_000_000.0,3)),"energy_full_wh":read_f64(path.join("energy_full")).map(|value|round(value/1_000_000.0,3)),"voltage_volts":read_f64(path.join("voltage_now")).map(|value|round(value/1_000_000.0,3)),"cycle_count":read_i64(path.join("cycle_count")),"technology":read(path.join("technology")),"model":read(path.join("model_name"))}));
         }
     }
-    json!({"available":!supplies.is_empty(),"supplies":supplies,"rapl":[]})
+    json!({
+        "available": !supplies.is_empty() || cpu_power_watts.is_some(),
+        "supplies": supplies,
+        "rapl": rapl.iter().map(|counter| json!({"name":counter.name,"power_watts":cpu_power_watts})).collect::<Vec<_>>()
+    })
 }
 
 fn battery_snapshot(power: &Value) -> Value {
@@ -888,6 +1841,7 @@ fn battery_snapshot(power: &Value) -> Value {
 #[derive(Clone, Default)]
 struct ProcessCounters {
     ticks: u64,
+    start_ticks: u64,
     rss_bytes: u64,
     name: String,
 }
@@ -906,10 +1860,16 @@ fn process_counters() -> HashMap<u32, ProcessCounters> {
         let Some(stat) = read(entry.path().join("stat")) else {
             continue;
         };
+        let Some(open) = stat.find('(') else {
+            continue;
+        };
         let Some(close) = stat.rfind(')') else {
             continue;
         };
-        let process_name = stat.get(1..close).unwrap_or_default().to_owned();
+        let process_name = stat
+            .get(open.saturating_add(1)..close)
+            .unwrap_or_default()
+            .to_owned();
         let fields: Vec<&str> = stat
             .get(close + 2..)
             .unwrap_or_default()
@@ -929,10 +1889,15 @@ fn process_counters() -> HashMap<u32, ProcessCounters> {
             .get(21)
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or_default();
+        let start_ticks = fields
+            .get(19)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
         processes.insert(
             pid,
             ProcessCounters {
                 ticks,
+                start_ticks,
                 rss_bytes: rss_pages.saturating_mul(page_size),
                 name: process_name,
             },
@@ -946,24 +1911,60 @@ fn process_snapshot(
     after: &HashMap<u32, ProcessCounters>,
     elapsed: f64,
     limit: usize,
+    state: &mut CollectorState,
 ) -> Value {
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
-    let mut top: Vec<Value> = after.iter().map(|(pid, current)| {
-        let previous = before.get(pid).unwrap_or(current);
-        let cpu = current.ticks.saturating_sub(previous.ticks) as f64 / ticks_per_second / elapsed * 100.0;
-        json!({"pid":pid,"name":current.name,"cpu_percent":round(cpu,1),"rss_bytes":current.rss_bytes})
-    }).collect();
-    top.sort_by(|left, right| {
-        right
-            .get("cpu_percent")
+    let now = now_epoch();
+    let mut top: Vec<Value> = after
+        .iter()
+        .map(|(pid, current)| {
+            let previous = before
+                .get(pid)
+                .filter(|previous| previous.start_ticks == current.start_ticks)
+                .unwrap_or(current);
+            let cpu = current.ticks.saturating_sub(previous.ticks) as f64 / ticks_per_second
+                / elapsed
+                * 100.0;
+            let key = format!("{pid}:{}", current.start_ticks);
+            let history = state.processes.entry(key).or_default();
+            let average = if history.last_seen > 0.0 && now > history.last_seen {
+                let interval = (now - history.last_seen).min(300.0);
+                let alpha = 1.0 - (-interval / PROCESS_CPU_RESPONSE_SECONDS).exp();
+                history.cpu_average_percent + alpha * (cpu - history.cpu_average_percent)
+            } else {
+                cpu
+            };
+            history.cpu_average_percent = average.max(0.0);
+            history.last_seen = now;
+            json!({"pid":pid,"name":current.name,"cpu_percent":round(cpu,1),"cpu_average_percent":round(history.cpu_average_percent,1),"rss_bytes":current.rss_bytes})
+        })
+        .collect();
+    state
+        .processes
+        .retain(|_, history| now - history.last_seen <= 600.0);
+    // Use the same (smoothed) CPU value on both sides of the comparison.
+    // A raw/smoothed mix is not transitive and can make Rust's sort panic.
+    // Quantising to the value actually published (one decimal place) also
+    // gives a stable order for brief process spikes.
+    top.sort_by_key(|process| {
+        let cpu = process
+            .get("cpu_average_percent")
             .and_then(Value::as_f64)
-            .unwrap_or_default()
-            .total_cmp(
-                &left
-                    .get("cpu_percent")
-                    .and_then(Value::as_f64)
-                    .unwrap_or_default(),
-            )
+            .filter(|value| value.is_finite())
+            .unwrap_or_default();
+        let memory = process
+            .get("rss_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let pid = process
+            .get("pid")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        (
+            std::cmp::Reverse((cpu * 10.0).round() as i64),
+            std::cmp::Reverse(memory),
+            pid,
+        )
     });
     top.truncate(limit);
     json!({"available":true,"count":after.len(),"top":top})
@@ -977,12 +1978,183 @@ fn uptime_snapshot() -> Value {
         .ok()
         .and_then(|name| name.into_string().ok())
         .unwrap_or_else(|| "unknown".into());
-    json!({"seconds":round(seconds,1),"boot_time_epoch":round(now_epoch()-seconds,1),"kernel":read(format!("{PROC}/sys/kernel/osrelease")),"hostname":hostname,"os":std::env::consts::OS})
+    let os = read("/etc/os-release")
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("PRETTY_NAME=")
+                    .map(|value| value.trim_matches('"').to_owned())
+            })
+        })
+        .unwrap_or_else(|| std::env::consts::OS.to_owned());
+    json!({"seconds":round(seconds,1),"boot_time_epoch":round(now_epoch()-seconds,1),"kernel":read(format!("{PROC}/sys/kernel/osrelease")),"hostname":hostname,"os":os,"architecture":std::env::consts::ARCH})
 }
 
-fn snapshot(args: &SnapshotArgs) -> Value {
+fn period_key(timestamp: f64, period: &str) -> String {
+    let date = Local
+        .timestamp_opt(timestamp as i64, 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    match period {
+        "daily" => format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day()),
+        "weekly" => {
+            let week = date.iso_week();
+            format!("{}-W{:02}", week.year(), week.week())
+        }
+        "monthly" => format!("{:04}-{:02}", date.year(), date.month()),
+        _ => String::new(),
+    }
+}
+
+fn trim_period(periods: &mut BTreeMap<String, TrafficBucket>, keep: usize) {
+    while periods.len() > keep {
+        let Some(oldest) = periods.keys().next().cloned() else {
+            break;
+        };
+        periods.remove(&oldest);
+    }
+}
+
+fn total_with_average(periods: &BTreeMap<String, TrafficBucket>, key: &str) -> Value {
+    let current = periods.get(key).cloned().unwrap_or_default();
+    let historical: Vec<&TrafficBucket> = periods
+        .iter()
+        .filter(|(period_key, _)| period_key.as_str() != key)
+        .map(|(_, value)| value)
+        .collect();
+    let average = |field: fn(&TrafficBucket) -> u64| {
+        (!historical.is_empty()).then(|| {
+            historical.iter().map(|value| field(value)).sum::<u64>() / historical.len() as u64
+        })
+    };
+    json!({"key":key,"rx_bytes":current.rx_bytes,"tx_bytes":current.tx_bytes,"rx_avg_bytes":average(|bucket|bucket.rx_bytes),"tx_avg_bytes":average(|bucket|bucket.tx_bytes)})
+}
+
+fn update_network_totals(
+    state: &mut CollectorState,
+    counters: &HashMap<String, NetCounters>,
+) -> Value {
+    let now = now_epoch();
+    let boot_id = read_boot_id();
+    let history = &mut state.network;
+    if history.boot_id != boot_id {
+        history.interfaces.clear();
+        history.boot_id = boot_id;
+    }
+    for (name, current) in counters {
+        if is_virtual_interface(name) {
+            continue;
+        }
+        match history.interfaces.get(name) {
+            Some(previous)
+                if current.rx >= previous.rx_bytes && current.tx >= previous.tx_bytes =>
+            {
+                let rx_delta = current.rx - previous.rx_bytes;
+                let tx_delta = current.tx - previous.tx_bytes;
+                // Collection happens every few seconds. Assigning a boundary
+                // straddling delta to its current period keeps history compact
+                // while introducing at most one poll interval of drift.
+                for (period, buckets) in [
+                    ("daily", &mut history.daily),
+                    ("weekly", &mut history.weekly),
+                    ("monthly", &mut history.monthly),
+                ] {
+                    let bucket = buckets.entry(period_key(now, period)).or_default();
+                    bucket.rx_bytes = bucket.rx_bytes.saturating_add(rx_delta);
+                    bucket.tx_bytes = bucket.tx_bytes.saturating_add(tx_delta);
+                }
+            }
+            _ => {}
+        }
+        history.interfaces.insert(
+            name.clone(),
+            NetworkInterfaceHistory {
+                rx_bytes: current.rx,
+                tx_bytes: current.tx,
+                updated_at: now,
+            },
+        );
+    }
+    history
+        .interfaces
+        .retain(|name, _| counters.contains_key(name));
+    let daily_key = period_key(now, "daily");
+    let weekly_key = period_key(now, "weekly");
+    let monthly_key = period_key(now, "monthly");
+    history.daily.entry(daily_key.clone()).or_default();
+    history.weekly.entry(weekly_key.clone()).or_default();
+    history.monthly.entry(monthly_key.clone()).or_default();
+    trim_period(&mut history.daily, 45);
+    trim_period(&mut history.weekly, 16);
+    trim_period(&mut history.monthly, 18);
+    json!({"daily":total_with_average(&history.daily,&daily_key),"weekly":total_with_average(&history.weekly,&weekly_key),"monthly":total_with_average(&history.monthly,&monthly_key)})
+}
+
+fn number_at(data: &Value, pointer: &str) -> Option<f64> {
+    data.pointer(pointer)
+        .and_then(Value::as_f64)
+        .filter(|value| finite(*value))
+}
+
+fn enrich_history(
+    snapshot: &mut Value,
+    state: &mut CollectorState,
+    net_counters: &HashMap<String, NetCounters>,
+) {
+    let cpu_usage = number_at(snapshot, "/cpu/usage_percent");
+    let cpu_power = number_at(snapshot, "/cpu/power_watts");
+    let memory = number_at(snapshot, "/memory/usage_percent");
+    let swap = number_at(snapshot, "/memory/swap/usage_percent");
+    let gpu = number_at(snapshot, "/gpu/devices/0/usage_percent");
+    let vram = number_at(snapshot, "/gpu/devices/0/vram_usage_percent");
+    let cpu_temp = number_at(snapshot, "/temperature/cpu_current_celsius");
+    let gpu_temp = number_at(snapshot, "/temperature/hardware/gpu/current_celsius");
+    let storage_temp = number_at(snapshot, "/temperature/hardware/storage/current_celsius");
+    let download = number_at(snapshot, "/network/download_bytes_per_sec");
+    let upload = number_at(snapshot, "/network/upload_bytes_per_sec");
+    let disk_read = number_at(snapshot, "/disk/total_read_bytes_per_sec");
+    let disk_write = number_at(snapshot, "/disk/total_write_bytes_per_sec");
+
+    snapshot["cpu"]["usage_average_percent"] = metric_averages(state, "cpu_usage", cpu_usage);
+    snapshot["cpu"]["power_watts_average"] = metric_averages(state, "cpu_power", cpu_power);
+    snapshot["memory"]["usage_average_percent"] = metric_averages(state, "memory_usage", memory);
+    snapshot["memory"]["swap"]["usage_average_percent"] =
+        metric_averages(state, "swap_usage", swap);
+    snapshot["gpu"]["usage_average_percent"] = metric_averages(state, "gpu_usage", gpu);
+    snapshot["gpu"]["vram_average_percent"] = metric_averages(state, "vram_usage", vram);
+    snapshot["network"]["download_average"] = metric_averages(state, "network_download", download);
+    snapshot["network"]["upload_average"] = metric_averages(state, "network_upload", upload);
+    snapshot["disk"]["read_average"] = metric_averages(state, "disk_read", disk_read);
+    snapshot["disk"]["write_average"] = metric_averages(state, "disk_write", disk_write);
+    snapshot["network"]["totals"] = update_network_totals(state, net_counters);
+
+    for (metric_key, pointer, current) in [
+        ("cpu_temperature", "/temperature", cpu_temp),
+        ("gpu_temperature", "/temperature/hardware/gpu", gpu_temp),
+        (
+            "storage_temperature",
+            "/temperature/hardware/storage",
+            storage_temp,
+        ),
+    ] {
+        let averages = metric_averages(state, metric_key, current);
+        if let Some(current) = current {
+            let maximum = state
+                .maximums
+                .entry(metric_key.to_owned())
+                .or_insert(current);
+            *maximum = maximum.max(current);
+            if let Some(target) = snapshot.pointer_mut(pointer) {
+                target["average_celsius"] = averages["overall"].clone();
+                target["maximum_celsius"] = json!(round(*maximum, 1));
+            }
+        }
+    }
+}
+
+fn snapshot(args: &SnapshotArgs, state: &mut CollectorState) -> Value {
     let window = args.sample_window.clamp(0.05, 2.0);
     let cpu_before = cpu_times();
+    let rapl_before = rapl_counters();
     let disk_before = disk_counters();
     let net_before = net_counters();
     let process_before = process_counters();
@@ -990,16 +2162,20 @@ fn snapshot(args: &SnapshotArgs) -> Value {
     thread::sleep(Duration::from_secs_f64(window));
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     let cpu_after = cpu_times();
+    let rapl_after = rapl_counters();
     let disk_after = disk_counters();
     let net_after = net_counters();
     let process_after = process_counters();
-    let power = power_snapshot();
-    json!({
+    let cpu_power_watts = rapl_power_watts(&rapl_before, &rapl_after, elapsed);
+    let power = power_snapshot(cpu_power_watts, &rapl_after);
+    let mut snapshot = json!({
         "schema_version":1,"timestamp":now_epoch(),"sample_window_seconds":round(elapsed,3),"uptime":uptime_snapshot(),
-        "cpu":cpu_snapshot(&cpu_before,&cpu_after),"memory":memory_snapshot(),"temperature":temperature_snapshot(),
+        "cpu":cpu_snapshot(&cpu_before,&cpu_after,cpu_power_watts),"memory":memory_snapshot(),"temperature":temperature_snapshot(),
         "power":power,"battery":battery_snapshot(&power),"gpu":gpu_snapshot(),"disk":disk_snapshot(&disk_before,&disk_after,elapsed),
-        "network":network_snapshot(&net_before,&net_after,elapsed),"processes":process_snapshot(&process_before,&process_after,elapsed,args.process_limit)
-    })
+        "network":network_snapshot(&net_before,&net_after,elapsed),"processes":process_snapshot(&process_before,&process_after,elapsed,args.process_limit,state)
+    });
+    enrich_history(&mut snapshot, state, &net_after);
+    snapshot
 }
 
 fn default_config_path() -> PathBuf {
@@ -1196,8 +2372,9 @@ fn publish_snapshot(
     client: &Client,
     config: &RuntimeConfig,
     args: &SnapshotArgs,
+    state: &mut CollectorState,
 ) -> Result<(), String> {
-    let mut data = snapshot(args);
+    let mut data = snapshot(args, state);
     data["source"] = json!({"host_id":config.agent.host_id,"hostname":hostname::get().ok().and_then(|name|name.into_string().ok()).unwrap_or_else(||"unknown".into()),"transport":"mqtt"});
     publish(
         client,
@@ -1229,10 +2406,16 @@ fn run_agent(config: RuntimeConfig, once: bool) -> Result<(), String> {
         sample_window: config.agent.sample_window_seconds,
         process_limit: config.collection.process_limit,
     };
+    let mut state = load_state();
+    let mut last_state_save = std::time::Instant::now() - Duration::from_secs(60);
     let mut next = std::time::Instant::now();
     let result = loop {
-        if let Err(error) = publish_snapshot(&client, &config, &args) {
+        if let Err(error) = publish_snapshot(&client, &config, &args, &mut state) {
             break Err(error);
+        }
+        if once || last_state_save.elapsed() >= Duration::from_secs(60) {
+            save_state(&state);
+            last_state_save = std::time::Instant::now();
         }
         if once {
             break Ok(());
@@ -1314,8 +2497,209 @@ fn write_private(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+const INVENTORY_EXECUTABLE: &str = "/usr/local/libexec/syslens/syslens-inventory";
+const INVENTORY_CACHE: &str = "/var/cache/syslens/hardware-inventory.json";
+const INVENTORY_SERVICE: &str = "[Unit]\nDescription=SysLens hardware inventory probe\n\n[Service]\nType=oneshot\nExecStart=/usr/local/libexec/syslens/syslens-inventory inventory probe --output /var/cache/syslens/hardware-inventory.json\nUMask=0022\nCacheDirectory=syslens\nNoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nProtectSystem=strict\n\n";
+const INVENTORY_TIMER: &str = "[Unit]\nDescription=Refresh SysLens hardware inventory\n\n[Timer]\nOnBootSec=90s\nOnUnitActiveSec=15min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n";
+
+fn root_nvme_health() -> Option<NvmeHealth> {
+    let device = root_block_device()?;
+    let name = device.file_name()?.to_str()?;
+    nvme_health_for_block_device(name)
+}
+
+fn write_inventory_cache(output: &Path) -> Result<(), String> {
+    let ram = collected_ram_inventory();
+    let document = HardwareInventory {
+        schema_version: 1,
+        collected_at: now_epoch(),
+        ram,
+        disk_health: root_nvme_health(),
+    };
+    let rendered = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+    let parent = output.parent().ok_or_else(|| {
+        format!(
+            "inventory output {} has no parent directory",
+            output.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    let temporary = output.with_extension("tmp");
+    fs::write(&temporary, rendered).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))
+            .map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, output).map_err(|error| error.to_string())
+}
+
+fn run_sudo(arguments: &[String]) -> Result<(), String> {
+    let status = ProcessCommand::new("sudo")
+        .args(arguments)
+        .status()
+        .map_err(|error| format!("could not start sudo: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("sudo {} failed", arguments.join(" ")))
+}
+
+fn run_inventory_enable() -> Result<(), String> {
+    let has_dmi = Path::new("/sys/firmware/dmi/tables/DMI").exists();
+    let has_root_nvme = root_block_device()
+        .and_then(|device| {
+            device
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|name| nvme_controller_for_block_device(&name).is_some());
+    if !has_dmi && !has_root_nvme {
+        println!(
+            "This host exposes neither DMI RAM data nor an NVMe root disk for managed hardware inventory."
+        );
+        return Ok(());
+    }
+    if has_dmi && !Path::new("/usr/sbin/dmidecode").exists() && !has_root_nvme {
+        return Err("dmidecode is required for detailed RAM inventory but is not installed".into());
+    }
+    println!(
+        "SysLens will request your system password once to install its root-owned, read-only hardware inventory timer."
+    );
+    run_sudo(&["-v".into()])?;
+
+    let staging = std::env::temp_dir().join(format!("syslens-inventory-{}", std::process::id()));
+    fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    let service_path = staging.join("syslens-hardware-inventory.service");
+    let timer_path = staging.join("syslens-hardware-inventory.timer");
+    let preparation = (|| -> Result<(), String> {
+        fs::write(&service_path, INVENTORY_SERVICE).map_err(|error| error.to_string())?;
+        fs::write(&timer_path, INVENTORY_TIMER).map_err(|error| error.to_string())?;
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let install = |source: &Path, destination: &str, mode: &str| {
+            run_sudo(&[
+                "install".into(),
+                "-D".into(),
+                "-o".into(),
+                "root".into(),
+                "-g".into(),
+                "root".into(),
+                "-m".into(),
+                mode.into(),
+                source.display().to_string(),
+                destination.into(),
+            ])
+        };
+        install(&executable, INVENTORY_EXECUTABLE, "755")?;
+        install(
+            &service_path,
+            "/etc/systemd/system/syslens-hardware-inventory.service",
+            "644",
+        )?;
+        install(
+            &timer_path,
+            "/etc/systemd/system/syslens-hardware-inventory.timer",
+            "644",
+        )?;
+        run_sudo(&["systemctl".into(), "daemon-reload".into()])?;
+        run_sudo(&[
+            "systemctl".into(),
+            "enable".into(),
+            "--now".into(),
+            "syslens-hardware-inventory.timer".into(),
+        ])?;
+        run_sudo(&[
+            "systemctl".into(),
+            "start".into(),
+            "syslens-hardware-inventory.service".into(),
+        ])
+    })();
+    let _ = fs::remove_dir_all(staging);
+    preparation?;
+    println!(
+        "Managed hardware inventory is enabled. SysLens refreshes RAM details and NVMe health every 15 minutes without further passwords."
+    );
+    Ok(())
+}
+
+fn run_inventory_disable() -> Result<(), String> {
+    let timer_path = Path::new("/etc/systemd/system/syslens-hardware-inventory.timer");
+    if !timer_path.exists() {
+        println!("Managed hardware inventory is not enabled on this host.");
+        return Ok(());
+    }
+
+    println!(
+        "SysLens will request your system password once to stop managed hardware inventory and clear its cached data."
+    );
+    run_sudo(&["-v".into()])?;
+    run_sudo(&[
+        "systemctl".into(),
+        "disable".into(),
+        "--now".into(),
+        "syslens-hardware-inventory.timer".into(),
+    ])?;
+    run_sudo(&["rm".into(), "-f".into(), INVENTORY_CACHE.into()])?;
+    run_sudo(&[
+        "systemctl".into(),
+        "reset-failed".into(),
+        "syslens-hardware-inventory.service".into(),
+    ])?;
+    println!("Managed hardware inventory is disabled and its cached data was removed.");
+    Ok(())
+}
+
+fn run_inventory_status() -> Result<(), String> {
+    match fs::read_to_string(hardware_inventory_path()) {
+        Ok(raw) => {
+            let inventory: HardwareInventory = serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid managed hardware inventory: {error}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inventory).map_err(|error| error.to_string())?
+            );
+        }
+        Err(_) => println!("No managed hardware inventory has been collected on this host."),
+    }
+    Ok(())
+}
+
 fn escape_toml(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn offer_hardware_inventory_setup() -> Result<(), String> {
+    let has_dmi = Path::new("/sys/firmware/dmi/tables/DMI").exists();
+    let has_root_nvme = root_block_device()
+        .and_then(|device| {
+            device
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|name| nvme_controller_for_block_device(&name).is_some());
+    if (!has_dmi && !has_root_nvme)
+        || !prompt_yes_no("Enable managed RAM and NVMe hardware inventory", true)?
+    {
+        return Ok(());
+    }
+    match run_inventory_enable() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!(
+                "Hardware inventory was not enabled: {error}\nYou can retry later with `syslens inventory enable`."
+            );
+            Ok(())
+        }
+    }
 }
 
 fn run_setup(target: PathBuf) -> Result<(), String> {
@@ -1323,6 +2707,7 @@ fn run_setup(target: PathBuf) -> Result<(), String> {
         "SysLens setup\n\nLocal Plasma monitoring needs no configuration. MQTT mode publishes snapshots for Home Assistant or other receivers."
     );
     if !prompt_yes_no("Configure MQTT publishing", true)? {
+        offer_hardware_inventory_setup()?;
         println!("No configuration written. Use `syslens snapshot --json` for local telemetry.");
         return Ok(());
     }
@@ -1376,6 +2761,7 @@ fn run_setup(target: PathBuf) -> Result<(), String> {
             &format!("SYSLENS_MQTT_PASSWORD={}\n", password.replace('\n', "")),
         )?;
     }
+    offer_hardware_inventory_setup()?;
     let config = load_config(&target)?;
     println!(
         "\nConfiguration written to {}\nTopics: {}/{{meta,state,availability}}\n\nNext steps:\n  syslens --config {} --validate-config\n  syslens --config {} --publish --once\n  syslens --config {} --publish",
@@ -1389,7 +2775,9 @@ fn run_setup(target: PathBuf) -> Result<(), String> {
 }
 
 fn print_snapshot(args: &SnapshotArgs, pretty: bool) -> Result<(), String> {
-    let data = snapshot(args);
+    let mut state = load_state();
+    let data = snapshot(args, &mut state);
+    save_state(&state);
     let rendered = if pretty {
         serde_json::to_string_pretty(&data)
     } else {
@@ -1408,6 +2796,12 @@ fn main() -> ExitCode {
         Some(Command::Agent(agent)) => {
             load_config(&agent.config).and_then(|config| run_agent(config, agent.once))
         }
+        Some(Command::Inventory { command }) => match command {
+            InventoryCommand::Enable => run_inventory_enable(),
+            InventoryCommand::Disable => run_inventory_disable(),
+            InventoryCommand::Probe { output } => write_inventory_cache(&output),
+            InventoryCommand::Status => run_inventory_status(),
+        },
         None if cli.setup => run_setup(cli.setup_config.unwrap_or_else(default_config_path)),
         None if cli.validate_config => match cli.config.as_deref() {
             Some(path) => load_config(path).and_then(|config| {
@@ -1429,5 +2823,107 @@ fn main() -> ExitCode {
             eprintln!("syslens: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MetricHistory, MetricSample, active_dpm_clock_mhz, cpu_list_count, dmi_memory_inventory,
+        migrate_metric_history, parse_nvme_smart_log, weighted_bucket_average,
+    };
+
+    #[test]
+    fn counts_sparse_cpu_lists() {
+        assert_eq!(cpu_list_count("0-1,3-7"), Some(7));
+        assert_eq!(cpu_list_count("0-7"), Some(8));
+        assert_eq!(cpu_list_count("0,2,4"), Some(3));
+    }
+
+    #[test]
+    fn reads_populated_dmi_memory_slots() {
+        let inventory = dmi_memory_inventory(
+            "Handle 0x0018, DMI type 17, 92 bytes\nMemory Device\n\tSize: 16 GB\n\tForm Factor: SODIMM\n\tLocator: DIMM 0\n\tBank Locator: P0 CHANNEL A\n\tManufacturer: Kingston\n\tPart Number: KVR56S46BS8-16\n\tType: DDR5\n\tSpeed: 5600 MT/s\n\tConfigured Memory Speed: 5600 MT/s\n\nHandle 0x0019, DMI type 17, 92 bytes\nMemory Device\n\tSize: No Module Installed\n\tForm Factor: SODIMM\n\tLocator: DIMM 1\n\tBank Locator: P0 CHANNEL B\n\tManufacturer: Not Specified\n\tType: Unknown\n\tSpeed: Unknown\n",
+        )
+        .expect("DMI memory inventory should parse");
+        assert_eq!(inventory.manufacturer.as_deref(), Some("Kingston"));
+        assert_eq!(inventory.ram_type.as_deref(), Some("DDR5"));
+        assert_eq!(inventory.slots_populated, Some(1));
+        assert_eq!(inventory.slots_total, Some(2));
+        assert_eq!(inventory.nominal_data_rate.as_deref(), Some("5600 MT/s"));
+        assert_eq!(inventory.model.as_deref(), Some("KVR56S46BS8-16"));
+        assert_eq!(inventory.modules.len(), 1);
+        assert_eq!(inventory.modules[0].slot, "DIMM 0");
+        assert_eq!(
+            inventory.modules[0].model.as_deref(),
+            Some("KVR56S46BS8-16")
+        );
+    }
+
+    #[test]
+    fn summarizes_matching_and_mixed_dimm_models() {
+        let matching = dmi_memory_inventory(
+            "Memory Device\n\tSize: 16 GB\n\tLocator: DIMM A\n\tPart Number: M425R2GA3BB0-CWM\n\tType: DDR5\n\tSpeed: 5600 MT/s\n\nMemory Device\n\tSize: 16 GB\n\tLocator: DIMM B\n\tPart Number: M425R2GA3BB0-CWM\n\tType: DDR5\n\tSpeed: 5600 MT/s\n",
+        )
+        .expect("matching DIMMs should parse");
+        assert_eq!(matching.model.as_deref(), Some("2 × M425R2GA3BB0-CWM"));
+
+        let mixed = dmi_memory_inventory(
+            "Memory Device\n\tSize: 16 GB\n\tLocator: DIMM A\n\tPart Number: M425R2GA3BB0-CWM\n\nMemory Device\n\tSize: 16 GB\n\tLocator: DIMM B\n\tPart Number: CT16G56C46S5\n",
+        )
+        .expect("mixed DIMMs should parse");
+        assert_eq!(
+            mixed.model.as_deref(),
+            Some("DIMM A: M425R2GA3BB0-CWM · DIMM B: CT16G56C46S5")
+        );
+    }
+
+    #[test]
+    fn reads_standard_nvme_health_log() {
+        let mut log = [0_u8; 512];
+        log[5] = 7;
+        log[48] = 2;
+        log[128] = 42;
+        let health = parse_nvme_smart_log(&log).expect("SMART log should parse");
+        assert_eq!(health.remaining_percent, Some(93));
+        assert_eq!(health.data_written_bytes, Some(1_024_000));
+        assert_eq!(health.power_on_hours, Some(42));
+        assert_eq!(health.critical_warning.as_deref(), Some("No warnings"));
+    }
+
+    #[test]
+    fn reads_active_gpu_dpm_clock() {
+        assert_eq!(
+            active_dpm_clock_mhz("0: 200Mhz\n1: 400Mhz *\n2: 1800Mhz"),
+            Some(400.0)
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_metric_samples_to_weighted_buckets() {
+        let mut history = MetricHistory {
+            samples: vec![
+                MetricSample {
+                    t: 1_000.0,
+                    v: 10.0,
+                    n: 2,
+                },
+                MetricSample {
+                    t: 1_100.0,
+                    v: 20.0,
+                    n: 1,
+                },
+            ],
+            running_n: 10,
+            running_mean: 12.5,
+            ..Default::default()
+        };
+        migrate_metric_history(&mut history);
+        assert!(history.samples.is_empty());
+        assert_eq!(history.hourly.len(), 1);
+        assert_eq!(history.daily.len(), 1);
+        assert_eq!(history.all_time.n, 10);
+        assert_eq!(history.all_time.mean, 12.5);
+        assert_eq!(weighted_bucket_average(history.hourly.values()), Some(13.3));
     }
 }

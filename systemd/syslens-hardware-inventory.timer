@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh SysLens hardware inventory
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

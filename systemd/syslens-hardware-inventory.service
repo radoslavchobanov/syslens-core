@@ -1,0 +1,12 @@
+[Unit]
+Description=SysLens hardware inventory probe
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/syslens/syslens-inventory inventory probe --output /var/cache/syslens/hardware-inventory.json
+UMask=0022
+CacheDirectory=syslens
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

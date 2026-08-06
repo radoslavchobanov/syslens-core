@@ -1,0 +1,64 @@
+name: Release Debian packages
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.debian_arch }} package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            debian_arch: amd64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            debian_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.rust_target }}
+
+      - name: Build Debian package
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          packaging/debian/build-deb.sh \
+            "target/${{ matrix.rust_target }}/release/syslens" \
+            "${version}" \
+            "${{ matrix.debian_arch }}" \
+            dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syslens-core-${{ matrix.debian_arch }}
+          path: dist/*.deb
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "${TAG}" dist/**/*.deb --generate-notes

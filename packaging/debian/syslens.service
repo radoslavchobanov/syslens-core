@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/syslens/syslens.env
-ExecStart=%h/.local/bin/syslens agent --config %h/.config/syslens/config.toml
+ExecStart=/usr/bin/syslens agent --config %h/.config/syslens/config.toml
 Restart=on-failure
 RestartSec=5
 
