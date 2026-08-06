@@ -1,0 +1,19 @@
+[agent]
+# Stable MQTT path: syslens/<host_id>/state
+host_id = "my-server"
+interval_seconds = 3
+sample_window_seconds = 0.35
+
+[collection]
+process_limit = 6
+
+[mqtt]
+host = "192.168.0.108"
+port = 1883
+topic_prefix = "syslens"
+# username = "syslens"
+# password_env = "SYSLENS_MQTT_PASSWORD"
+tls = false
+keepalive_seconds = 60
+qos = 1
+retain = true
