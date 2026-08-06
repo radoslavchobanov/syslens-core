@@ -513,6 +513,22 @@ fn temperature_category(label: &str, source: &str, path: &str) -> &'static str {
     }
 }
 
+fn temperature_display_label(category: &str, raw_label: &str, source: &str) -> String {
+    let raw = raw_label.to_ascii_lowercase();
+    let source = source.to_ascii_lowercase();
+    match category {
+        "gpu" if raw.contains("edge") => "GPU edge temperature".into(),
+        "gpu" if raw.contains("junction") => "GPU junction temperature".into(),
+        "gpu" => "GPU temperature".into(),
+        "storage" if source.contains("nvme") || raw.contains("composite") => {
+            "NVMe temperature".into()
+        }
+        "storage" => "Storage temperature".into(),
+        "cpu" => "CPU temperature".into(),
+        _ => raw_label.to_owned(),
+    }
+}
+
 fn temperature_group(sensors: &[Value], category: &str) -> Value {
     let mut candidates: Vec<&Value> = sensors
         .iter()
@@ -565,10 +581,17 @@ fn temperature_group(sensors: &[Value], category: &str) -> Value {
                 )
         })
         .copied();
+    let raw_label = primary
+        .and_then(|sensor| sensor.get("label"))
+        .and_then(Value::as_str);
+    let source = primary
+        .and_then(|sensor| sensor.get("source"))
+        .and_then(Value::as_str);
     json!({
         "available": primary.is_some(),
         "current_celsius": primary.and_then(|sensor| sensor.get("celsius")),
-        "label": primary.and_then(|sensor| sensor.get("label")),
+        "label": raw_label.map(|label| temperature_display_label(category, label, source.unwrap_or_default())),
+        "raw_label": raw_label,
         "source": primary.and_then(|sensor| sensor.get("source")),
         "sensors": sensors.iter().filter(|sensor| sensor.get("category").and_then(Value::as_str) == Some(category)).collect::<Vec<_>>()
     })
