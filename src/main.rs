@@ -353,11 +353,6 @@ fn cpu_snapshot(before: &[Vec<u64>], after: &[Vec<u64>]) -> Value {
         .get("vendor_id")
         .or_else(|| info.get("CPU implementer"))
         .cloned();
-    let flags: Vec<String> = info
-        .get("flags")
-        .or_else(|| info.get("Features"))
-        .map(|value| value.split_whitespace().map(str::to_owned).collect())
-        .unwrap_or_default();
     let cpufreq = json!({
         "available": !clocks.is_empty(),
         "current_mhz_avg": clocks.iter().copied().reduce(|left, right| left + right).map(|sum| round(sum / clocks.len() as f64, 1)),
@@ -370,7 +365,10 @@ fn cpu_snapshot(before: &[Vec<u64>], after: &[Vec<u64>]) -> Value {
     });
     json!({
         "available": true, "architecture": std::env::consts::ARCH, "model": model, "vendor": vendor,
-        "logical_cores": logical, "physical_cores": physical_core_count(&info).unwrap_or(logical), "flags": flags,
+        // CPU feature flags are very large and not rendered by SysLens.  Keep
+        // the stable field but omit them so MQTT snapshots fit conservative
+        // broker packet limits (including the 10 KiB Mosquitto default here).
+        "logical_cores": logical, "physical_cores": physical_core_count(&info).unwrap_or(logical), "flags": Vec::<String>::new(),
         "microcode": info.get("microcode"), "cache": info.get("cache size"), "usage_percent": usage,
         "per_core_percent": per_core, "current_mhz_avg": cpufreq["current_mhz_avg"],
         "current_mhz_min": cpufreq["current_mhz_min"], "current_mhz_max": cpufreq["current_mhz_max"],
@@ -783,7 +781,14 @@ fn network_snapshot(
         let rx = current.rx.saturating_sub(previous.rx) as f64 / elapsed;
         let tx = current.tx.saturating_sub(previous.tx) as f64 / elapsed;
         let item = json!({"name":name,"state":current.state,"speed_mbps":current.speed_mbps,"drops":current.drops,"rx_bytes_per_sec":round(rx,1),"tx_bytes_per_sec":round(tx,1)});
-        interfaces.push(item.clone());
+        // Docker bridges and veth pairs can number in the dozens. They add no
+        // useful host-level signal and can make an MQTT state larger than a
+        // broker's packet limit, so only expose usable host links here.
+        if (!is_virtual_interface(name) && current.state == "up")
+            || (!is_virtual_interface(name) && current.speed_mbps.is_some())
+        {
+            interfaces.push(item.clone());
+        }
         if !is_virtual_interface(name) && current.state == "up" {
             rx_total += rx;
             tx_total += tx;
@@ -1117,7 +1122,10 @@ fn create_client(config: &RuntimeConfig) -> Result<(Client, ConnectionControl), 
                     announced = true;
                     let _ = ready_sender.send(Err(error.to_string()));
                 }
-                Err(_) => break,
+                Err(error) => {
+                    eprintln!("syslens: MQTT connection stopped: {error}");
+                    break;
+                }
                 _ => {}
             }
         }
@@ -1209,6 +1217,12 @@ fn run_agent(config: RuntimeConfig, once: bool) -> Result<(), String> {
         next += Duration::from_secs_f64(config.agent.interval_seconds);
         thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
     };
+    // The synchronous client queues publishes for the connection thread.  Give
+    // a one-shot diagnostic publish a chance to cross the socket before its
+    // deliberately clean shutdown switches availability to offline.
+    if once {
+        thread::sleep(Duration::from_secs(1));
+    }
     let _ = publish(
         &client,
         format!("{base}/availability"),
