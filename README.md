@@ -15,7 +15,7 @@ embedding a second collector.
 | --- | --- | --- |
 | [syslens-core](https://github.com/radoslavchobanov/syslens-core) | Linux telemetry collector and MQTT publisher | Source of truth |
 | [syslens-plasmoid](https://github.com/radoslavchobanov/syslens-plasmoid) | KDE Plasma widget | Direct local command or SSH command |
-| syslens-home-assistant | Home Assistant dashboard integration | Retained MQTT state only |
+| [syslens-home-assistant](https://github.com/radoslavchobanov/syslens-home-assistant) | Home Assistant dashboard integration | Retained MQTT state only |
 
 The Plasma interface is deliberately separate. It can monitor a local host or
 a remote host over SSH without MQTT. The Home Assistant interface is also
