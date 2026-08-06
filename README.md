@@ -37,6 +37,22 @@ syslens snapshot --pretty
 
 The old `syslens-core` spelling remains as a compatibility alias.
 
+## Debian / Ubuntu installation
+
+Tagged releases publish architecture-specific `syslens-core` Debian packages
+for `amd64` and `arm64`. Until a signed SysLens APT repository is introduced,
+download the matching release artifact and install it explicitly:
+
+```bash
+sudo apt install ./syslens-core_<version>_<architecture>.deb
+```
+
+The package installs `/usr/bin/syslens` and an optional systemd user-service
+template. It does not configure a broker, start a publisher, or enable the
+privileged inventory helper automatically. Follow the guided commands below
+after installation. Packaging details and local build instructions are in
+[`packaging/debian`](packaging/debian/README.md).
+
 ## MQTT / Home Assistant
 
 Run the guided setup on each publishing host:

@@ -1,0 +1,14 @@
+[Unit]
+Description=SysLens MQTT telemetry agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/syslens/syslens.env
+ExecStart=/usr/bin/syslens agent --config %h/.config/syslens/config.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
