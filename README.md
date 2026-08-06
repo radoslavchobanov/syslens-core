@@ -82,6 +82,29 @@ systemctl --user enable --now syslens.service
 Use [`config/syslens.toml.example`](config/syslens.toml.example) for
 non-interactive provisioning.
 
+## Migrating a legacy Python publisher
+
+Use the same `agent.host_id`, MQTT topic prefix, credentials file, and MQTT
+client ID so receivers continue to see the exact same topics. Do not run the
+old and new publisher under the same client ID at once: MQTT correctly treats
+that as a duplicate connection.
+
+1. Install `syslens-core` as `~/.local/bin/syslens-core`.
+2. Stop the Python service, then prove the real configuration once:
+
+   ```bash
+   systemctl --user stop syslens.service
+   set -a; . ~/.config/syslens/credentials.env; set +a
+   ~/.local/bin/syslens-core --config ~/.config/syslens/config.toml --publish --once
+   ```
+
+3. Change `syslens.service` to the systemd `ExecStart` above, reload, and
+   restart it. Keep a copy of the former unit beside it as
+   `syslens.service.python-backup`.
+4. Check the retained `<prefix>/<host-id>/state` and `availability` topics.
+   Roll back immediately by restoring that saved unit and restarting the
+   service if either is missing.
+
 ## Resource model
 
 Each snapshot samples CPU, disk I/O, network throughput, and per-process CPU
