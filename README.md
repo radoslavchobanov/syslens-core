@@ -92,3 +92,7 @@ shortening the interval is the main resource-cost tradeoff.
 Hardware data is capability-based: CPU, GPU, NVMe, battery, and thermal values
 appear only when Linux exposes them. Missing hardware is represented as empty
 or unavailable data rather than guessed values.
+
+For MQTT, the core omits CPU feature-flag lists and inactive container links
+from the state payload. Those values are not rendered by SysLens, and keeping
+the state compact makes it work with conservative 10 KiB broker packet limits.
