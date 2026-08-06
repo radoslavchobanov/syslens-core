@@ -8,7 +8,7 @@ sample_window_seconds = 0.35
 process_limit = 6
 
 [mqtt]
-host = "192.168.0.108"
+host = "mqtt.example.net"
 port = 1883
 topic_prefix = "syslens"
 # username = "syslens"
