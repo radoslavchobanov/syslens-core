@@ -17,9 +17,9 @@ scripts/install-core.sh
 syslens-core snapshot --pretty
 ```
 
-`syslens-core` does not need any setup for local-only use. The future Plasma
-package simply executes `syslens-core snapshot --json` locally, or over SSH on
-a remote host.
+`syslens-core` does not need any setup for local-only use. The separate
+[`syslens-plasmoid`](../syslens-plasmoid) package executes
+`syslens-core snapshot --json` locally, or over SSH on a remote host.
 
 When all consumers have moved off the legacy Python CLI, install it as the
 normal `syslens` command:
