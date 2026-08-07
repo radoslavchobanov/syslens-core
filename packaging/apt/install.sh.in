@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Installed once with:
+#   curl -fsSL https://radoslavchobanov.github.io/syslens-core/apt/install.sh | sudo bash
+#
+# This configures only the SysLens APT keyring and source.  It deliberately
+# does not install SysLens itself; users retain normal APT control afterwards.
+
+REPOSITORY_URL="https://radoslavchobanov.github.io/syslens-core/apt"
+EXPECTED_FINGERPRINT="@SYSLENS_APT_ARCHIVE_FINGERPRINT@"
+KEYRING_PATH="/usr/share/keyrings/syslens-archive-keyring.gpg"
+SOURCE_PATH="/etc/apt/sources.list.d/syslens.list"
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Run this setup command through sudo:" >&2
+  echo "  curl -fsSL ${REPOSITORY_URL}/install.sh | sudo bash" >&2
+  exit 1
+fi
+
+for command in curl gpg install; do
+  command -v "${command}" >/dev/null || {
+    echo "Missing required command: ${command}" >&2
+    exit 1
+  }
+done
+
+temporary_keyring="$(mktemp)"
+trap 'rm -f "${temporary_keyring}"' EXIT
+curl --fail --silent --show-error --location \
+  "${REPOSITORY_URL}/syslens-archive-keyring.gpg" \
+  --output "${temporary_keyring}"
+
+actual_fingerprint="$(gpg --show-keys --with-colons "${temporary_keyring}" \
+  | awk -F: '$1 == "fpr" { print $10; exit }')"
+if [[ "${actual_fingerprint}" != "${EXPECTED_FINGERPRINT}" ]]; then
+  echo "The downloaded SysLens archive key does not match its expected fingerprint." >&2
+  exit 1
+fi
+
+install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+install -m 0644 "${temporary_keyring}" "${KEYRING_PATH}"
+printf '%s\n' "deb [signed-by=${KEYRING_PATH}] ${REPOSITORY_URL} stable main" >"${SOURCE_PATH}"
+
+echo "SysLens APT repository configured."
+echo "Next: sudo apt update && sudo apt install syslens-core"

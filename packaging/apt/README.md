@@ -48,9 +48,11 @@ committed, attached to a GitHub Release, or copied into documentation.
 
 3. Add the result as the repository Actions secret `SYSLENS_APT_SIGNING_KEY`.
    If the subkey has a passphrase, add it as `SYSLENS_APT_SIGNING_PASSPHRASE`.
-4. Add a repository variable `SYSLENS_APT_SIGNING_FINGERPRINT` containing the
-   public fingerprint, and set `APT_REPOSITORY_ENABLED` to `true` only after
-   the other steps succeed.
+4. Add a repository variable `SYSLENS_APT_ARCHIVE_FINGERPRINT` containing the
+   **primary public-key fingerprint**. GPG uses that identity to select the
+   signing subkey, while the installer pins it as the long-lived archive
+   identity. Set `APT_REPOSITORY_ENABLED` to `true` only after the other steps
+   succeed.
 5. Create an orphan `gh-pages` branch once. Enable GitHub Pages and select
    **GitHub Actions** as its publishing source. The branch preserves the
    `apt/` directory between releases; the release workflow deploys that static
@@ -62,17 +64,19 @@ the temporary keyring when the runner exits.
 
 ## User installation
 
-After the repository is live, a Debian/Ubuntu user installs its public key and
-source once:
+After the repository is live, a Debian/Ubuntu user configures its public key
+and source once, from any directory:
 
 ```bash
-curl -fsSL https://radoslavchobanov.github.io/syslens-core/apt/syslens-archive-keyring.gpg \
-  | sudo tee /usr/share/keyrings/syslens-archive-keyring.gpg >/dev/null
-echo 'deb [signed-by=/usr/share/keyrings/syslens-archive-keyring.gpg] https://radoslavchobanov.github.io/syslens-core/apt stable main' \
-  | sudo tee /etc/apt/sources.list.d/syslens.list >/dev/null
+curl -fsSL https://radoslavchobanov.github.io/syslens-core/apt/install.sh | sudo bash
 sudo apt update
 sudo apt install syslens-core
 ```
+
+`install.sh` is intentionally small and inspectable. It verifies the
+downloaded public archive key against the release fingerprint, installs the
+keyring and one APT source file, then stops. It does not install or start
+SysLens; the following normal APT command does that.
 
 To upgrade later:
 

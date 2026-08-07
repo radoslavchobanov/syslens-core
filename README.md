@@ -82,17 +82,19 @@ The old `syslens-core` spelling remains as a compatibility alias.
 
 Tagged releases publish architecture-specific `syslens-core` Debian packages
 for `amd64` and `arm64`. Final releases are also added to the signed SysLens
-APT repository once it is enabled. To use it, install the published archive
-key and source once:
+APT repository once it is enabled. To configure that repository once on a
+Debian/Ubuntu host, from any directory:
 
 ```bash
-curl -fsSL https://radoslavchobanov.github.io/syslens-core/apt/syslens-archive-keyring.gpg \
-  | sudo tee /usr/share/keyrings/syslens-archive-keyring.gpg >/dev/null
-echo 'deb [signed-by=/usr/share/keyrings/syslens-archive-keyring.gpg] https://radoslavchobanov.github.io/syslens-core/apt stable main' \
-  | sudo tee /etc/apt/sources.list.d/syslens.list >/dev/null
+curl -fsSL https://radoslavchobanov.github.io/syslens-core/apt/install.sh | sudo bash
 sudo apt update
 sudo apt install syslens-core
 ```
+
+The setup script only downloads a public archive key, verifies its expected
+fingerprint, and adds the APT source; it does not install SysLens itself. From
+then on, `sudo apt install syslens-core` and normal APT upgrades work from any
+directory without a cloned SysLens repository.
 
 Until that repository is live, download the matching release artifact and
 install it explicitly:

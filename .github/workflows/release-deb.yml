@@ -124,12 +124,20 @@ jobs:
         env:
           GNUPGHOME: ${{ runner.temp }}/syslens-gnupg
           SYSLENS_APT_SIGNING_PASSPHRASE: ${{ secrets.SYSLENS_APT_SIGNING_PASSPHRASE }}
-          SIGNING_FINGERPRINT: ${{ vars.SYSLENS_APT_SIGNING_FINGERPRINT }}
+          SIGNING_FINGERPRINT: ${{ vars.SYSLENS_APT_ARCHIVE_FINGERPRINT }}
         run: |
           source/packaging/apt/build-repository.sh \
             --repository pages/apt \
             --packages artifacts \
             --signing-key "$SIGNING_FINGERPRINT"
+
+      - name: Add verified APT setup script
+        env:
+          SIGNING_FINGERPRINT: ${{ vars.SYSLENS_APT_ARCHIVE_FINGERPRINT }}
+        run: |
+          sed "s/@SYSLENS_APT_ARCHIVE_FINGERPRINT/${SIGNING_FINGERPRINT}/" \
+            source/packaging/apt/install.sh.in > pages/apt/install.sh
+          chmod 0755 pages/apt/install.sh
 
       - name: Commit static repository
         env:
