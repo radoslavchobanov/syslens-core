@@ -31,8 +31,8 @@ release workflow performs these builds for tagged releases.
 
 ## APT repository policy
 
-Release artifacts are suitable for direct `apt install ./file.deb`. A later
-signed APT repository is a separate publication surface: it must publish the
-package index and signed Release metadata, then users add its keyring and
-source once before `apt install syslens-core` works. Do not expose an
-unversioned development artifact through that repository.
+Release artifacts are suitable for direct `apt install ./file.deb`. Final
+release tags are additionally eligible for the signed `stable` APT repository;
+pre-release tags are deliberately excluded. See [`../apt`](../apt/README.md)
+for the repository structure, signing-key boundary, maintainer setup, and user
+installation instructions.
