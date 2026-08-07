@@ -15,7 +15,7 @@ result with a Debian-based build host:
 cargo build --locked --release
 packaging/debian/build-deb.sh \
   target/release/syslens \
-  0.1.0 \
+  0.2.0 \
   amd64 \
   dist
 ```
@@ -23,7 +23,7 @@ packaging/debian/build-deb.sh \
 Install the resulting artifact locally with:
 
 ```bash
-sudo apt install ./dist/syslens-core_0.1.0_amd64.deb
+sudo apt install ./dist/syslens-core_0.2.0_amd64.deb
 ```
 
 For aarch64 builds, pass an aarch64-built binary and `arm64`. The GitHub
