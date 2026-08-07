@@ -2477,6 +2477,24 @@ fn prompt_yes_no(label: &str, default: bool) -> Result<bool, String> {
     }
 }
 
+enum SetupMode {
+    Local,
+    Mqtt,
+}
+
+fn prompt_setup_mode() -> Result<SetupMode, String> {
+    println!(
+        "\nHow will this host be used?\n  1) Local CLI / KDE Plasma (no broker or background service)\n  2) MQTT publisher for Home Assistant or another receiver"
+    );
+    loop {
+        match prompt("Choose a mode", Some("1"))?.as_str() {
+            "1" | "local" | "plasma" => return Ok(SetupMode::Local),
+            "2" | "mqtt" | "publisher" => return Ok(SetupMode::Mqtt),
+            _ => eprintln!("Choose 1 for local monitoring or 2 for MQTT publishing."),
+        }
+    }
+}
+
 fn write_private(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -2495,6 +2513,65 @@ fn write_private(path: &Path, content: &str) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(path))
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn systemd_quote(path: &Path) -> String {
+    format!(
+        "\"{}\"",
+        path.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
+}
+
+fn user_service_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("systemd/user/syslens.service")
+}
+
+fn user_agent_service_unit(executable: &Path, config_path: &Path) -> String {
+    let environment_path = config_path.with_file_name("syslens.env");
+    format!(
+        "[Unit]\nDescription=SysLens MQTT telemetry agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironmentFile=-{}\nExecStart={} agent --config {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        systemd_quote(&environment_path),
+        systemd_quote(executable),
+        systemd_quote(config_path),
+    )
+}
+
+fn install_user_agent_service(config_path: &Path) -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let service_path = user_service_path();
+    let unit = user_agent_service_unit(&executable, config_path);
+    write_private(&service_path, &unit)?;
+
+    let run_systemctl = |arguments: &[&str]| {
+        ProcessCommand::new("systemctl")
+            .arg("--user")
+            .args(arguments)
+            .status()
+            .map_err(|error| format!("could not start systemctl --user: {error}"))?
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("systemctl --user {} failed", arguments.join(" ")))
+    };
+    run_systemctl(&["daemon-reload"])?;
+    run_systemctl(&["enable", "--now", "syslens.service"])?;
+    Ok(service_path)
 }
 
 const INVENTORY_EXECUTABLE: &str = "/usr/local/libexec/syslens/syslens-inventory";
@@ -2703,12 +2780,15 @@ fn offer_hardware_inventory_setup() -> Result<(), String> {
 }
 
 fn run_setup(target: PathBuf) -> Result<(), String> {
+    let target = absolute_path(&target)?;
     println!(
-        "SysLens setup\n\nLocal Plasma monitoring needs no configuration. MQTT mode publishes snapshots for Home Assistant or other receivers."
+        "SysLens setup\n\nThis wizard configures the way this host is used. Hardware inventory is optional and works with either mode."
     );
-    if !prompt_yes_no("Configure MQTT publishing", true)? {
+    if matches!(prompt_setup_mode()?, SetupMode::Local) {
         offer_hardware_inventory_setup()?;
-        println!("No configuration written. Use `syslens snapshot --json` for local telemetry.");
+        println!(
+            "\nLocal SysLens is ready.\n\nNext steps:\n  syslens snapshot --pretty\n  Install syslens-plasmoid for a KDE Plasma interface.\n\nNo MQTT broker, configuration file, or background service is needed for local monitoring."
+        );
         return Ok(());
     }
     let host_id = prompt("Stable host ID", Some(&default_host_id()))?;
@@ -2763,13 +2843,25 @@ fn run_setup(target: PathBuf) -> Result<(), String> {
     }
     offer_hardware_inventory_setup()?;
     let config = load_config(&target)?;
+    let service_path = if prompt_yes_no(
+        "Install and start the per-user MQTT publishing service now",
+        true,
+    )? {
+        Some(install_user_agent_service(&target)?)
+    } else {
+        None
+    };
     println!(
-        "\nConfiguration written to {}\nTopics: {}/{{meta,state,availability}}\n\nNext steps:\n  syslens --config {} --validate-config\n  syslens --config {} --publish --once\n  syslens --config {} --publish",
+        "\nMQTT SysLens is ready.\nConfiguration: {}\nTopics: {}/{{meta,state,availability}}\n{}\n\nUseful checks:\n  syslens --config {} --validate-config\n  syslens --config {} --publish --once\n  systemctl --user status syslens.service",
         target.display(),
         topic_base(&config),
+        service_path.map_or_else(
+            || "Service: not installed; run `syslens setup` again when ready to enable it."
+                .to_owned(),
+            |path| format!("Service: enabled and started from {}", path.display()),
+        ),
         target.display(),
         target.display(),
-        target.display()
     );
     Ok(())
 }
@@ -2830,7 +2922,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::{
         MetricHistory, MetricSample, active_dpm_clock_mhz, cpu_list_count, dmi_memory_inventory,
-        migrate_metric_history, parse_nvme_smart_log, weighted_bucket_average,
+        migrate_metric_history, parse_nvme_smart_log, user_agent_service_unit,
+        weighted_bucket_average,
     };
 
     #[test]
@@ -2889,6 +2982,18 @@ mod tests {
         assert_eq!(health.data_written_bytes, Some(1_024_000));
         assert_eq!(health.power_on_hours, Some(42));
         assert_eq!(health.critical_warning.as_deref(), Some("No warnings"));
+    }
+
+    #[test]
+    fn renders_user_service_with_the_selected_binary_and_config() {
+        let unit = user_agent_service_unit(
+            std::path::Path::new("/usr/bin/syslens"),
+            std::path::Path::new("/home/rado/.config/syslens/config.toml"),
+        );
+        assert!(unit.contains("EnvironmentFile=-\"/home/rado/.config/syslens/syslens.env\""));
+        assert!(unit.contains(
+            "ExecStart=\"/usr/bin/syslens\" agent --config \"/home/rado/.config/syslens/config.toml\""
+        ));
     }
 
     #[test]

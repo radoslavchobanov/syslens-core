@@ -22,17 +22,30 @@ a remote host over SSH without MQTT. The Home Assistant interface is also
 separate and intentionally does **not** execute Core commands: it consumes the
 retained MQTT contract described below.
 
-## Install and use
+## First-time setup
 
-Build once, then install it:
+Install Core, then run the first-run wizard:
 
 ```bash
 scripts/install-core.sh
+syslens setup
+```
+
+The wizard starts with a clear choice:
+
+1. **Local CLI / KDE Plasma** — no broker, configuration file, or background
+   service. It optionally enables the read-only hardware-inventory helper.
+2. **MQTT publisher** — configures the broker, host ID, credentials, publish
+   interval, optional hardware inventory, and can install and start the
+   per-user publishing service.
+
+The local mode is the default. Verify either mode with:
+
+```bash
 syslens snapshot --pretty
 ```
 
-`syslens` does not need any setup for local-only use. The separate
-[`syslens-plasmoid`](../syslens-plasmoid) package executes
+The separate [`syslens-plasmoid`](../syslens-plasmoid) package uses
 `syslens snapshot --json` locally, or over SSH on a remote host.
 
 The old `syslens-core` spelling remains as a compatibility alias.
@@ -55,7 +68,7 @@ after installation. Packaging details and local build instructions are in
 
 ## MQTT / Home Assistant
 
-Run the guided setup on each publishing host:
+Run the guided setup and choose **MQTT publisher** on each publishing host:
 
 ```bash
 syslens setup
@@ -86,26 +99,18 @@ The topic layout and `schema_version: 1` snapshot envelope are compatible with
 the existing SysLens Python MQTT collector. MQTT may use plain TCP or standard
 system-CA TLS (`mqtt.tls = true`).
 
-For a systemd user service, load the secret file before starting the agent:
-
-```ini
-[Service]
-EnvironmentFile=%h/.config/syslens/syslens.env
-ExecStart=%h/.local/bin/syslens agent --config %h/.config/syslens/config.toml
-Restart=on-failure
-```
-
-The ready-to-copy unit is [`systemd/syslens.service`](systemd/syslens.service):
+Setup can install and start the systemd user service automatically. To manage
+it afterwards:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/syslens.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now syslens.service
+systemctl --user status syslens.service
+systemctl --user restart syslens.service
 ```
 
 Use [`config/syslens.toml.example`](config/syslens.toml.example) for
-non-interactive provisioning.
+non-interactive provisioning. The included
+[`systemd/syslens.service`](systemd/syslens.service) remains available as a
+manual template.
 
 ## Local persistent history
 
