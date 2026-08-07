@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod tui;
 
 const PROC: &str = "/proc";
 const SYS: &str = "/sys";
@@ -68,6 +70,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Open the interactive local system monitor.
+    Tui(TuiArgs),
     /// Print one local telemetry snapshot.
     Snapshot(SnapshotArgs),
     /// Create a local or MQTT publisher configuration interactively.
@@ -82,6 +86,15 @@ enum Command {
         #[command(subcommand)]
         command: InventoryCommand,
     },
+}
+
+#[derive(Args, Debug, Clone)]
+struct TuiArgs {
+    #[command(flatten)]
+    snapshot: SnapshotArgs,
+    /// Refresh interval in seconds.
+    #[arg(long, default_value_t = 2.0)]
+    interval: f64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2883,6 +2896,8 @@ fn print_snapshot(args: &SnapshotArgs, pretty: bool) -> Result<(), String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Some(Command::Tui(args)) if cli.json => print_snapshot(&args.snapshot, cli.pretty),
+        Some(Command::Tui(args)) => tui::run(args),
         Some(Command::Snapshot(args)) => print_snapshot(&args, cli.pretty),
         Some(Command::Setup { config }) => run_setup(config.unwrap_or_else(default_config_path)),
         Some(Command::Agent(agent)) => {
@@ -2907,6 +2922,13 @@ fn main() -> ExitCode {
             Some(path) => load_config(path).and_then(|config| run_agent(config, cli.once)),
             None => Err("--publish requires --config".into()),
         },
+        None if cli.json || cli.pretty => print_snapshot(&cli.snapshot, cli.pretty),
+        // A terminal invocation is for people; scripts and pipes retain the
+        // long-standing JSON snapshot behaviour.
+        None if io::stdout().is_terminal() => tui::run(TuiArgs {
+            snapshot: cli.snapshot,
+            interval: 2.0,
+        }),
         None => print_snapshot(&cli.snapshot, cli.pretty),
     };
     match result {

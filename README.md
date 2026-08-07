@@ -1,9 +1,9 @@
 # SysLens Core
 
-`syslens` is the small Linux collector behind SysLens. It reads kernel and
-sysfs data directly, produces one stable JSON snapshot, and can optionally
-publish it to an MQTT broker. It has no database, web server, or broker of its
-own.
+`syslens` is a low-overhead Linux system monitor and telemetry collector. Run
+`syslens` in a terminal for its interactive local monitor, or use its stable
+JSON snapshot and optional MQTT publisher to feed other SysLens interfaces. It
+has no database, web server, or broker of its own.
 
 ## SysLens components
 
@@ -33,17 +33,45 @@ syslens setup
 
 The wizard starts with a clear choice:
 
-1. **Local CLI / KDE Plasma** — no broker, configuration file, or background
-   service. It optionally enables the read-only hardware-inventory helper.
+1. **Local TUI / CLI / KDE Plasma** — no broker, configuration file, or
+   background service. It optionally enables the read-only hardware-inventory
+   helper.
 2. **MQTT publisher** — configures the broker, host ID, credentials, publish
    interval, optional hardware inventory, and can install and start the
    per-user publishing service.
 
-The local mode is the default. Verify either mode with:
+The local monitor is the default human-facing interface:
+
+```bash
+syslens
+```
+
+It is designed for a normal terminal (minimum 62 × 22 cells) and provides:
+
+- an overview of CPU, RAM and swap, disk, GPU, network activity, and a compact
+  top-process preview;
+- a sortable process table (`c` CPU, `m` memory, `j`/`k` selection); and
+- a dedicated thermal and hardware-inventory view.
+
+Use `Tab` or `1`–`3` to switch views, `r` to refresh immediately, and `q` to
+quit. The refresh interval defaults to two seconds and can be changed with:
+
+```bash
+syslens tui --interval 3
+```
+
+For scripts, pipes, the Plasma widget, and any program consuming Core, the
+machine-facing JSON contract remains explicit and unchanged:
 
 ```bash
 syslens snapshot --pretty
+# Compatibility spelling for a one-shot JSON snapshot:
+syslens --json
 ```
+
+When `syslens` has no subcommand but stdout is not an interactive terminal, it
+also keeps the previous JSON snapshot behaviour. Existing automation therefore
+does not unexpectedly receive terminal control codes.
 
 The separate [`syslens-plasmoid`](../syslens-plasmoid) package uses
 `syslens snapshot --json` locally, or over SSH on a remote host.
