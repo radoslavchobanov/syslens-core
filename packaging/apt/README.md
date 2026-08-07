@@ -51,9 +51,10 @@ committed, attached to a GitHub Release, or copied into documentation.
 4. Add a repository variable `SYSLENS_APT_SIGNING_FINGERPRINT` containing the
    public fingerprint, and set `APT_REPOSITORY_ENABLED` to `true` only after
    the other steps succeed.
-5. Create an orphan `gh-pages` branch once and enable GitHub Pages with that
-   branch as its publishing source. The branch must preserve the `apt/`
-   directory between releases.
+5. Create an orphan `gh-pages` branch once. Enable GitHub Pages and select
+   **GitHub Actions** as its publishing source. The branch preserves the
+   `apt/` directory between releases; the release workflow deploys that static
+   directory to Pages explicitly.
 
 The release workflow imports the secret into a temporary GNUPG home, signs the
 metadata, exports the matching public key into the repository, then discards

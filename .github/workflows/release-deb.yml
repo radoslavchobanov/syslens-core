@@ -143,3 +143,30 @@ jobs:
             git commit -m "Publish APT repository for ${TAG}"
             git push origin gh-pages
           fi
+
+      - name: Prepare static Pages artifact
+        run: |
+          mkdir published
+          cp -a pages/apt published/apt
+          touch published/.nojekyll
+
+      - name: Upload static Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: published
+
+  deploy-apt-pages:
+    name: Deploy APT repository to GitHub Pages
+    needs: publish-apt
+    if: needs.publish-apt.result == 'success'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy static Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4
