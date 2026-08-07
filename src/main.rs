@@ -2546,7 +2546,7 @@ fn user_service_path() -> PathBuf {
 fn user_agent_service_unit(executable: &Path, config_path: &Path) -> String {
     let environment_path = config_path.with_file_name("syslens.env");
     format!(
-        "[Unit]\nDescription=SysLens MQTT telemetry agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironmentFile=-{}\nExecStart={} agent --config {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=SysLens MQTT telemetry agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironmentFile={}\nExecStart={} agent --config {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(&environment_path),
         systemd_quote(executable),
         systemd_quote(config_path),
@@ -2835,12 +2835,12 @@ fn run_setup(target: PathBuf) -> Result<(), String> {
         ));
     }
     write_private(&target, &text)?;
-    if !password.is_empty() {
-        write_private(
-            &target.with_file_name("syslens.env"),
-            &format!("SYSLENS_MQTT_PASSWORD={}\n", password.replace('\n', "")),
-        )?;
-    }
+    let environment = if password.is_empty() {
+        "# SysLens MQTT environment. No secret is configured.\n".to_owned()
+    } else {
+        format!("SYSLENS_MQTT_PASSWORD={}\n", password.replace('\n', ""))
+    };
+    write_private(&target.with_file_name("syslens.env"), &environment)?;
     offer_hardware_inventory_setup()?;
     let config = load_config(&target)?;
     let service_path = if prompt_yes_no(
@@ -2990,7 +2990,7 @@ mod tests {
             std::path::Path::new("/usr/bin/syslens"),
             std::path::Path::new("/home/rado/.config/syslens/config.toml"),
         );
-        assert!(unit.contains("EnvironmentFile=-\"/home/rado/.config/syslens/syslens.env\""));
+        assert!(unit.contains("EnvironmentFile=\"/home/rado/.config/syslens/syslens.env\""));
         assert!(unit.contains(
             "ExecStart=\"/usr/bin/syslens\" agent --config \"/home/rado/.config/syslens/config.toml\""
         ));
