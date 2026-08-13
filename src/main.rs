@@ -2157,8 +2157,19 @@ fn enrich_history(
                 .or_insert(current);
             *maximum = maximum.max(current);
             if let Some(target) = snapshot.pointer_mut(pointer) {
-                target["average_celsius"] = averages["overall"].clone();
-                target["maximum_celsius"] = json!(round(*maximum, 1));
+                let historical_average = averages["overall"].clone();
+                let historical_maximum = json!(round(*maximum, 1));
+                target["average_celsius"] = historical_average.clone();
+                target["maximum_celsius"] = historical_maximum.clone();
+
+                // Keep the original CPU-specific fields accurate for existing
+                // interfaces. They used to describe the current sensor value,
+                // which made a displayed "average" and "maximum" identical
+                // to "now" even though persisted history was available.
+                if metric_key == "cpu_temperature" {
+                    target["cpu_average_celsius"] = historical_average;
+                    target["cpu_maximum_celsius"] = historical_maximum;
+                }
             }
         }
     }
@@ -2943,10 +2954,12 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetricHistory, MetricSample, active_dpm_clock_mhz, cpu_list_count, dmi_memory_inventory,
-        migrate_metric_history, parse_nvme_smart_log, user_agent_service_unit,
-        weighted_bucket_average,
+        CollectorState, MetricHistory, MetricSample, NetCounters, active_dpm_clock_mhz,
+        cpu_list_count, dmi_memory_inventory, enrich_history, migrate_metric_history,
+        parse_nvme_smart_log, user_agent_service_unit, weighted_bucket_average,
     };
+    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn counts_sparse_cpu_lists() {
@@ -3052,5 +3065,40 @@ mod tests {
         assert_eq!(history.all_time.n, 10);
         assert_eq!(history.all_time.mean, 12.5);
         assert_eq!(weighted_bucket_average(history.hourly.values()), Some(13.3));
+    }
+
+    #[test]
+    fn keeps_cpu_temperature_aliases_in_sync_with_persisted_history() {
+        let mut state = CollectorState::default();
+        let counters = HashMap::<String, NetCounters>::new();
+        let snapshot = |temperature| {
+            json!({
+                "cpu": {"usage_percent": 0.0},
+                "memory": {"usage_percent": 0.0, "swap": {"usage_percent": 0.0}},
+                "gpu": {"devices": [{"usage_percent": 0.0, "vram_usage_percent": 0.0}]},
+                "network": {"download_bytes_per_sec": 0.0, "upload_bytes_per_sec": 0.0},
+                "disk": {"total_read_bytes_per_sec": 0.0, "total_write_bytes_per_sec": 0.0},
+                "temperature": {
+                    "cpu_current_celsius": temperature,
+                    "hardware": {"gpu": {}, "storage": {}}
+                }
+            })
+        };
+
+        let mut first = snapshot(40.0);
+        enrich_history(&mut first, &mut state, &counters);
+        let mut second = snapshot(60.0);
+        enrich_history(&mut second, &mut state, &counters);
+
+        assert_eq!(second["temperature"]["average_celsius"], json!(50.0));
+        assert_eq!(second["temperature"]["maximum_celsius"], json!(60.0));
+        assert_eq!(
+            second["temperature"]["cpu_average_celsius"],
+            second["temperature"]["average_celsius"]
+        );
+        assert_eq!(
+            second["temperature"]["cpu_maximum_celsius"],
+            second["temperature"]["maximum_celsius"]
+        );
     }
 }
