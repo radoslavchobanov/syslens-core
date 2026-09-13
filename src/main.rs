@@ -3317,9 +3317,25 @@ fn diagnosis_addon_command() -> ProcessCommand {
             .parent()
             .map(|directory| directory.join("syslens-diagnosis"))
     });
-    match sibling.filter(|path| path.is_file()) {
+    match sibling.filter(|path| is_executable_file(path)) {
         Some(path) => ProcessCommand::new(path),
         None => ProcessCommand::new("syslens-diagnosis"),
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 

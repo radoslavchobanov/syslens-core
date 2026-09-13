@@ -261,3 +261,41 @@ fn diagnosis_commands_explain_when_the_addon_is_not_installed() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn diagnosis_commands_use_path_when_a_sibling_addon_is_not_executable() {
+    let fixture = Fixture::new();
+    let bin_directory = fixture.root.join("bin");
+    let path_directory = fixture.root.join("path");
+    fs::create_dir(&bin_directory).unwrap();
+    fs::create_dir(&path_directory).unwrap();
+    let core = bin_directory.join("syslens");
+    fs::copy(env!("CARGO_BIN_EXE_syslens"), &core).unwrap();
+
+    let sibling = bin_directory.join("syslens-diagnosis");
+    fs::write(&sibling, "not executable").unwrap();
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let capture = fixture.root.join("path-arguments");
+    let addon = path_directory.join("syslens-diagnosis");
+    fs::write(
+        &addon,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SYSLENS_TEST_CAPTURE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&addon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(core)
+        .env("PATH", path_directory)
+        .env("SYSLENS_TEST_CAPTURE", &capture)
+        .args(["incidents", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "PATH fallback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(capture).unwrap(), "incidents\nlist\n");
+}
