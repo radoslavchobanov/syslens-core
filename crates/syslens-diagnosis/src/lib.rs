@@ -4,7 +4,7 @@
 //! an optional, host-local companion and may be stopped or removed independently.
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -77,11 +77,41 @@ impl Config {
 pub fn config_path() -> PathBuf {
     xdg_path("XDG_CONFIG_HOME", ".config").join("syslens-diagnosis/config.toml")
 }
+pub fn user_service_path() -> PathBuf {
+    xdg_path("XDG_CONFIG_HOME", ".config").join("systemd/user/syslens-diagnosis.service")
+}
+pub fn service_unit(binary: &Path, config: &Path, database: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=SysLens local diagnosis companion\n\n[Service]\nExecStart={} daemon --config {} --database {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        binary.display(),
+        config.display(),
+        database.display()
+    )
+}
+pub fn install_user_service(
+    binary: &Path,
+    config: &Path,
+    database: &Path,
+) -> Result<PathBuf, String> {
+    let path = user_service_path();
+    let parent = path.parent().ok_or("service path has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    fs::write(&path, service_unit(binary, config, database))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
 pub fn state_dir() -> PathBuf {
     xdg_path("XDG_STATE_HOME", ".local/state").join("syslens-diagnosis")
 }
 pub fn database_path() -> PathBuf {
     state_dir().join("diagnosis.sqlite")
+}
+pub fn database_path_for_config(config: &Path) -> PathBuf {
+    if config == config_path() {
+        database_path()
+    } else {
+        config.with_extension("sqlite")
+    }
 }
 fn xdg_path(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
@@ -158,6 +188,20 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| e.to_string())?;
+    let foreign_keys: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if foreign_keys != 1 {
+        return Err("SQLite foreign-key enforcement is unavailable".into());
+    }
+    let busy_timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if busy_timeout != 5_000 {
+        return Err(format!(
+            "SQLite busy timeout is {busy_timeout}ms, expected 5000ms"
+        ));
+    }
     let mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
@@ -174,6 +218,11 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
         ));
     }
     migrate(&conn)?;
+    Ok(conn)
+}
+pub fn initialize_db(path: &Path, config: &Config) -> Result<Connection, String> {
+    let conn = open_db(path)?;
+    conn.execute("INSERT INTO metadata(key,value) VALUES('interval_seconds',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [config.interval_seconds.to_string()]).map_err(|e| e.to_string())?;
     Ok(conn)
 }
 fn version_at_least(text: &str, min: (i32, i32, i32)) -> bool {
@@ -308,9 +357,14 @@ fn insert_snapshot_tx(tx: &Transaction<'_>, s: &Snapshot) -> Result<(), String> 
     }
     Ok(())
 }
-pub fn cleanup(conn: &Connection, cutoff: i64) -> Result<usize, String> {
-    conn.execute("DELETE FROM host_samples WHERE timestamp < ?", [cutoff])
-        .map_err(|e| e.to_string())
+pub fn cleanup(conn: &mut Connection, cutoff: i64) -> Result<usize, String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let count = tx
+        .execute("DELETE FROM host_samples WHERE timestamp < ?", [cutoff])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM process_identities WHERE NOT EXISTS (SELECT 1 FROM process_samples WHERE process_samples.identity_id=process_identities.id)", []).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(count)
 }
 
 pub fn database_size(path: &Path) -> u64 {
@@ -361,18 +415,43 @@ impl Collector {
         let mem = parse_meminfo(&self.proc_root.join("meminfo"), &mut gaps);
         let (some, full) = parse_psi(&self.proc_root.join("pressure/memory"), &mut gaps);
         let mut processes = Vec::new();
+        let mut status_unreadable = 0_u64;
+        let mut io_unreadable = 0_u64;
+        let mut process_unreadable = 0_u64;
         match fs::read_dir(&self.proc_root) {
             Ok(entries) => {
                 for entry in entries.flatten() {
                     if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() {
+                        let base = self.proc_root.join(pid.to_string());
+                        if fs::read_to_string(base.join("status")).is_err() {
+                            status_unreadable += 1;
+                        }
+                        if fs::read_to_string(base.join("io")).is_err() {
+                            io_unreadable += 1;
+                        }
                         match self.process(pid) {
                             Ok(p) => processes.push(p),
-                            Err(e) => gaps.push(format!("pid {pid}: {e}")),
+                            Err(_) => process_unreadable += 1,
                         }
                     }
                 }
             }
             Err(e) => gaps.push(format!("cannot enumerate proc: {e}")),
+        }
+        if status_unreadable > 0 {
+            gaps.push(format!(
+                "process status unreadable for {status_unreadable} visible processes"
+            ));
+        }
+        if io_unreadable > 0 {
+            gaps.push(format!(
+                "process io unreadable for {io_unreadable} visible processes"
+            ));
+        }
+        if process_unreadable > 0 {
+            gaps.push(format!(
+                "process stat unreadable for {process_unreadable} visible processes"
+            ));
         }
         Snapshot {
             host: HostSample {
@@ -511,11 +590,18 @@ pub struct Diagnosis {
 pub struct Interval {
     pub start_utc: String,
     pub end_utc: String,
+    pub mean_mem_total_bytes: Option<f64>,
+    pub mean_mem_available_bytes: Option<f64>,
 }
 #[derive(Serialize)]
 pub struct Coverage {
     pub current_samples: i64,
     pub comparison_samples: i64,
+    pub expected_samples: i64,
+    pub current_ratio: f64,
+    pub comparison_ratio: f64,
+    pub current_gaps: i64,
+    pub comparison_gaps: i64,
 }
 #[derive(Serialize)]
 pub struct ProcessFinding {
@@ -547,26 +633,57 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
     };
     let n = count(start, end)?;
     let cn = count(cstart, cend)?;
+    let interval_seconds: i64 = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='interval_seconds'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let expected = ((duration.num_seconds() + interval_seconds - 1) / interval_seconds).max(1);
+    let gaps = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
+        conn.query_row(
+            "SELECT count(*) FROM collection_gaps WHERE timestamp>=? AND timestamp<=?",
+            params![a.timestamp(), b.timestamp()],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    };
+    let current_gaps = gaps(start, end)?;
+    let comparison_gaps = gaps(cstart, cend)?;
+    let coverage = Coverage {
+        current_samples: n,
+        comparison_samples: cn,
+        expected_samples: expected,
+        current_ratio: n as f64 / expected as f64,
+        comparison_ratio: cn as f64 / expected as f64,
+        current_gaps,
+        comparison_gaps,
+    };
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
     let mut findings = Vec::new();
     let mut limitations=vec!["RssAnon is anonymous resident memory, not private/USS; process RSS cannot exactly reconcile physical RAM.".into()];
-    if n == 0 || cn == 0 {
-        limitations.push("No comparable stored host samples cover one or both intervals.".into());
+    if coverage.current_ratio < 0.8 || coverage.comparison_ratio < 0.8 {
+        limitations.push("At least 80% sample coverage is required in each interval; stored evidence is incomplete.".into());
         return Ok(Diagnosis {
             version: 1,
             status: "insufficient evidence".into(),
             current: Interval {
                 start_utc: fmt(start),
                 end_utc: fmt(end),
+                mean_mem_total_bytes: None,
+                mean_mem_available_bytes: None,
             },
             comparison: Interval {
                 start_utc: fmt(cstart),
                 end_utc: fmt(cend),
+                mean_mem_total_bytes: None,
+                mean_mem_available_bytes: None,
             },
-            coverage: Coverage {
-                current_samples: n,
-                comparison_samples: cn,
-            },
+            coverage,
             findings,
             processes: vec![],
             limitations,
@@ -636,15 +753,16 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
         current: Interval {
             start_utc: fmt(start),
             end_utc: fmt(end),
+            mean_mem_total_bytes: total,
+            mean_mem_available_bytes: avail,
         },
         comparison: Interval {
             start_utc: fmt(cstart),
             end_utc: fmt(cend),
+            mean_mem_total_bytes: total,
+            mean_mem_available_bytes: cavail,
         },
-        coverage: Coverage {
-            current_samples: n,
-            comparison_samples: cn,
-        },
+        coverage,
         findings,
         processes,
         limitations,
@@ -729,6 +847,21 @@ mod tests {
         )
     }
     #[test]
+    fn config_rejects_unknown_fields_and_boundaries() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        fs::write(&path, "interval_seconds = 4\n").unwrap();
+        assert!(load_config(&path).is_err());
+        fs::write(&path, "unknown = 1\n").unwrap();
+        assert!(load_config(&path).is_err());
+        fs::write(
+            &path,
+            "interval_seconds = 5\nretention_days = 185\ndatabase_budget_bytes = 1073741824\n",
+        )
+        .unwrap();
+        assert!(load_config(&path).is_ok());
+    }
+    #[test]
     fn schema_and_pid_reuse() {
         let d = tempdir().unwrap();
         let mut c = open_db(&d.path().join("x.sqlite")).unwrap();
@@ -772,6 +905,11 @@ mod tests {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
         let mut c = open_db(&path).unwrap();
+        c.execute(
+            "INSERT INTO metadata(key,value) VALUES('interval_seconds','7200')",
+            [],
+        )
+        .unwrap();
         let now = unix_now();
         for (timestamp, rss) in [
             (now - 7 * 86_400 - 3 * 3600, 11 * 1024 * 1024),
@@ -810,5 +948,119 @@ mod tests {
         assert_eq!(result.status, "ok");
         assert_eq!(result.processes[0].name, "growing");
         assert_eq!(result.processes[0].rss_anon_change_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn schema_lock_and_retention_are_enforced() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let lock = acquire_writer_lock(d.path()).unwrap();
+        assert!(acquire_writer_lock(d.path()).is_err());
+        drop(lock);
+        c.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000")
+            .unwrap();
+        let fk: i64 = c
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        let timeout: i64 = c
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((fk, timeout), (1, 5000));
+        let snapshot = Snapshot {
+            host: HostSample {
+                timestamp: 1,
+                boot_id: "b".into(),
+                ..Default::default()
+            },
+            processes: vec![ProcessSample {
+                pid: 1,
+                start_ticks: 1,
+                name: "old".into(),
+                executable: None,
+                uid: None,
+                cgroup_name: None,
+                rss_anon: None,
+                rss_file: None,
+                rss_shmem: None,
+                rss_total: None,
+                cpu_ticks: None,
+                read_bytes: None,
+                write_bytes: None,
+            }],
+            gaps: vec!["test gap".into()],
+        };
+        insert_snapshot(&mut c, &snapshot).unwrap();
+        cleanup(&mut c, 2).unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM process_identities", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        c.execute_batch("PRAGMA user_version=99").unwrap();
+        drop(c);
+        assert!(open_db(&path).is_err());
+    }
+
+    #[test]
+    fn fake_proc_records_missing_sources_as_bounded_gaps() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join("sys/kernel/random")).unwrap();
+        fs::create_dir_all(d.path().join("pressure")).unwrap();
+        fs::create_dir_all(d.path().join("42")).unwrap();
+        fs::write(d.path().join("sys/kernel/random/boot_id"), "boot\n").unwrap();
+        fs::write(
+            d.path().join("42/stat"),
+            "42 (fake) S 0 0 0 0 0 0 0 0 0 0 1 2 0 0 0 0 0 0 9\n",
+        )
+        .unwrap();
+        let snapshot = Collector::new(d.path().to_path_buf()).collect(1);
+        assert!(snapshot.host.mem_total.is_none());
+        assert!(snapshot.gaps.iter().any(|g| g.contains("meminfo")));
+        assert!(
+            snapshot
+                .gaps
+                .iter()
+                .any(|g| g.contains("process status unreadable"))
+        );
+    }
+
+    #[test]
+    fn service_unit_keeps_custom_config_and_database_together() {
+        let unit = service_unit(
+            Path::new("/opt/syslens-diagnosis"),
+            Path::new("/tmp/custom.toml"),
+            Path::new("/tmp/custom.sqlite"),
+        );
+        assert!(unit.contains("--config /tmp/custom.toml --database /tmp/custom.sqlite"));
+    }
+
+    #[test]
+    fn sparse_history_is_insufficient_evidence() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for timestamp in [now - 3600, now - 7 * 86400 - 3 * 3600] {
+            insert_snapshot(
+                &mut c,
+                &Snapshot {
+                    host: HostSample {
+                        timestamp,
+                        boot_id: "b".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            diagnose_memory(&path, "2h", "previous-week")
+                .unwrap()
+                .status,
+            "insufficient evidence"
+        );
     }
 }

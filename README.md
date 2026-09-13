@@ -239,7 +239,7 @@ initialises `~/.local/state/syslens-diagnosis/diagnosis.sqlite`, then enables
 its user service. The daemon stores host RAM composition plus visible process
 RssAnon/RSS and CPU/I/O counters every 30 seconds. `diagnose memory` compares
 stored local intervals and names observed process growth; it clearly reports
-insufficient coverage and never claims RssAnon is USS/private memory. `chat`
+insufficient coverage below 80% in either interval and never claims RssAnon is USS/private memory. `chat`
 and `incidents` remain unavailable in this release.
 
 Core forwards `syslens diagnose ...`, `syslens chat`, and `syslens incidents

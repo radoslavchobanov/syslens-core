@@ -28,8 +28,12 @@ enum CommandLine {
     Daemon {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        database: Option<PathBuf>,
     },
     Diagnose {
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[command(subcommand)]
         resource: Diagnose,
     },
@@ -68,15 +72,16 @@ fn main() -> ExitCode {
     let r = match cli.command {
         CommandLine::Enable { config } => {
             let p = config.unwrap_or_else(diagnosis::config_path);
+            let db = diagnosis::database_path_for_config(&p);
             match diagnosis::ensure_config(&p)
-                .and_then(|_| diagnosis::open_db(&diagnosis::database_path()).map(|_| ()))
+                .and_then(|config| diagnosis::initialize_db(&db, &config).map(|_| ()))
+                .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
+                .and_then(|binary| diagnosis::install_user_service(&binary, &p, &db))
+                .and_then(|_| service(&["daemon-reload"]))
                 .and_then(|_| service(&["enable", "--now", "syslens-diagnosis.service"]))
             {
                 Ok(()) => {
-                    println!(
-                        "syslens-diagnosis enabled; recording uses {}",
-                        diagnosis::database_path().display()
-                    );
+                    println!("syslens-diagnosis enabled; recording uses {}", db.display());
                     Ok(())
                 }
                 Err(e) => Err(format!(
@@ -86,25 +91,33 @@ fn main() -> ExitCode {
         }
         CommandLine::Disable => service(&["disable", "--now", "syslens-diagnosis.service"]),
         CommandLine::Status { config } => status(config.unwrap_or_else(diagnosis::config_path)),
-        CommandLine::Daemon { config } => daemon(config),
+        CommandLine::Daemon { config, database } => daemon(config, database),
         CommandLine::Diagnose {
+            config,
             resource:
                 Diagnose::Memory {
                     since,
                     compare,
                     json,
                 },
-        } => match diagnosis::diagnose_memory(&diagnosis::database_path(), &since, &compare) {
-            Ok(d) => {
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&d).unwrap())
-                } else {
-                    print!("{}", diagnosis::render_diagnosis(&d))
-                };
-                Ok(())
+        } => {
+            let config = config.unwrap_or_else(diagnosis::config_path);
+            match diagnosis::diagnose_memory(
+                &diagnosis::database_path_for_config(&config),
+                &since,
+                &compare,
+            ) {
+                Ok(d) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&d).unwrap())
+                    } else {
+                        print!("{}", diagnosis::render_diagnosis(&d))
+                    };
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        },
+        }
         CommandLine::Chat => Err("chat is not available yet; use `syslens diagnose memory`".into()),
         CommandLine::Incidents => Err("incidents are not available yet".into()),
     };
@@ -125,7 +138,7 @@ fn status(config: PathBuf) -> Result<(), String> {
         return Ok(());
     }
     let cfg = diagnosis::load_config(&config)?;
-    let db = diagnosis::database_path();
+    let db = diagnosis::database_path_for_config(&config);
     if !db.exists() {
         println!(
             "syslens-diagnosis: configured; no evidence database at {}",
@@ -168,11 +181,11 @@ fn status(config: PathBuf) -> Result<(), String> {
     );
     Ok(())
 }
-fn daemon(config: PathBuf) -> Result<(), String> {
+fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
     let cfg = diagnosis::load_config(&config)?;
-    let db = diagnosis::database_path();
+    let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
     let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir())?;
-    let mut conn = diagnosis::open_db(&db)?;
+    let mut conn = diagnosis::initialize_db(&db, &cfg)?;
     let collector = diagnosis::Collector::new(PathBuf::from("/proc"));
     loop {
         if diagnosis::budget_allows(&db, cfg.database_budget_bytes)
@@ -183,7 +196,7 @@ fn daemon(config: PathBuf) -> Result<(), String> {
                 eprintln!("syslens-diagnosis: collection write failed: {e}")
             }
             let cutoff = diagnosis::unix_now() - i64::from(cfg.retention_days) * 86400;
-            if let Err(e) = diagnosis::cleanup(&conn, cutoff) {
+            if let Err(e) = diagnosis::cleanup(&mut conn, cutoff) {
                 eprintln!("syslens-diagnosis: retention cleanup failed: {e}")
             }
         } else {

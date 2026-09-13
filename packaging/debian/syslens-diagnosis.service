@@ -2,7 +2,7 @@
 Description=SysLens local diagnosis companion
 
 [Service]
-ExecStart=/usr/bin/syslens-diagnosis daemon --config %h/.config/syslens-diagnosis/config.toml
+ExecStart=/usr/bin/syslens-diagnosis daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite
 Restart=on-failure
 RestartSec=5
 
