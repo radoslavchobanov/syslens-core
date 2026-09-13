@@ -60,6 +60,23 @@ quit. The refresh interval defaults to two seconds and can be changed with:
 syslens tui --interval 3
 ```
 
+Collection runs on a worker thread, so keys and rendering remain responsive while
+sampling. Repeated refresh requests coalesce into the current collection. The TUI
+restores the terminal before joining an active sample on exit. Optional `lspci`
+enrichment has a 500 ms timeout and a 64 KiB output limit; failed probes retain the
+usual unavailable fallback and are cached per PCI slot. The TUI
+collects the complete process list (ignoring `--process-limit`), so memory sorting
+can find idle processes and selection scrolls through all entries. CLI JSON and
+MQTT still publish the requested CPU-ranked top processes, six by default.
+
+One-shot snapshots and the first agent/TUI sample use `--sample-window` (default
+0.35 seconds, accepted range 0.05–2 seconds). Later agent/TUI samples reuse the
+previous counters and cover the full interval between readings, including
+collection work. Disk, network, and energy rates use each source's read midpoint;
+process CPU uses each PID's stat-read midpoint. `sample_window_seconds` reports
+the actual interval between CPU readings. Slow collection skips missed deadlines
+instead of publishing a burst of catch-up snapshots.
+
 For scripts, pipes, the Plasma widget, and any program consuming Core, the
 machine-facing JSON contract remains explicit and unchanged:
 
@@ -131,6 +148,12 @@ syslens --config ~/.config/syslens/config.toml --publish --once
 syslens agent --config ~/.config/syslens/config.toml
 ```
 
+Each process entry in a snapshot includes `private_bytes`, the resident
+anonymous memory currently held by that process. File-backed mappings such as
+large database caches are not included in this value. The older `rss_bytes`
+field remains in the payload for compatibility with older consumers, but new
+interfaces should use `private_bytes`.
+
 The MQTT broker is user-provided. SysLens publishes retained messages on:
 
 ```text
@@ -162,6 +185,24 @@ Each host keeps its own compact, owner-only collector state at
 `~/.local/state/syslens-core/state.json`. It is written atomically every minute
 and survives normal service and system restarts. No central database is
 required.
+
+The agent keeps collecting and saving this local history while its MQTT broker
+is unavailable. It retries MQTT with capped exponential backoff and small
+jitter, retaining only the newest snapshot during an outage. Each new broker
+session publishes retained `meta`, then retained `availability: online`, then
+the current `state`. `--once` waits for its selected MQTT QoS to complete and
+returns an error if connection or delivery times out. A clean SIGINT or SIGTERM
+always saves history and makes a bounded, best-effort retained `offline` update;
+that final MQTT attempt has a 400 ms budget.
+
+The agent holds an advisory history lock for its lifetime; a second agent using
+the same state path exits with an error. Standalone snapshots and TUI refreshes
+lock before loading, update and atomically save, then release ownership. While
+the agent owns history, local views keep ephemeral history without writing it.
+An open TUI therefore does not hold the lock between refreshes. A new agent may
+need to retry if a local refresh currently owns the lock. Temporary state files
+are unique and owner-only. Read, parse, and persistence errors are reported;
+malformed history is preserved and must be moved aside explicitly to reset it.
 
 For each tracked metric, the state stores weighted aggregates rather than raw
 three-second samples:

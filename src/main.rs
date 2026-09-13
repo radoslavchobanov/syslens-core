@@ -1,6 +1,8 @@
 use chrono::{Datelike, Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
-use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS, Transport};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, LastWill, MqttOptions, Outgoing, Packet, QoS, Transport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -12,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod collector;
+mod history;
 mod tui;
 
 const PROC: &str = "/proc";
@@ -29,6 +32,11 @@ const DAY_SECONDS: f64 = 24.0 * HOUR_SECONDS;
 const HOURLY_BUCKET_RETENTION: i64 = 24;
 const DAILY_BUCKET_RETENTION: i64 = 30;
 const PROCESS_CPU_RESPONSE_SECONDS: f64 = 120.0;
+const MQTT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MQTT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const MQTT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(400);
+const MQTT_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const MQTT_RETRY_MAX: Duration = Duration::from_secs(60);
 static PCI_GPU_MODEL_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 static EMBEDDED_GPU_MODEL: OnceLock<Option<String>> = OnceLock::new();
 
@@ -115,7 +123,7 @@ enum InventoryCommand {
 #[derive(Args, Debug, Clone)]
 struct SnapshotArgs {
     /// Seconds used to calculate live rates and CPU usage.
-    #[arg(long, default_value_t = 0.35)]
+    #[arg(long, default_value_t = 0.35, value_parser = collector::parse_window)]
     sample_window: f64,
     /// Number of top processes included in the snapshot.
     #[arg(long, default_value_t = 6)]
@@ -130,7 +138,7 @@ struct AgentArgs {
     once: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RuntimeConfig {
     #[serde(default)]
     agent: AgentConfig,
@@ -139,7 +147,7 @@ struct RuntimeConfig {
     mqtt: MqttConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct AgentConfig {
     #[serde(default = "default_host_id")]
     host_id: String,
@@ -159,7 +167,7 @@ impl Default for AgentConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CollectionConfig {
     #[serde(default = "default_process_limit")]
     process_limit: usize,
@@ -173,7 +181,7 @@ impl Default for CollectionConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct MqttConfig {
     host: String,
     #[serde(default = "default_port")]
@@ -429,40 +437,6 @@ fn state_path() -> PathBuf {
         .join("syslens-core/state.json")
 }
 
-fn load_state() -> CollectorState {
-    fs::read_to_string(state_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn save_state(state: &CollectorState) {
-    let path = state_path();
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-    }
-    let temporary = path.with_extension("tmp");
-    let Ok(serialized) = serde_json::to_vec(state) else {
-        return;
-    };
-    if fs::write(&temporary, serialized).is_ok() {
-        let _ = fs::rename(&temporary, &path);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-    }
-}
-
 fn finite(value: f64) -> bool {
     value.is_finite()
 }
@@ -565,6 +539,21 @@ fn parse_kv(path: &str, separator: char) -> BTreeMap<String, String> {
                 .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
         })
         .collect()
+}
+
+fn status_kib(status: &str, field: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.trim() == field)
+            .then(|| value.split_whitespace().next()?.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn private_memory_bytes_from_status(status: &str) -> Option<u64> {
+    // RssAnon is the resident anonymous portion of a process. It excludes
+    // file-backed mappings such as Bitcoin's mapped database/cache pages.
+    status_kib(status, "RssAnon").map(|kib| kib.saturating_mul(1024))
 }
 
 fn cpu_times() -> Vec<Vec<u64>> {
@@ -1699,6 +1688,63 @@ fn driver_name(device: &Path) -> Option<String> {
     })
 }
 
+// lspci is optional enrichment. Keep its output and runtime bounded, including
+// when a probe fills its pipe or leaves stdout open after the child exits.
+fn pci_probe_output(command: &mut ProcessCommand, timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let started = std::time::Instant::now();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let result = (|| {
+        let mut stdout = child.stdout.take()?;
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let mut output = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            if started.elapsed() >= timeout {
+                return None;
+            }
+            let read = match stdout.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            };
+            output.extend_from_slice(&buffer[..read]);
+            if output.len() > 64 * 1024 {
+                return None;
+            }
+            if let Some(status) = child.try_wait().ok()? {
+                if !status.success() {
+                    return None;
+                }
+                // Drain available bytes, but never wait on inherited pipe handles.
+                if read == 0 {
+                    return Some(output);
+                }
+            }
+            if read == 0 {
+                thread::sleep(
+                    Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+        }
+    })();
+    // On timeout/error kill before waiting; successful try_wait already reaped it.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 fn pci_gpu_model(device: &Path) -> Option<String> {
     let slot = read(device.join("uevent")).and_then(|uevent| {
         uevent
@@ -1711,26 +1757,25 @@ fn pci_gpu_model(device: &Path) -> Option<String> {
     {
         return model.clone();
     }
-    let model = ProcessCommand::new("lspci")
-        .args(["-nn", "-s", &slot])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|output| output.lines().next().map(str::to_owned))
-        .and_then(|line| line.split_once(": ").map(|(_, value)| value.to_owned()))
-        .map(|value| {
-            value
-                .rsplit_once(" [")
-                .map(|(model, _)| model)
-                .unwrap_or(&value)
-                .split(" (rev ")
-                .next()
-                .unwrap_or(&value)
-                .trim()
-                .to_owned()
-        })
-        .filter(|model| !model.is_empty());
+    let model = pci_probe_output(
+        ProcessCommand::new("lspci").args(["-nn", "-s", &slot]),
+        Duration::from_millis(500),
+    )
+    .and_then(|output| String::from_utf8(output).ok())
+    .and_then(|output| output.lines().next().map(str::to_owned))
+    .and_then(|line| line.split_once(": ").map(|(_, value)| value.to_owned()))
+    .map(|value| {
+        value
+            .rsplit_once(" [")
+            .map(|(model, _)| model)
+            .unwrap_or(&value)
+            .split(" (rev ")
+            .next()
+            .unwrap_or(&value)
+            .trim()
+            .to_owned()
+    })
+    .filter(|model| !model.is_empty());
     if let Ok(mut cache) = cache.lock() {
         cache.insert(slot, model.clone());
     }
@@ -1853,8 +1898,10 @@ fn battery_snapshot(power: &Value) -> Value {
 
 #[derive(Clone, Default)]
 struct ProcessCounters {
+    sampled_at: Option<std::time::Instant>,
     ticks: u64,
     start_ticks: u64,
+    private_bytes: u64,
     rss_bytes: u64,
     name: String,
 }
@@ -1870,9 +1917,14 @@ fn process_counters() -> HashMap<u32, ProcessCounters> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
+        let started = std::time::Instant::now();
         let Some(stat) = read(entry.path().join("stat")) else {
             continue;
         };
+        let sampled_at = Some(started + started.elapsed() / 2);
+        let private_bytes = read(entry.path().join("status"))
+            .and_then(|status| private_memory_bytes_from_status(&status))
+            .unwrap_or_default();
         let Some(open) = stat.find('(') else {
             continue;
         };
@@ -1909,8 +1961,10 @@ fn process_counters() -> HashMap<u32, ProcessCounters> {
         processes.insert(
             pid,
             ProcessCounters {
+                sampled_at,
                 ticks,
                 start_ticks,
+                private_bytes,
                 rss_bytes: rss_pages.saturating_mul(page_size),
                 name: process_name,
             },
@@ -1928,15 +1982,24 @@ fn process_snapshot(
 ) -> Value {
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
     let now = now_epoch();
-    let mut top: Vec<Value> = after
+    let mut top: Vec<(u32, &ProcessCounters, f64, f64)> = after
         .iter()
         .map(|(pid, current)| {
             let previous = before
                 .get(pid)
                 .filter(|previous| previous.start_ticks == current.start_ticks)
                 .unwrap_or(current);
-            let cpu = current.ticks.saturating_sub(previous.ticks) as f64 / ticks_per_second
-                / elapsed
+            let process_elapsed = current
+                .sampled_at
+                .zip(previous.sampled_at)
+                .map(|(current, previous)| {
+                    current.saturating_duration_since(previous).as_secs_f64()
+                })
+                .filter(|elapsed| *elapsed > 0.0)
+                .unwrap_or(elapsed);
+            let cpu = current.ticks.saturating_sub(previous.ticks) as f64
+                / ticks_per_second
+                / process_elapsed
                 * 100.0;
             let key = format!("{pid}:{}", current.start_ticks);
             let history = state.processes.entry(key).or_default();
@@ -1949,7 +2012,12 @@ fn process_snapshot(
             };
             history.cpu_average_percent = average.max(0.0);
             history.last_seen = now;
-            json!({"pid":pid,"name":current.name,"cpu_percent":round(cpu,1),"cpu_average_percent":round(history.cpu_average_percent,1),"rss_bytes":current.rss_bytes})
+            (
+                *pid,
+                current,
+                round(cpu, 1),
+                round(history.cpu_average_percent, 1),
+            )
         })
         .collect();
     state
@@ -1959,27 +2027,17 @@ fn process_snapshot(
     // A raw/smoothed mix is not transitive and can make Rust's sort panic.
     // Quantising to the value actually published (one decimal place) also
     // gives a stable order for brief process spikes.
-    top.sort_by_key(|process| {
-        let cpu = process
-            .get("cpu_average_percent")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
-            .unwrap_or_default();
-        let memory = process
-            .get("rss_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let pid = process
-            .get("pid")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
+    top.sort_by_key(|(pid, process, _, cpu)| {
         (
             std::cmp::Reverse((cpu * 10.0).round() as i64),
-            std::cmp::Reverse(memory),
-            pid,
+            std::cmp::Reverse(process.private_bytes),
+            *pid,
         )
     });
     top.truncate(limit);
+    let top: Vec<Value> = top.into_iter().map(|(pid, current, cpu, average)| {
+        json!({"pid":pid,"name":current.name,"cpu_percent":cpu,"cpu_average_percent":average,"private_bytes":current.private_bytes,"rss_bytes":current.rss_bytes})
+    }).collect();
     json!({"available":true,"count":after.len(),"top":top})
 }
 
@@ -2176,30 +2234,7 @@ fn enrich_history(
 }
 
 fn snapshot(args: &SnapshotArgs, state: &mut CollectorState) -> Value {
-    let window = args.sample_window.clamp(0.05, 2.0);
-    let cpu_before = cpu_times();
-    let rapl_before = rapl_counters();
-    let disk_before = disk_counters();
-    let net_before = net_counters();
-    let process_before = process_counters();
-    let started = std::time::Instant::now();
-    thread::sleep(Duration::from_secs_f64(window));
-    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-    let cpu_after = cpu_times();
-    let rapl_after = rapl_counters();
-    let disk_after = disk_counters();
-    let net_after = net_counters();
-    let process_after = process_counters();
-    let cpu_power_watts = rapl_power_watts(&rapl_before, &rapl_after, elapsed);
-    let power = power_snapshot(cpu_power_watts, &rapl_after);
-    let mut snapshot = json!({
-        "schema_version":1,"timestamp":now_epoch(),"sample_window_seconds":round(elapsed,3),"uptime":uptime_snapshot(),
-        "cpu":cpu_snapshot(&cpu_before,&cpu_after,cpu_power_watts),"memory":memory_snapshot(),"temperature":temperature_snapshot(),
-        "power":power,"battery":battery_snapshot(&power),"gpu":gpu_snapshot(),"disk":disk_snapshot(&disk_before,&disk_after,elapsed),
-        "network":network_snapshot(&net_before,&net_after,elapsed),"processes":process_snapshot(&process_before,&process_after,elapsed,args.process_limit,state)
-    });
-    enrich_history(&mut snapshot, state, &net_after);
-    snapshot
+    collector::Collector::default().sample(args, state)
 }
 
 fn default_config_path() -> PathBuf {
@@ -2225,10 +2260,9 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), String> {
     if !config.agent.interval_seconds.is_finite() || config.agent.interval_seconds < 0.5 {
         return Err("agent.interval_seconds must be at least 0.5".into());
     }
-    if !config.agent.sample_window_seconds.is_finite() || config.agent.sample_window_seconds < 0.05
-    {
-        return Err("agent.sample_window_seconds must be at least 0.05".into());
-    }
+    Duration::try_from_secs_f64(config.agent.interval_seconds)
+        .map_err(|error| error.to_string())?;
+    collector::validate_window(config.agent.sample_window_seconds)?;
     if config.agent.sample_window_seconds > config.agent.interval_seconds {
         return Err("agent.sample_window_seconds must not exceed agent.interval_seconds".into());
     }
@@ -2294,12 +2328,88 @@ fn redacted_config(path: &Path, config: &RuntimeConfig) -> Value {
     })
 }
 
-struct ConnectionControl {
-    stop: Arc<AtomicBool>,
-    join: thread::JoinHandle<()>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishProgress {
+    Dispatched,
+    Delivered,
 }
 
-fn create_client(config: &RuntimeConfig) -> Result<(Client, ConnectionControl), String> {
+#[derive(Debug, Default)]
+struct LatestSnapshot {
+    payload: Option<Vec<u8>>,
+    generation: u64,
+}
+
+impl LatestSnapshot {
+    fn replace(&mut self, payload: Vec<u8>) {
+        self.payload = Some(payload);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn copy_current(&self) -> Option<(u64, Vec<u8>)> {
+        self.payload
+            .as_ref()
+            .map(|payload| (self.generation, payload.clone()))
+    }
+}
+
+#[derive(Debug)]
+struct RetrySchedule {
+    failures: u32,
+    next_attempt: std::time::Instant,
+}
+
+impl RetrySchedule {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            next_attempt: std::time::Instant::now(),
+        }
+    }
+
+    fn ready(&self, now: std::time::Instant) -> bool {
+        now >= self.next_attempt
+    }
+
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.next_attempt = std::time::Instant::now();
+    }
+
+    fn failed(&mut self, now: std::time::Instant, jitter: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt = now + retry_delay(self.failures, jitter);
+    }
+}
+
+fn retry_delay(failures: u32, jitter: Duration) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    let exponential = MQTT_RETRY_INITIAL
+        .checked_mul(1_u32 << shift)
+        .unwrap_or(MQTT_RETRY_MAX)
+        .min(MQTT_RETRY_MAX);
+    exponential.saturating_add(jitter).min(MQTT_RETRY_MAX)
+}
+
+struct RetryJitter {
+    state: u64,
+}
+
+impl RetryJitter {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next(&mut self) -> Duration {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        let upper = (MQTT_RETRY_INITIAL / 4).as_nanos() as u64;
+        Duration::from_nanos(self.state % (upper + 1))
+    }
+}
+
+fn create_client(config: &RuntimeConfig) -> Result<(AsyncClient, EventLoop), String> {
     let base = topic_base(config);
     let client_id = config
         .mqtt
@@ -2326,143 +2436,373 @@ fn create_client(config: &RuntimeConfig) -> Result<(Client, ConnectionControl), 
     if config.mqtt.tls {
         options.set_transport(Transport::tls_with_default_config());
     }
-    let (client, mut connection) = Client::new(options, 16);
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let join = thread::spawn(move || {
-        let mut announced = false;
-        for event in connection.iter() {
-            if worker_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            match event {
-                Ok(Event::Incoming(Packet::ConnAck(_))) if !announced => {
-                    announced = true;
-                    let _ = ready_sender.send(Ok(()));
-                }
-                Err(error) if !announced => {
-                    announced = true;
-                    let _ = ready_sender.send(Err(error.to_string()));
-                }
-                Err(error) => {
-                    eprintln!("syslens: MQTT connection stopped: {error}");
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-    match ready_receiver.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => Ok((client, ConnectionControl { stop, join })),
-        Ok(Err(error)) => {
-            stop.store(true, Ordering::Relaxed);
-            drop(client);
-            let _ = join.join();
-            Err(format!(
-                "could not connect to MQTT broker {}:{}: {error}",
-                config.mqtt.host, config.mqtt.port
-            ))
-        }
-        Err(_) => {
-            stop.store(true, Ordering::Relaxed);
-            drop(client);
-            let _ = join.join();
-            Err(format!(
-                "timed out connecting to MQTT broker {}:{}",
-                config.mqtt.host, config.mqtt.port
-            ))
-        }
-    }
-}
-
-fn publish(
-    client: &Client,
-    topic: String,
-    payload: impl Into<Vec<u8>>,
-    config: &RuntimeConfig,
-    retain: bool,
-) -> Result<(), String> {
-    client
-        .publish(topic, qos(config.mqtt.qos), retain, payload)
-        .map_err(|error| format!("MQTT publish failed: {error}"))
+    let (client, mut eventloop) = AsyncClient::new(options, 8);
+    eventloop
+        .network_options
+        .set_connection_timeout(MQTT_CONNECT_TIMEOUT.as_secs());
+    Ok((client, eventloop))
 }
 
 fn metadata(config: &RuntimeConfig) -> Value {
     json!({"schema_version":1,"host_id":config.agent.host_id,"hostname":hostname::get().ok().and_then(|name|name.into_string().ok()).unwrap_or_else(||"unknown".into()),"platform":format!("{} {}",std::env::consts::OS,std::env::consts::ARCH),"publisher":"syslens-core","published_at":now_epoch()})
 }
 
-fn publish_snapshot(
-    client: &Client,
+fn delivery_requirement(qos: u8) -> PublishProgress {
+    if qos == 0 {
+        PublishProgress::Dispatched
+    } else {
+        PublishProgress::Delivered
+    }
+}
+
+fn publish_messages(
     config: &RuntimeConfig,
-    args: &SnapshotArgs,
-    state: &mut CollectorState,
+    messages: Vec<(String, Vec<u8>, bool)>,
+    timeout: Duration,
+    stop: &AtomicBool,
 ) -> Result<(), String> {
-    let mut data = snapshot(args, state);
-    data["source"] = json!({"host_id":config.agent.host_id,"hostname":hostname::get().ok().and_then(|name|name.into_string().ok()).unwrap_or_else(||"unknown".into()),"transport":"mqtt"});
-    publish(
-        client,
-        format!("{}/state", topic_base(config)),
-        serde_json::to_vec(&data).map_err(|error| error.to_string())?,
+    publish_messages_with_budget(
         config,
-        config.mqtt.retain,
+        messages,
+        timeout,
+        MQTT_CONNECT_TIMEOUT.saturating_add(timeout),
+        stop,
     )
 }
 
+fn publish_messages_with_budget(
+    config: &RuntimeConfig,
+    messages: Vec<(String, Vec<u8>, bool)>,
+    delivery_timeout: Duration,
+    budget: Duration,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start MQTT runtime: {error}"))?
+        .block_on(publish_messages_async(
+            config,
+            messages,
+            delivery_timeout,
+            budget,
+            stop,
+        ))
+}
+
+async fn next_mqtt_event(
+    eventloop: &mut EventLoop,
+    deadline: tokio::time::Instant,
+    stop: &AtomicBool,
+) -> Result<Event, String> {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("MQTT operation interrupted by shutdown".into());
+        }
+        tokio::select! {
+            event = eventloop.poll() => return event.map_err(|error| format!("MQTT connection failed: {error}")),
+            _ = tokio::time::sleep_until(deadline) => return Err("timed out waiting for MQTT delivery".into()),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+async fn publish_messages_async(
+    config: &RuntimeConfig,
+    messages: Vec<(String, Vec<u8>, bool)>,
+    delivery_timeout: Duration,
+    budget: Duration,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let (client, mut eventloop) = create_client(config)?;
+    let overall_deadline = tokio::time::Instant::now() + budget;
+    let result = async {
+        let connect_deadline = overall_deadline;
+        loop {
+            if let Event::Incoming(Packet::ConnAck(_)) =
+                next_mqtt_event(&mut eventloop, connect_deadline, stop).await?
+            {
+                break;
+            }
+        }
+        for (topic, payload, retain) in &messages {
+            client
+                .publish(topic, qos(config.mqtt.qos), *retain, payload.clone())
+                .await
+                .map_err(|error| format!("MQTT publish failed: {error}"))?;
+        }
+        let expected = delivery_requirement(config.mqtt.qos);
+        let delivery_deadline =
+            (tokio::time::Instant::now() + delivery_timeout).min(overall_deadline);
+        let mut delivered = 0;
+        while delivered < messages.len() {
+            match next_mqtt_event(&mut eventloop, delivery_deadline, stop).await? {
+                Event::Outgoing(Outgoing::Publish(_))
+                    if expected == PublishProgress::Dispatched =>
+                {
+                    delivered += 1;
+                }
+                Event::Incoming(Packet::PubAck(_)) | Event::Incoming(Packet::PubComp(_))
+                    if expected == PublishProgress::Delivered =>
+                {
+                    delivered += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let mut cleanup_result = client
+        .disconnect()
+        .await
+        .map_err(|error| format!("MQTT disconnect failed: {error}"));
+    if result.is_ok() {
+        let disconnect_deadline =
+            (tokio::time::Instant::now() + Duration::from_millis(100)).min(overall_deadline);
+        cleanup_result = loop {
+            match next_mqtt_event(&mut eventloop, disconnect_deadline, stop).await {
+                Ok(Event::Outgoing(Outgoing::Disconnect)) => break Ok(()),
+                Ok(_) => {}
+                Err(error) if error.contains("timed out") => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+    }
+    delivery_result_after_cleanup(result, cleanup_result)
+}
+
+fn delivery_result_after_cleanup(
+    delivery: Result<(), String>,
+    _cleanup: Result<(), String>,
+) -> Result<(), String> {
+    delivery
+}
+
+fn publish_snapshot(
+    config: &RuntimeConfig,
+    snapshot: &[u8],
+    timeout: Duration,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let base = topic_base(config);
+    // Publish this sequence for every fresh MQTT session.  The retained meta and
+    // availability records always precede the retained current state.
+    publish_messages(
+        config,
+        vec![
+            (
+                format!("{base}/meta"),
+                serde_json::to_vec(&metadata(config)).map_err(|error| error.to_string())?,
+                true,
+            ),
+            (format!("{base}/availability"), b"online".to_vec(), true),
+            (
+                format!("{base}/state"),
+                snapshot.to_vec(),
+                config.mqtt.retain,
+            ),
+        ],
+        timeout,
+        stop,
+    )
+}
+
+fn publish_offline(config: &RuntimeConfig, stop: &AtomicBool) -> Result<(), String> {
+    publish_messages_with_budget(
+        config,
+        vec![(
+            format!("{}/availability", topic_base(config)),
+            b"offline".to_vec(),
+            true,
+        )],
+        MQTT_SHUTDOWN_TIMEOUT,
+        MQTT_SHUTDOWN_TIMEOUT,
+        stop,
+    )
+}
+
+fn install_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))
+        .map_err(|error| format!("could not register SIGINT handler: {error}"))?;
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))
+        .map_err(|error| format!("could not register SIGTERM handler: {error}"))?;
+    Ok(stop)
+}
+
+fn sleep_until(deadline: std::time::Instant, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+struct MqttTransport {
+    latest: Arc<(Mutex<LatestSnapshot>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+    config: RuntimeConfig,
+}
+
+impl MqttTransport {
+    fn start(config: RuntimeConfig) -> Self {
+        let latest = Arc::new((Mutex::new(LatestSnapshot::default()), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_latest = Arc::clone(&latest);
+        let worker_stop = Arc::clone(&stop);
+        let worker_config = config.clone();
+        let join = thread::spawn(move || {
+            let mut retry = RetrySchedule::new();
+            let mut jitter = RetryJitter::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64,
+            );
+            let mut delivered = None;
+            while !worker_stop.load(Ordering::Relaxed) {
+                let (generation, payload) = {
+                    let (lock, wake) = &*worker_latest;
+                    let guard = lock.lock().expect("MQTT latest snapshot mutex poisoned");
+                    if guard.copy_current().is_none() || delivered == Some(guard.generation) {
+                        let _ = wake
+                            .wait_timeout(guard, Duration::from_millis(100))
+                            .expect("MQTT latest snapshot mutex poisoned");
+                        continue;
+                    }
+                    guard.copy_current().expect("snapshot checked above")
+                };
+                let now = std::time::Instant::now();
+                if !retry.ready(now) {
+                    sleep_until(retry.next_attempt, &worker_stop);
+                    continue;
+                }
+                match publish_snapshot(
+                    &worker_config,
+                    &payload,
+                    MQTT_DELIVERY_TIMEOUT,
+                    &worker_stop,
+                ) {
+                    Ok(()) => {
+                        delivered = Some(generation);
+                        retry.succeeded();
+                    }
+                    Err(_) if worker_stop.load(Ordering::Relaxed) => break,
+                    Err(error) => {
+                        eprintln!("syslens: MQTT publish failed; retrying: {error}");
+                        retry.failed(std::time::Instant::now(), jitter.next());
+                    }
+                }
+            }
+        });
+        Self {
+            latest,
+            stop,
+            join: Some(join),
+            config,
+        }
+    }
+
+    fn submit(&self, payload: Vec<u8>) {
+        let (lock, wake) = &*self.latest;
+        lock.lock()
+            .expect("MQTT latest snapshot mutex poisoned")
+            .replace(payload);
+        wake.notify_one();
+    }
+
+    fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.latest.1.notify_all();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        // A final offline record is useful when the broker is reachable, but
+        // shutdown must never wait on a reconnect.  The stopped flag makes this
+        // attempt return promptly when a connection is still pending.
+        let offline_stop = AtomicBool::new(false);
+        let _ = publish_offline(&self.config, &offline_stop);
+    }
+}
+
 fn run_agent(config: RuntimeConfig, once: bool) -> Result<(), String> {
-    let (client, connection) = create_client(&config)?;
-    let base = topic_base(&config);
-    publish(
-        &client,
-        format!("{base}/meta"),
-        serde_json::to_vec(&metadata(&config)).map_err(|error| error.to_string())?,
-        &config,
-        true,
-    )?;
-    publish(
-        &client,
-        format!("{base}/availability"),
-        "online",
-        &config,
-        true,
-    )?;
+    let stop = install_shutdown_signal()?;
+    run_agent_until(config, once, stop, state_path())
+}
+
+fn run_agent_until(
+    config: RuntimeConfig,
+    once: bool,
+    stop: Arc<AtomicBool>,
+    history_path: PathBuf,
+) -> Result<(), String> {
     let args = SnapshotArgs {
         sample_window: config.agent.sample_window_seconds,
         process_limit: config.collection.process_limit,
     };
-    let mut state = load_state();
+    let mut collector = collector::Collector::default();
+    run_agent_loop(config, once, stop, history_path, move |state| {
+        collector.sample(&args, state)
+    })
+}
+
+fn run_agent_loop<F>(
+    config: RuntimeConfig,
+    once: bool,
+    stop: Arc<AtomicBool>,
+    history_path: PathBuf,
+    mut sample: F,
+) -> Result<(), String>
+where
+    F: FnMut(&mut CollectorState) -> Value,
+{
+    let mut history = history::HistoryStore::open(history_path, history::Access::Writer)?;
     let mut last_state_save = std::time::Instant::now() - Duration::from_secs(60);
     let mut next = std::time::Instant::now();
+    let transport = (!once).then(|| MqttTransport::start(config.clone()));
     let result = loop {
-        if let Err(error) = publish_snapshot(&client, &config, &args, &mut state) {
+        let mut data = sample(&mut history.state);
+        data["source"] = json!({"host_id":config.agent.host_id,"hostname":hostname::get().ok().and_then(|name|name.into_string().ok()).unwrap_or_else(||"unknown".into()),"transport":"mqtt"});
+        let payload = serde_json::to_vec(&data).map_err(|error| error.to_string())?;
+        if let Some(transport) = &transport {
+            transport.submit(payload);
+        } else if let Err(error) = publish_snapshot(&config, &payload, MQTT_DELIVERY_TIMEOUT, &stop)
+        {
             break Err(error);
         }
         if once || last_state_save.elapsed() >= Duration::from_secs(60) {
-            save_state(&state);
+            if let Err(error) = history.save() {
+                break Err(error);
+            }
             last_state_save = std::time::Instant::now();
         }
         if once {
             break Ok(());
         }
-        next += Duration::from_secs_f64(config.agent.interval_seconds);
-        thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+        if stop.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        next = collector::next_deadline(
+            next,
+            std::time::Instant::now(),
+            Duration::from_secs_f64(config.agent.interval_seconds),
+        );
+        sleep_until(next, &stop);
     };
-    // The synchronous client queues publishes for the connection thread.  Give
-    // a one-shot diagnostic publish a chance to cross the socket before its
-    // deliberately clean shutdown switches availability to offline.
-    if once {
-        thread::sleep(Duration::from_secs(1));
+    // History stays authoritative when transport is unavailable.  A clean
+    // shutdown makes one bounded best-effort attempt to retain offline.
+    let save_result = history.save();
+    if let Some(transport) = transport {
+        transport.shutdown();
+    } else {
+        let offline_stop = AtomicBool::new(false);
+        let _ = publish_offline(&config, &offline_stop);
     }
-    let _ = publish(
-        &client,
-        format!("{base}/availability"),
-        "offline",
-        &config,
-        true,
-    );
-    let _ = client.disconnect();
-    connection.stop.store(true, Ordering::Relaxed);
-    let _ = connection.join.join();
+    save_result?;
     result
 }
 
@@ -2891,9 +3231,10 @@ fn run_setup(target: PathBuf) -> Result<(), String> {
 }
 
 fn print_snapshot(args: &SnapshotArgs, pretty: bool) -> Result<(), String> {
-    let mut state = load_state();
-    let data = snapshot(args, &mut state);
-    save_state(&state);
+    collector::validate_window(args.sample_window)?;
+    let mut history = history::HistoryStore::open(state_path(), history::Access::Local)?;
+    let data = snapshot(args, &mut history.state);
+    history.save()?;
     let rendered = if pretty {
         serde_json::to_string_pretty(&data)
     } else {
@@ -2954,18 +3295,556 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CollectorState, MetricHistory, MetricSample, NetCounters, active_dpm_clock_mhz,
-        cpu_list_count, dmi_memory_inventory, enrich_history, migrate_metric_history,
-        parse_nvme_smart_log, user_agent_service_unit, weighted_bucket_average,
+        AgentConfig, CollectionConfig, CollectorState, LatestSnapshot, MQTT_RETRY_MAX,
+        MetricHistory, MetricSample, MqttConfig, NetCounters, PublishProgress, RetryJitter,
+        RetrySchedule, RuntimeConfig, active_dpm_clock_mhz, cpu_list_count, delivery_requirement,
+        dmi_memory_inventory, enrich_history, migrate_metric_history, parse_nvme_smart_log,
+        private_memory_bytes_from_status, publish_snapshot, retry_delay, run_agent_loop,
+        user_agent_service_unit, weighted_bucket_average,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn retry_backoff_is_capped_and_resets_after_delivery() {
+        assert_eq!(retry_delay(1, Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(retry_delay(2, Duration::ZERO), Duration::from_secs(2));
+        assert_eq!(retry_delay(99, Duration::from_secs(30)), MQTT_RETRY_MAX);
+
+        let mut schedule = RetrySchedule::new();
+        let now = Instant::now();
+        schedule.failed(now, Duration::ZERO);
+        assert!(!schedule.ready(now));
+        schedule.succeeded();
+        assert!(schedule.ready(Instant::now()));
+
+        let mut jitter = RetryJitter::new(7);
+        let first = jitter.next();
+        let second = jitter.next();
+        assert!(first <= Duration::from_millis(250));
+        assert!(second <= Duration::from_millis(250));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn outage_queue_keeps_only_the_newest_snapshot() {
+        let mut latest = LatestSnapshot::default();
+        latest.replace(b"old".to_vec());
+        latest.replace(b"newest".to_vec());
+        assert_eq!(latest.copy_current(), Some((2, b"newest".to_vec())));
+    }
+
+    #[test]
+    fn delivery_waits_for_qos_acknowledgement_and_times_out() {
+        assert_eq!(delivery_requirement(0), PublishProgress::Dispatched);
+        assert_eq!(delivery_requirement(1), PublishProgress::Delivered);
+        assert_eq!(delivery_requirement(2), PublishProgress::Delivered);
+    }
+
+    fn read_mqtt_packet(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
+        let mut first = [0_u8; 1];
+        stream.read_exact(&mut first).unwrap();
+        let mut remaining = 0_usize;
+        let mut multiplier = 1_usize;
+        loop {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            remaining += (byte[0] as usize & 127) * multiplier;
+            if byte[0] & 128 == 0 {
+                break;
+            }
+            multiplier *= 128;
+        }
+        let mut body = vec![0_u8; remaining];
+        stream.read_exact(&mut body).unwrap();
+        (first[0], body)
+    }
+
+    fn fixture_config(port: u16, qos: u8) -> RuntimeConfig {
+        RuntimeConfig {
+            agent: AgentConfig {
+                host_id: "fixture".into(),
+                interval_seconds: 1.0,
+                sample_window_seconds: 0.05,
+            },
+            collection: CollectionConfig { process_limit: 1 },
+            mqtt: MqttConfig {
+                host: "127.0.0.1".into(),
+                port,
+                topic_prefix: "syslens".into(),
+                username: None,
+                password_env: None,
+                client_id: Some("fixture-client".into()),
+                tls: false,
+                keepalive_seconds: 60,
+                qos,
+                retain: true,
+            },
+        }
+    }
+
+    #[test]
+    fn reconnect_session_orders_meta_online_state_and_waits_for_pubacks() {
+        let stop = AtomicBool::new(false);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let (kind, _) = read_mqtt_packet(&mut stream);
+            assert_eq!(kind >> 4, 1, "fixture should receive CONNECT");
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+
+            let mut topics = Vec::new();
+            for _ in 0..3 {
+                let (kind, body) = read_mqtt_packet(&mut stream);
+                assert_eq!(kind >> 4, 3, "fixture should receive PUBLISH");
+                let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                topics.push(String::from_utf8(body[2..2 + topic_len].to_vec()).unwrap());
+                let packet_id = 2 + topic_len;
+                stream
+                    .write_all(&[0x40, 0x02, body[packet_id], body[packet_id + 1]])
+                    .unwrap();
+            }
+            let (kind, _) = read_mqtt_packet(&mut stream);
+            assert_eq!(kind >> 4, 14, "fixture should receive DISCONNECT");
+            topics
+        });
+
+        publish_snapshot(
+            &fixture_config(port, 1),
+            br#"{"generation":"newest"}"#,
+            Duration::from_secs(1),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                "syslens/fixture/meta",
+                "syslens/fixture/availability",
+                "syslens/fixture/state"
+            ]
+        );
+    }
+
+    #[test]
+    fn qos_two_once_delivery_waits_for_pubcomp() {
+        let stop = AtomicBool::new(false);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let (kind, _) = read_mqtt_packet(&mut stream);
+            assert_eq!(kind >> 4, 1);
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let mut published = 0;
+            let mut completed = 0;
+            while completed < 3 {
+                let (kind, body) = read_mqtt_packet(&mut stream);
+                match kind >> 4 {
+                    3 => {
+                        published += 1;
+                        let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                        let packet_id = 2 + topic_len;
+                        stream
+                            .write_all(&[0x50, 0x02, body[packet_id], body[packet_id + 1]])
+                            .unwrap();
+                    }
+                    6 => {
+                        assert_eq!(kind, 0x62);
+                        assert_eq!(body.len(), 2);
+                        stream.write_all(&[0x70, 0x02, body[0], body[1]]).unwrap();
+                        completed += 1;
+                    }
+                    other => panic!("unexpected MQTT packet type {other}"),
+                }
+            }
+            assert_eq!(published, 3);
+            let (kind, _) = read_mqtt_packet(&mut stream);
+            assert_eq!(kind >> 4, 14);
+        });
+
+        publish_snapshot(
+            &fixture_config(port, 2),
+            br#"{"generation":"newest"}"#,
+            Duration::from_secs(1),
+            &stop,
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn qos_zero_delivery_completes_after_socket_dispatch() {
+        let stop = AtomicBool::new(false);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_mqtt_packet(&mut stream);
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            for _ in 0..3 {
+                let (kind, _) = read_mqtt_packet(&mut stream);
+                assert_eq!(kind, 0x31, "QoS 0 retained publish must dispatch");
+            }
+            let (kind, _) = read_mqtt_packet(&mut stream);
+            assert_eq!(kind >> 4, 14);
+        });
+        publish_snapshot(
+            &fixture_config(port, 0),
+            br#"{"generation":"qos0"}"#,
+            Duration::from_millis(100),
+            &stop,
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn qos_one_and_two_fail_when_the_broker_never_acknowledges() {
+        for qos in [1, 2] {
+            let stop = AtomicBool::new(false);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let _ = read_mqtt_packet(&mut stream);
+                stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+                for _ in 0..3 {
+                    let (kind, _) = read_mqtt_packet(&mut stream);
+                    assert_eq!(kind >> 4, 3);
+                }
+                thread::sleep(Duration::from_millis(200));
+            });
+            let error = publish_snapshot(
+                &fixture_config(port, qos),
+                br#"{"generation":"no-ack"}"#,
+                Duration::from_millis(100),
+                &stop,
+            )
+            .unwrap_err();
+            assert!(error.contains("timed out"));
+            server.join().unwrap();
+        }
+    }
+
+    fn stop_transport(mut transport: super::MqttTransport) {
+        transport.stop.store(true, Ordering::Relaxed);
+        transport.latest.1.notify_all();
+        transport.join.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn transport_recovers_from_initial_unavailability_with_the_latest_snapshot() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let transport = super::MqttTransport::start(fixture_config(port, 1));
+        transport.submit(br#"{"generation":"stale"}"#.to_vec());
+        thread::sleep(Duration::from_millis(80));
+        transport.submit(br#"{"generation":"latest"}"#.to_vec());
+
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _ = read_mqtt_packet(&mut stream);
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                let (kind, body) = read_mqtt_packet(&mut stream);
+                assert_eq!(kind, 0x33, "retained QoS 1 expected");
+                let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                let topic = String::from_utf8(body[2..2 + topic_len].to_vec()).unwrap();
+                let packet_id = 2 + topic_len;
+                if topic.ends_with("/state") {
+                    received = body[packet_id + 2..].to_vec();
+                }
+                stream
+                    .write_all(&[0x40, 0x02, body[packet_id], body[packet_id + 1]])
+                    .unwrap();
+            }
+            let (kind, _) = read_mqtt_packet(&mut stream);
+            assert_eq!(kind >> 4, 14);
+            received
+        });
+        let state = server.join().unwrap();
+        assert_eq!(state, br#"{"generation":"latest"}"#);
+        stop_transport(transport);
+    }
+
+    #[test]
+    fn transport_reconnects_after_a_post_connect_disconnect_with_current_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let transport = super::MqttTransport::start(fixture_config(port, 1));
+        transport.submit(br#"{"generation":"first"}"#.to_vec());
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _ = read_mqtt_packet(&mut first);
+            first.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let _ = read_mqtt_packet(&mut first);
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _ = read_mqtt_packet(&mut second);
+            second.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let mut state = Vec::new();
+            for _ in 0..3 {
+                let (_, body) = read_mqtt_packet(&mut second);
+                let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                let topic = String::from_utf8(body[2..2 + topic_len].to_vec()).unwrap();
+                let packet_id = 2 + topic_len;
+                if topic.ends_with("/state") {
+                    state = body[packet_id + 2..].to_vec();
+                }
+                second
+                    .write_all(&[0x40, 0x02, body[packet_id], body[packet_id + 1]])
+                    .unwrap();
+            }
+            let (kind, _) = read_mqtt_packet(&mut second);
+            assert_eq!(kind >> 4, 14);
+            state
+        });
+        thread::sleep(Duration::from_millis(100));
+        transport.submit(br#"{"generation":"second"}"#.to_vec());
+        assert_eq!(server.join().unwrap(), br#"{"generation":"second"}"#);
+        stop_transport(transport);
+    }
+
+    #[test]
+    fn stop_flag_interrupts_an_ack_wait_within_one_poll_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (waiting_sender, waiting_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_mqtt_packet(&mut stream);
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let _ = read_mqtt_packet(&mut stream);
+            waiting_sender.send(()).unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            publish_snapshot(
+                &fixture_config(port, 1),
+                br#"{"generation":"wait"}"#,
+                Duration::from_secs(5),
+                &worker_stop,
+            )
+        });
+        waiting_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let started = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("interrupted"), "unexpected error: {error}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_shutdown_joins_the_inflight_connection_before_returning() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected_sender, connected_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_mqtt_packet(&mut first);
+            connected_sender.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            let _ = first.read(&mut byte);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = read_mqtt_packet(&mut second);
+            second.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let (kind, body) = read_mqtt_packet(&mut second);
+            assert_eq!(kind, 0x33);
+            let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+            let packet_id = 2 + topic_len;
+            second
+                .write_all(&[0x40, 0x02, body[packet_id], body[packet_id + 1]])
+                .unwrap();
+            let (kind, _) = read_mqtt_packet(&mut second);
+            assert_eq!(kind >> 4, 14);
+        });
+        let transport = super::MqttTransport::start(fixture_config(port, 1));
+        transport.submit(br#"{"generation":"inflight"}"#.to_vec());
+        connected_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let started = Instant::now();
+        transport.shutdown();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_offline_attempt_has_one_hard_deadline_when_broker_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected_sender, connected_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_mqtt_packet(&mut first);
+            connected_sender.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            let _ = first.read(&mut byte);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = read_mqtt_packet(&mut second);
+            // Deliberately never send ConnAck for the shutdown offline attempt.
+            thread::sleep(Duration::from_millis(650));
+        });
+        let transport = super::MqttTransport::start(fixture_config(port, 1));
+        transport.submit(br#"{"generation":"inflight"}"#.to_vec());
+        connected_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let started = Instant::now();
+        transport.shutdown();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn acknowledged_delivery_survives_cleanup_failure() {
+        assert!(super::delivery_result_after_cleanup(Ok(()), Err("peer closed".into())).is_ok());
+        assert_eq!(
+            super::delivery_result_after_cleanup(Err("delivery timed out".into()), Ok(())),
+            Err("delivery timed out".into())
+        );
+    }
+
+    #[test]
+    fn agent_persists_while_unavailable_then_recovers_with_ordered_latest_state() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let history_dir = std::env::temp_dir().join(format!(
+            "syslens-agent-lifecycle-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let history_path = history_dir.join("state.json");
+        let stop = Arc::new(AtomicBool::new(false));
+        let agent_stop = Arc::clone(&stop);
+        let mut agent_config = fixture_config(port, 1);
+        agent_config.agent.interval_seconds = 0.2;
+        let agent_history = history_path.clone();
+        let agent = thread::spawn(move || {
+            let mut generation = 0_u64;
+            run_agent_loop(agent_config, false, agent_stop, agent_history, move |_| {
+                generation += 1;
+                json!({"generation": generation})
+            })
+        });
+
+        // The first collection starts a failed transport attempt before the
+        // fixture listens; collection and history remain independent.
+        thread::sleep(Duration::from_millis(650));
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _ = read_mqtt_packet(&mut stream);
+            stream.write_all(&[0x20, 0x02, 0x00, 0x00]).unwrap();
+            let mut topics = Vec::new();
+            let mut state = Vec::new();
+            for _ in 0..3 {
+                let (kind, body) = read_mqtt_packet(&mut stream);
+                assert_eq!(kind, 0x33);
+                let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                let topic = String::from_utf8(body[2..2 + topic_len].to_vec()).unwrap();
+                let packet_id = 2 + topic_len;
+                if topic.ends_with("/state") {
+                    state = body[packet_id + 2..].to_vec();
+                }
+                topics.push(topic);
+                stream
+                    .write_all(&[0x40, 0x02, body[packet_id], body[packet_id + 1]])
+                    .unwrap();
+            }
+            ready_sender.send(()).unwrap();
+            (topics, state)
+        });
+        ready_receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        assert!(agent.join().unwrap().is_ok());
+        let (topics, state) = server.join().unwrap();
+        assert_eq!(
+            topics,
+            vec![
+                "syslens/fixture/meta",
+                "syslens/fixture/availability",
+                "syslens/fixture/state"
+            ]
+        );
+        assert!(
+            std::str::from_utf8(&state)
+                .unwrap()
+                .contains("\"transport\":\"mqtt\"")
+        );
+        assert!(
+            serde_json::from_slice::<Value>(&state).unwrap()["generation"]
+                .as_u64()
+                .unwrap()
+                >= 4,
+            "the agent should collect repeatedly during the initial outage"
+        );
+        assert!(
+            fs::metadata(&history_path).is_ok(),
+            "final history save missing"
+        );
+        let _ = fs::remove_file(&history_path);
+        let _ = fs::remove_file(history_path.with_extension("lock"));
+        let _ = fs::remove_dir(&history_dir);
+    }
 
     #[test]
     fn counts_sparse_cpu_lists() {
         assert_eq!(cpu_list_count("0-1,3-7"), Some(7));
         assert_eq!(cpu_list_count("0-7"), Some(8));
         assert_eq!(cpu_list_count("0,2,4"), Some(3));
+    }
+
+    #[test]
+    fn reads_private_process_memory_without_file_backed_pages() {
+        let status = "Name:\tbitcoind\nVmRSS:\t9674508 kB\nRssAnon:\t635232 kB\nRssFile:\t9039276 kB\nRssShmem:\t0 kB\n";
+        assert_eq!(
+            private_memory_bytes_from_status(status),
+            Some(635_232 * 1024)
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! The collector keeps its stable JSON/MQTT contract. This module only turns
 //! the same local snapshot into a readable interactive view.
 
-use crate::{SnapshotArgs, TuiArgs, load_state, save_state, snapshot};
+use crate::{SnapshotArgs, TuiArgs};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -15,13 +15,19 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use serde_json::Value;
 use std::{
     cmp::Ordering,
     collections::VecDeque,
     io::{self, stdout},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -129,7 +135,7 @@ impl App {
         processes.sort_by(|left, right| {
             let metric = match self.process_sort {
                 ProcessSort::Cpu => "cpu_average_percent",
-                ProcessSort::Memory => "rss_bytes",
+                ProcessSort::Memory => "private_bytes",
             };
             number_at(right, metric)
                 .partial_cmp(&number_at(left, metric))
@@ -143,41 +149,143 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), String> {
     if !args.interval.is_finite() || args.interval < 0.5 {
         return Err("tui interval must be at least 0.5 seconds".into());
     }
-    let interval = Duration::from_secs_f64(args.interval);
-    let mut state = load_state();
-    let initial = snapshot(&args.snapshot, &mut state);
-    let mut app = App::new(initial, interval);
+    let interval = Duration::try_from_secs_f64(args.interval).map_err(|error| error.to_string())?;
+    crate::collector::validate_window(args.snapshot.sample_window)?;
+    let worker = SamplingWorker::start(args.snapshot);
+    worker.request();
+    let mut app = App::new(Value::Null, interval);
 
     enable_raw_mode().map_err(|error| error.to_string())?;
+    let _guard = TerminalGuard;
     let mut output = stdout();
     execute!(output, EnterAlternateScreen).map_err(|error| error.to_string())?;
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
 
-    let result = run_loop(&mut terminal, &mut app, &args.snapshot, &mut state);
-    save_state(&state);
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-    result
+    run_loop(&mut terminal, &mut app, &worker)
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    }
+}
+
+// One in-flight request and one replaceable result keep work and memory bounded.
+// Drop disconnects requests and joins the worker, including all error exits.
+struct SamplingWorker {
+    requests: Option<mpsc::SyncSender<()>>,
+    busy: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<Result<Value, String>>>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl SamplingWorker {
+    fn start(mut args: SnapshotArgs) -> Self {
+        args.process_limit = usize::MAX;
+        let mut collector = crate::collector::Collector::default();
+        let mut state = crate::CollectorState::default();
+        Self::spawn(move || local_snapshot(&args, &mut state, &mut collector))
+    }
+
+    fn spawn(mut sample: impl FnMut() -> Result<Value, String> + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let latest = Arc::new(Mutex::new(None));
+        let worker_busy = Arc::clone(&busy);
+        let worker_latest = Arc::clone(&latest);
+        let join = thread::spawn(move || {
+            while rx.recv().is_ok() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut sample))
+                    .unwrap_or_else(|_| Err("sampling worker panicked".into()));
+                let failed = result.is_err();
+                *worker_latest
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(result);
+                worker_busy.store(false, AtomicOrdering::Release);
+                if failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests: Some(tx),
+            busy,
+            latest,
+            join: Some(join),
+        }
+    }
+
+    fn request(&self) {
+        if !self.busy.swap(true, AtomicOrdering::AcqRel)
+            && self
+                .requests
+                .as_ref()
+                .is_some_and(|requests| requests.try_send(()).is_err())
+        {
+            self.busy.store(false, AtomicOrdering::Release);
+        }
+    }
+
+    fn take(&self) -> Option<Result<Value, String>> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+impl Drop for SamplingWorker {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+// Release ownership after each refresh so a TUI does not monopolize history.
+// If an agent owns it, retain the TUI's ephemeral state without saving it.
+fn local_snapshot(
+    args: &SnapshotArgs,
+    state: &mut crate::CollectorState,
+    collector: &mut crate::collector::Collector,
+) -> Result<Value, String> {
+    let mut history =
+        crate::history::HistoryStore::open(crate::state_path(), crate::history::Access::Local)?;
+    if history.is_writer() {
+        let data = collector.sample(args, &mut history.state);
+        history.save()?;
+        *state = history.state;
+        Ok(data)
+    } else {
+        if state.metrics.is_empty() {
+            *state = history.state;
+        }
+        Ok(collector.sample(args, state))
+    }
 }
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    snapshot_args: &SnapshotArgs,
-    state: &mut crate::CollectorState,
+    worker: &SamplingWorker,
 ) -> Result<(), String> {
-    let mut last_saved = Instant::now();
+    let mut next_refresh = Instant::now() + app.refresh_interval;
     loop {
+        if let Some(result) = worker.take() {
+            app.update(result?);
+        }
         terminal
             .draw(|frame| draw(frame, app))
             .map_err(|error| error.to_string())?;
 
-        let wait = app
-            .refresh_interval
-            .saturating_sub(app.refreshed_at.elapsed())
-            .min(Duration::from_millis(250));
+        let wait = next_refresh
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
         if event::poll(wait).map_err(|error| error.to_string())?
             && let Event::Key(key) = event::read().map_err(|error| error.to_string())?
             && key.kind == KeyEventKind::Press
@@ -197,17 +305,15 @@ fn run_loop(
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.selected_process = app.selected_process.saturating_sub(1);
                 }
-                KeyCode::Char('r') => app.refreshed_at = Instant::now() - app.refresh_interval,
+                KeyCode::Char('r') => worker.request(),
                 _ => {}
             }
         }
 
-        if app.refreshed_at.elapsed() >= app.refresh_interval {
-            app.update(snapshot(snapshot_args, state));
-        }
-        if last_saved.elapsed() >= Duration::from_secs(60) {
-            save_state(state);
-            last_saved = Instant::now();
+        if Instant::now() >= next_refresh {
+            worker.request();
+            next_refresh =
+                crate::collector::next_deadline(next_refresh, Instant::now(), app.refresh_interval);
         }
     }
 }
@@ -539,7 +645,7 @@ fn draw_network_and_processes(frame: &mut ratatui::Frame, app: &App, area: Rect)
                 "{:<18} {:>5}  {:>8}",
                 truncate(string_at(process, "/name", "unknown"), 18),
                 percent(number_at(process, "cpu_average_percent")),
-                bytes(number_at(process, "rss_bytes")),
+                bytes(number_at(process, "private_bytes")),
             )
         };
         lines.push(Line::from(line));
@@ -579,7 +685,7 @@ fn draw_processes(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             ),
             Cell::from(percent(number_at(process, "cpu_average_percent"))),
             Cell::from(percent(number_at(process, "cpu_percent"))),
-            Cell::from(bytes(number_at(process, "rss_bytes"))),
+            Cell::from(bytes(number_at(process, "private_bytes"))),
         ])
         .style(style)
     });
@@ -603,7 +709,8 @@ fn draw_processes(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(CYAN))
             .title(title),
     );
-    frame.render_widget(table, area);
+    let mut table_state = TableState::default().with_selected(Some(app.selected_process));
+    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 fn draw_thermals(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -868,5 +975,96 @@ fn truncate(value: String, width: usize) -> String {
         format!("{clipped}…")
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn memory_sort_finds_idle_process_beyond_cpu_top_six() {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let before: std::collections::HashMap<u32, crate::ProcessCounters> = (0..8)
+            .map(|pid| {
+                (
+                    pid,
+                    crate::ProcessCounters {
+                        private_bytes: if pid == 7 { 1000 } else { 1 },
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let mut after = before.clone();
+        for (pid, process) in &mut after {
+            process.ticks = u64::from(7 - *pid) * hz;
+        }
+        let mut state = crate::CollectorState::default();
+        let limited = crate::process_snapshot(&before, &after, 1.0, 6, &mut state);
+        assert!(
+            !limited["top"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|process| process["pid"] == 7)
+        );
+        let processes = crate::process_snapshot(&before, &after, 1.0, usize::MAX, &mut state);
+        let mut app = App::new(json!({"processes":processes}), Duration::from_secs(1));
+        assert_eq!(app.processes()[0]["pid"], 0);
+        app.process_sort = ProcessSort::Memory;
+        assert_eq!(app.processes()[0]["pid"], 7);
+    }
+
+    #[test]
+    fn worker_coalesces_requests_and_joins_on_drop() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let worker = SamplingWorker::spawn(move || {
+            worker_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(Value::Null)
+        });
+        worker.request();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..100 {
+            worker.request();
+        }
+        release_tx.send(()).unwrap();
+        drop(worker);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn worker_delivers_failure_and_exits() {
+        let mut worker = SamplingWorker::spawn(|| Err("probe failed".into()));
+        worker.request();
+        worker.join.take().unwrap().join().unwrap();
+        assert_eq!(worker.take().unwrap().unwrap_err(), "probe failed");
+    }
+
+    #[test]
+    fn dropping_worker_bounds_stalled_probe_without_external_release() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let worker = SamplingWorker::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let output = crate::pci_probe_output(
+                std::process::Command::new("sh").args(["-c", "exec sleep 30"]),
+                Duration::from_millis(100),
+            );
+            assert!(output.is_none());
+            Ok(Value::Null)
+        });
+        worker.request();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        drop(worker);
+        // `drop` must wait for the active worker, but the bounded PCI probe
+        // must let it complete promptly without an external unblock signal.
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
