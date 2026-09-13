@@ -215,6 +215,26 @@ This keeps 1-day, 1-month, and all-time values durable without allowing the
 state file to grow with every poll. Network transfer totals and short-lived
 process smoothing are stored separately in the same file.
 
+## Optional diagnosis add-on
+
+`syslens-diagnosis` is a separate local-host add-on. Core does not install or
+run it, so an absent or disabled add-on adds no writer, database, model client,
+or diagnosis collection to `syslens`.
+
+The package currently provides only scaffold commands:
+
+```bash
+syslens-diagnosis status
+syslens-diagnosis enable
+syslens-diagnosis disable
+```
+
+Once installed, Core forwards `syslens diagnose ...`, `syslens chat`, and
+`syslens incidents ...` to that companion on the same host. These commands do
+not yet provide diagnosis, evidence recording, alerts, or AI integration.
+See [`packaging/debian`](packaging/debian/README.md) for the independent
+package build.
+
 ## Optional hardware inventory
 
 SysLens always reports live RAM use. DIMM part number, RAM type, populated

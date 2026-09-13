@@ -6,6 +6,7 @@ use rumqttc::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::UdpSocket;
@@ -93,6 +94,21 @@ enum Command {
     Inventory {
         #[command(subcommand)]
         command: InventoryCommand,
+    },
+    /// Delegate a local diagnosis request to the optional add-on.
+    Diagnose {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Start a local diagnosis chat through the optional add-on.
+    Chat {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Manage incidents through the optional diagnosis add-on.
+    Incidents {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
     },
 }
 
@@ -3261,6 +3277,9 @@ fn main() -> ExitCode {
             InventoryCommand::Probe { output } => write_inventory_cache(&output),
             InventoryCommand::Status => run_inventory_status(),
         },
+        Some(Command::Diagnose { arguments }) => run_diagnosis_addon("diagnose", arguments),
+        Some(Command::Chat { arguments }) => run_diagnosis_addon("chat", arguments),
+        Some(Command::Incidents { arguments }) => run_diagnosis_addon("incidents", arguments),
         None if cli.setup => run_setup(cli.setup_config.unwrap_or_else(default_config_path)),
         None if cli.validate_config => match cli.config.as_deref() {
             Some(path) => load_config(path).and_then(|config| {
@@ -3289,6 +3308,35 @@ fn main() -> ExitCode {
             eprintln!("syslens: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+fn diagnosis_addon_command() -> ProcessCommand {
+    let sibling = std::env::current_exe().ok().and_then(|current| {
+        current
+            .parent()
+            .map(|directory| directory.join("syslens-diagnosis"))
+    });
+    match sibling.filter(|path| path.is_file()) {
+        Some(path) => ProcessCommand::new(path),
+        None => ProcessCommand::new("syslens-diagnosis"),
+    }
+}
+
+fn run_diagnosis_addon(command: &str, arguments: Vec<OsString>) -> Result<(), String> {
+    let status = diagnosis_addon_command()
+        .arg(command)
+        .args(arguments)
+        .status()
+        .map_err(|error| {
+            format!(
+                "the optional diagnosis add-on is unavailable ({error}); install syslens-diagnosis"
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("syslens-diagnosis {command} exited with {status}"))
     }
 }
 

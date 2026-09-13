@@ -1121,6 +1121,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "syslens-diagnosis"
+version = "0.2.0"
+
+[[package]]
 name = "thiserror"
 version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

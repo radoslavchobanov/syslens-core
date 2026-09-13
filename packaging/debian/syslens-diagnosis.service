@@ -1,0 +1,10 @@
+[Unit]
+Description=SysLens local diagnosis companion
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/syslens-diagnosis status
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[package]
+name = "syslens-diagnosis"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Optional local diagnosis companion for SysLens"
+
+[[bin]]
+name = "syslens-diagnosis"
+path = "src/main.rs"

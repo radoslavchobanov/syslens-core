@@ -1,5 +1,7 @@
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -201,5 +203,61 @@ retain = true
     assert!(
         first.0.try_wait().unwrap().is_none(),
         "first agent did not retain the lock long enough for the second attempt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnosis_commands_delegate_to_a_sibling_addon_without_a_shell() {
+    let fixture = Fixture::new();
+    let bin_directory = fixture.root.join("bin");
+    fs::create_dir(&bin_directory).unwrap();
+    let core = bin_directory.join("syslens");
+    fs::copy(env!("CARGO_BIN_EXE_syslens"), &core).unwrap();
+
+    let capture = fixture.root.join("arguments");
+    let addon = bin_directory.join("syslens-diagnosis");
+    fs::write(
+        &addon,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SYSLENS_TEST_CAPTURE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&addon, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(&core)
+        .env("SYSLENS_TEST_CAPTURE", &capture)
+        .args(["diagnose", "memory", "--since", "today"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "delegation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(capture).unwrap(),
+        "diagnose\nmemory\n--since\ntoday\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnosis_commands_explain_when_the_addon_is_not_installed() {
+    let fixture = Fixture::new();
+    let bin_directory = fixture.root.join("bin");
+    fs::create_dir(&bin_directory).unwrap();
+    let core = bin_directory.join("syslens");
+    fs::copy(env!("CARGO_BIN_EXE_syslens"), &core).unwrap();
+
+    let output = Command::new(core)
+        .env("PATH", fixture.root.join("empty-path"))
+        .args(["chat"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("install syslens-diagnosis"),
+        "missing installation advice: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
