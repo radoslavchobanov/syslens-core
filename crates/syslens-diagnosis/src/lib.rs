@@ -1,0 +1,814 @@
+//! Local evidence recording and deterministic memory diagnosis for SysLens.
+//!
+//! This crate deliberately has no dependency on syslens-core or MQTT.  It is
+//! an optional, host-local companion and may be stopped or removed independently.
+
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
+use rusqlite::{Connection, OpenFlags, Transaction, params};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+
+pub const SCHEMA_VERSION: i64 = 1;
+pub const MIN_SQLITE: (i32, i32, i32) = (3, 51, 3);
+pub const GIB: u64 = 1024 * 1024 * 1024;
+const CONTROL_HEADROOM: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    #[serde(default = "default_interval")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_retention")]
+    pub retention_days: u32,
+    #[serde(default = "default_budget")]
+    pub database_budget_bytes: u64,
+}
+fn default_version() -> u32 {
+    1
+}
+fn default_interval() -> u64 {
+    30
+}
+fn default_retention() -> u32 {
+    185
+}
+fn default_budget() -> u64 {
+    16 * GIB
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            interval_seconds: 30,
+            retention_days: 185,
+            database_budget_bytes: 16 * GIB,
+        }
+    }
+}
+impl Config {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported config version {}; expected 1",
+                self.version
+            ));
+        }
+        if !(5..=300).contains(&self.interval_seconds) {
+            return Err("interval_seconds must be between 5 and 300".into());
+        }
+        if !(185..=3650).contains(&self.retention_days) {
+            return Err("retention_days must be between 185 and 3650".into());
+        }
+        if self.database_budget_bytes < GIB {
+            return Err("database_budget_bytes must be at least 1 GiB".into());
+        }
+        Ok(())
+    }
+}
+
+pub fn config_path() -> PathBuf {
+    xdg_path("XDG_CONFIG_HOME", ".config").join("syslens-diagnosis/config.toml")
+}
+pub fn state_dir() -> PathBuf {
+    xdg_path("XDG_STATE_HOME", ".local/state").join("syslens-diagnosis")
+}
+pub fn database_path() -> PathBuf {
+    state_dir().join("diagnosis.sqlite")
+}
+fn xdg_path(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(fallback))
+            .unwrap_or_else(|| PathBuf::from(fallback))
+    })
+}
+pub fn load_config(path: &Path) -> Result<Config, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let config: Config =
+        toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
+    config.validate()?;
+    Ok(config)
+}
+pub fn ensure_config(path: &Path) -> Result<Config, String> {
+    if path.exists() {
+        return load_config(path);
+    }
+    let parent = path.parent().ok_or("config path has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot secure {}: {e}", parent.display()))?;
+    let text = toml::to_string_pretty(&Config::default()).map_err(|e| e.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    use std::io::Write;
+    file.write_all(text.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Config::default().validate()?;
+    Ok(Config::default())
+}
+
+#[derive(Debug)]
+pub struct WriterLock {
+    _file: File,
+}
+pub fn acquire_writer_lock(dir: &Path) -> Result<WriterLock, String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let p = dir.join("daemon.lock");
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&p)
+        .map_err(|e| format!("cannot open writer lock: {e}"))?;
+    // `flock` stays held for this open descriptor and is released on process exit.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("another syslens-diagnosis daemon is already recording".into());
+    }
+    Ok(WriterLock { _file: file })
+}
+
+pub fn open_db(path: &Path) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| e.to_string())?;
+    conn.busy_timeout(StdDuration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| e.to_string())?;
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if mode.to_lowercase() != "wal" {
+        return Err(format!("SQLite refused WAL mode: {mode}"));
+    }
+    let version: String = conn
+        .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if !version_at_least(&version, MIN_SQLITE) {
+        return Err(format!(
+            "SQLite {version} is too old; need at least {}.{}.{}",
+            MIN_SQLITE.0, MIN_SQLITE.1, MIN_SQLITE.2
+        ));
+    }
+    migrate(&conn)?;
+    Ok(conn)
+}
+fn version_at_least(text: &str, min: (i32, i32, i32)) -> bool {
+    let p: Vec<i32> = text.split('.').filter_map(|x| x.parse().ok()).collect();
+    (
+        p.first().copied().unwrap_or(0),
+        p.get(1).copied().unwrap_or(0),
+        p.get(2).copied().unwrap_or(0),
+    ) >= min
+}
+fn migrate(conn: &Connection) -> Result<(), String> {
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if v > SCHEMA_VERSION {
+        return Err(format!(
+            "database schema {v} is newer than supported {SCHEMA_VERSION}"
+        ));
+    }
+    if v == SCHEMA_VERSION {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE host_samples (timestamp INTEGER PRIMARY KEY, boot_id TEXT NOT NULL, duration_ms INTEGER NOT NULL, status TEXT NOT NULL, mem_total INTEGER, mem_available INTEGER, mem_free INTEGER, buffers INTEGER, cached INTEGER, slab INTEGER, swap_total INTEGER, swap_free INTEGER, psi_some REAL, psi_full REAL);
+CREATE TABLE process_identities (id INTEGER PRIMARY KEY, boot_id TEXT NOT NULL, pid INTEGER NOT NULL, start_ticks INTEGER NOT NULL, name TEXT NOT NULL, executable TEXT, uid INTEGER, cgroup_name TEXT, UNIQUE(boot_id,pid,start_ticks));
+CREATE TABLE process_samples (timestamp INTEGER NOT NULL REFERENCES host_samples(timestamp) ON DELETE CASCADE, identity_id INTEGER NOT NULL REFERENCES process_identities(id) ON DELETE CASCADE, rss_anon INTEGER, rss_file INTEGER, rss_shmem INTEGER, rss_total INTEGER, cpu_ticks INTEGER, read_bytes INTEGER, write_bytes INTEGER, PRIMARY KEY(timestamp,identity_id));
+CREATE INDEX process_samples_identity_time ON process_samples(identity_id,timestamp);
+CREATE INDEX process_samples_time ON process_samples(timestamp);
+CREATE TABLE collection_gaps (id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, reason TEXT NOT NULL, duration_ms INTEGER, UNIQUE(timestamp,reason));
+PRAGMA user_version=1;").map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HostSample {
+    pub timestamp: i64,
+    pub boot_id: String,
+    pub duration_ms: i64,
+    pub mem_total: Option<i64>,
+    pub mem_available: Option<i64>,
+    pub mem_free: Option<i64>,
+    pub buffers: Option<i64>,
+    pub cached: Option<i64>,
+    pub slab: Option<i64>,
+    pub swap_total: Option<i64>,
+    pub swap_free: Option<i64>,
+    pub psi_some: Option<f64>,
+    pub psi_full: Option<f64>,
+}
+#[derive(Debug, Clone)]
+pub struct ProcessSample {
+    pub pid: i64,
+    pub start_ticks: i64,
+    pub name: String,
+    pub executable: Option<String>,
+    pub uid: Option<i64>,
+    pub cgroup_name: Option<String>,
+    pub rss_anon: Option<i64>,
+    pub rss_file: Option<i64>,
+    pub rss_shmem: Option<i64>,
+    pub rss_total: Option<i64>,
+    pub cpu_ticks: Option<i64>,
+    pub read_bytes: Option<i64>,
+    pub write_bytes: Option<i64>,
+}
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub host: HostSample,
+    pub processes: Vec<ProcessSample>,
+    pub gaps: Vec<String>,
+}
+
+pub fn insert_snapshot(conn: &mut Connection, snapshot: &Snapshot) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    insert_snapshot_tx(&tx, snapshot)?;
+    tx.commit().map_err(|e| e.to_string())
+}
+fn insert_snapshot_tx(tx: &Transaction<'_>, s: &Snapshot) -> Result<(), String> {
+    let h = &s.host;
+    tx.execute(
+        "INSERT OR REPLACE INTO host_samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![
+            h.timestamp,
+            h.boot_id,
+            h.duration_ms,
+            "ok",
+            h.mem_total,
+            h.mem_available,
+            h.mem_free,
+            h.buffers,
+            h.cached,
+            h.slab,
+            h.swap_total,
+            h.swap_free,
+            h.psi_some,
+            h.psi_full
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    for p in &s.processes {
+        tx.execute("INSERT INTO process_identities(boot_id,pid,start_ticks,name,executable,uid,cgroup_name) VALUES(?,?,?,?,?,?,?) ON CONFLICT(boot_id,pid,start_ticks) DO UPDATE SET name=excluded.name, executable=COALESCE(excluded.executable,process_identities.executable), uid=COALESCE(excluded.uid,process_identities.uid), cgroup_name=COALESCE(excluded.cgroup_name,process_identities.cgroup_name)", params![h.boot_id,p.pid,p.start_ticks,p.name,p.executable,p.uid,p.cgroup_name]).map_err(|e| e.to_string())?;
+        let id: i64 = tx
+            .query_row(
+                "SELECT id FROM process_identities WHERE boot_id=? AND pid=? AND start_ticks=?",
+                params![h.boot_id, p.pid, p.start_ticks],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO process_samples VALUES(?,?,?,?,?,?,?,?,?)",
+            params![
+                h.timestamp,
+                id,
+                p.rss_anon,
+                p.rss_file,
+                p.rss_shmem,
+                p.rss_total,
+                p.cpu_ticks,
+                p.read_bytes,
+                p.write_bytes
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for reason in &s.gaps {
+        tx.execute(
+            "INSERT OR IGNORE INTO collection_gaps(timestamp,reason,duration_ms) VALUES(?,?,?)",
+            params![h.timestamp, reason, h.duration_ms],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+pub fn cleanup(conn: &Connection, cutoff: i64) -> Result<usize, String> {
+    conn.execute("DELETE FROM host_samples WHERE timestamp < ?", [cutoff])
+        .map_err(|e| e.to_string())
+}
+
+pub fn database_size(path: &Path) -> u64 {
+    [
+        path.to_path_buf(),
+        path.with_extension("sqlite-wal"),
+        path.with_extension("sqlite-shm"),
+    ]
+    .iter()
+    .filter_map(|p| fs::metadata(p).ok())
+    .map(|m| m.len())
+    .sum()
+}
+pub fn budget_allows(path: &Path, budget: u64) -> bool {
+    database_size(path).saturating_add(CONTROL_HEADROOM) <= budget
+}
+pub fn filesystem_has_reserve(path: &Path) -> bool {
+    let parent = path.parent().unwrap_or(path);
+    let c_path = match std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c_path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let info = unsafe { info.assume_init() };
+    let available = info.f_bavail.saturating_mul(info.f_frsize);
+    let total = info.f_blocks.saturating_mul(info.f_frsize);
+    available >= GIB.max(total / 20)
+}
+
+pub struct Collector {
+    proc_root: PathBuf,
+}
+impl Collector {
+    pub fn new(proc_root: PathBuf) -> Self {
+        Self { proc_root }
+    }
+    pub fn collect(&self, now: i64) -> Snapshot {
+        let started = std::time::Instant::now();
+        let mut gaps = Vec::new();
+        let boot_id =
+            read_trim(&self.proc_root.join("sys/kernel/random/boot_id")).unwrap_or_else(|_| {
+                gaps.push("boot_id unavailable".into());
+                "unknown".into()
+            });
+        let mem = parse_meminfo(&self.proc_root.join("meminfo"), &mut gaps);
+        let (some, full) = parse_psi(&self.proc_root.join("pressure/memory"), &mut gaps);
+        let mut processes = Vec::new();
+        match fs::read_dir(&self.proc_root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() {
+                        match self.process(pid) {
+                            Ok(p) => processes.push(p),
+                            Err(e) => gaps.push(format!("pid {pid}: {e}")),
+                        }
+                    }
+                }
+            }
+            Err(e) => gaps.push(format!("cannot enumerate proc: {e}")),
+        }
+        Snapshot {
+            host: HostSample {
+                timestamp: now,
+                boot_id,
+                duration_ms: started.elapsed().as_millis() as i64,
+                mem_total: mem.get("MemTotal").copied(),
+                mem_available: mem.get("MemAvailable").copied(),
+                mem_free: mem.get("MemFree").copied(),
+                buffers: mem.get("Buffers").copied(),
+                cached: mem.get("Cached").copied(),
+                slab: mem.get("Slab").copied(),
+                swap_total: mem.get("SwapTotal").copied(),
+                swap_free: mem.get("SwapFree").copied(),
+                psi_some: some,
+                psi_full: full,
+            },
+            processes,
+            gaps,
+        }
+    }
+    fn process(&self, pid: i64) -> Result<ProcessSample, String> {
+        let base = self.proc_root.join(pid.to_string());
+        let stat = fs::read_to_string(base.join("stat")).map_err(|e| e.to_string())?;
+        let end = stat.rfind(')').ok_or("invalid stat")?;
+        let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
+        if fields.len() < 20 {
+            return Err("short stat".into());
+        }
+        let name = stat[stat.find('(').ok_or("invalid stat")? + 1..end].to_string();
+        let start_ticks = fields[19].parse().map_err(|_| "invalid start_ticks")?;
+        let cpu_ticks = fields[11]
+            .parse::<i64>()
+            .ok()
+            .zip(fields[12].parse::<i64>().ok())
+            .map(|(a, b)| a + b);
+        let status = parse_status(&base.join("status"));
+        let io = parse_key_values(&base.join("io"));
+        let executable = fs::read_link(base.join("exe"))
+            .ok()
+            .map(|p| p.display().to_string());
+        let uid = status
+            .get("Uid")
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|x| x.parse().ok());
+        let cgroup = fs::read_to_string(base.join("cgroup"))
+            .ok()
+            .and_then(|x| x.lines().next().map(str::to_owned));
+        Ok(ProcessSample {
+            pid,
+            start_ticks,
+            name,
+            executable,
+            uid,
+            cgroup_name: cgroup,
+            rss_anon: status.get("RssAnon").and_then(|value| kb(value)),
+            rss_file: status.get("RssFile").and_then(|value| kb(value)),
+            rss_shmem: status.get("RssShmem").and_then(|value| kb(value)),
+            rss_total: status.get("VmRSS").and_then(|value| kb(value)),
+            cpu_ticks,
+            read_bytes: io.get("read_bytes").and_then(|x| x.parse().ok()),
+            write_bytes: io.get("write_bytes").and_then(|x| x.parse().ok()),
+        })
+    }
+}
+fn read_trim(p: &Path) -> io::Result<String> {
+    fs::read_to_string(p).map(|x| x.trim().to_owned())
+}
+fn parse_key_values(p: &Path) -> BTreeMap<String, String> {
+    fs::read_to_string(p)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    l.split_once(':')
+                        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+fn parse_status(p: &Path) -> BTreeMap<String, String> {
+    parse_key_values(p)
+}
+fn kb(s: &str) -> Option<i64> {
+    s.split_whitespace()
+        .next()?
+        .parse::<i64>()
+        .ok()
+        .map(|x| x * 1024)
+}
+fn parse_meminfo(p: &Path, gaps: &mut Vec<String>) -> BTreeMap<String, i64> {
+    let raw = fs::read_to_string(p);
+    let Ok(raw) = raw else {
+        gaps.push("meminfo unavailable".into());
+        return BTreeMap::new();
+    };
+    raw.lines()
+        .filter_map(|l| {
+            let (a, b) = l.split_once(':')?;
+            Some((a.to_owned(), kb(b.trim())?))
+        })
+        .collect()
+}
+fn parse_psi(p: &Path, gaps: &mut Vec<String>) -> (Option<f64>, Option<f64>) {
+    match fs::read_to_string(p) {
+        Ok(s) => {
+            let val = |k: &str| {
+                s.lines().find(|x| x.starts_with(k)).and_then(|x| {
+                    x.split_whitespace()
+                        .find(|x| x.starts_with("avg10="))
+                        .and_then(|x| x[6..].parse().ok())
+                })
+            };
+            (val("some"), val("full"))
+        }
+        Err(_) => {
+            gaps.push("memory PSI unavailable".into());
+            (None, None)
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct Diagnosis {
+    pub version: u32,
+    pub status: String,
+    pub current: Interval,
+    pub comparison: Interval,
+    pub coverage: Coverage,
+    pub findings: Vec<String>,
+    pub processes: Vec<ProcessFinding>,
+    pub limitations: Vec<String>,
+}
+#[derive(Serialize)]
+pub struct Interval {
+    pub start_utc: String,
+    pub end_utc: String,
+}
+#[derive(Serialize)]
+pub struct Coverage {
+    pub current_samples: i64,
+    pub comparison_samples: i64,
+}
+#[derive(Serialize)]
+pub struct ProcessFinding {
+    pub name: String,
+    pub executable: Option<String>,
+    pub rss_anon_change_bytes: i64,
+    pub first_seen_utc: String,
+    pub last_seen_utc: String,
+}
+type MemoryAverages = (Option<f64>, Option<f64>, Option<f64>);
+pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagnosis, String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open evidence database: {e}"))?;
+    let now = Utc::now();
+    let (start, end) = parse_interval(since, now)?;
+    let duration = end - start;
+    if compare != "previous-week" {
+        return Err("only --compare previous-week is supported".into());
+    };
+    let cend = start - Duration::days(7);
+    let cstart = cend - duration;
+    let count = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
+        conn.query_row(
+            "SELECT count(*) FROM host_samples WHERE timestamp>=? AND timestamp<=?",
+            params![a.timestamp(), b.timestamp()],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    };
+    let n = count(start, end)?;
+    let cn = count(cstart, cend)?;
+    let fmt = |x: DateTime<Utc>| x.to_rfc3339();
+    let mut findings = Vec::new();
+    let mut limitations=vec!["RssAnon is anonymous resident memory, not private/USS; process RSS cannot exactly reconcile physical RAM.".into()];
+    if n == 0 || cn == 0 {
+        limitations.push("No comparable stored host samples cover one or both intervals.".into());
+        return Ok(Diagnosis {
+            version: 1,
+            status: "insufficient evidence".into(),
+            current: Interval {
+                start_utc: fmt(start),
+                end_utc: fmt(end),
+            },
+            comparison: Interval {
+                start_utc: fmt(cstart),
+                end_utc: fmt(cend),
+            },
+            coverage: Coverage {
+                current_samples: n,
+                comparison_samples: cn,
+            },
+            findings,
+            processes: vec![],
+            limitations,
+        });
+    }
+    let avg = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<MemoryAverages, String> {
+        conn.query_row("SELECT avg(mem_total),avg(mem_available),avg(cached+buffers+slab) FROM host_samples WHERE timestamp>=? AND timestamp<=?",params![a.timestamp(),b.timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())
+    };
+    let (total, avail, cache) = avg(start, end)?;
+    let (_, cavail, ccache) = avg(cstart, cend)?;
+    if let (Some(t), Some(a), Some(ca)) = (total, avail, cavail) {
+        let cur = (t - a) / t * 100.;
+        let old = (t - ca) / t * 100.;
+        findings.push(format!("Average used RAM was {:.1}% versus {:.1}% in the comparison interval ({:+.1} percentage points).",cur,old,cur-old));
+    }
+    if let (Some(x), Some(y)) = (cache, ccache) {
+        findings.push(format!(
+            "Cache, buffers, and slab changed by {:+} MiB.",
+            ((x - y) / 1048576.) as i64
+        ));
+    }
+    let mut stmt=conn.prepare("WITH current AS (SELECT ps.identity_id, min(ps.timestamp) first_seen,max(ps.timestamp) last_seen, max(ps.rss_anon) max_rss FROM process_samples ps WHERE ps.timestamp>=?1 AND ps.timestamp<=?2 GROUP BY ps.identity_id), previous AS (SELECT ps.identity_id,max(ps.rss_anon) max_rss FROM process_samples ps WHERE ps.timestamp>=?3 AND ps.timestamp<=?4 GROUP BY ps.identity_id) SELECT pi.name,pi.executable,current.max_rss-COALESCE(previous.max_rss,0),current.first_seen,current.last_seen FROM current JOIN process_identities pi ON pi.id=current.identity_id LEFT JOIN previous ON previous.identity_id=current.identity_id WHERE current.max_rss IS NOT NULL ORDER BY 3 DESC LIMIT 10").map_err(|e|e.to_string())?;
+    let mut rows = stmt
+        .query(params![
+            start.timestamp(),
+            end.timestamp(),
+            cstart.timestamp(),
+            cend.timestamp()
+        ])
+        .map_err(|e| e.to_string())?;
+    let mut processes = vec![];
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        let d: i64 = r.get(2).map_err(|e| e.to_string())?;
+        if d <= 0 {
+            continue;
+        }
+        let first: i64 = r.get(3).map_err(|e| e.to_string())?;
+        let last: i64 = r.get(4).map_err(|e| e.to_string())?;
+        processes.push(ProcessFinding {
+            name: r.get(0).map_err(|e| e.to_string())?,
+            executable: r.get(1).map_err(|e| e.to_string())?,
+            rss_anon_change_bytes: d,
+            first_seen_utc: Utc
+                .timestamp_opt(first, 0)
+                .single()
+                .ok_or("invalid process timestamp")?
+                .to_rfc3339(),
+            last_seen_utc: Utc
+                .timestamp_opt(last, 0)
+                .single()
+                .ok_or("invalid process timestamp")?
+                .to_rfc3339(),
+        });
+    }
+    if processes.is_empty() {
+        findings.push("No process showed a positive observed anonymous-memory increase across the retained samples.".into())
+    } else {
+        findings.push(format!(
+            "Top observed anonymous-memory growth: {} ({:+} MiB).",
+            processes[0].name,
+            processes[0].rss_anon_change_bytes / 1048576
+        ));
+    }
+    Ok(Diagnosis {
+        version: 1,
+        status: "ok".into(),
+        current: Interval {
+            start_utc: fmt(start),
+            end_utc: fmt(end),
+        },
+        comparison: Interval {
+            start_utc: fmt(cstart),
+            end_utc: fmt(cend),
+        },
+        coverage: Coverage {
+            current_samples: n,
+            comparison_samples: cn,
+        },
+        findings,
+        processes,
+        limitations,
+    })
+}
+fn parse_interval(
+    input: &str,
+    now: DateTime<Utc>,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    if input == "today" {
+        let local = now.with_timezone(&Local);
+        let start = Local
+            .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
+            .single()
+            .ok_or("cannot resolve local midnight")?
+            .with_timezone(&Utc);
+        return Ok((start, now));
+    }
+    let n = input
+        .strip_suffix('h')
+        .and_then(|x| x.parse::<i64>().ok())
+        .or_else(|| {
+            input
+                .strip_suffix('d')
+                .and_then(|x| x.parse::<i64>().ok().map(|x| x * 24))
+        })
+        .ok_or("--since must be today, <hours>h, or <days>d")?;
+    if n <= 0 {
+        return Err("--since duration must be positive".into());
+    }
+    Ok((now - Duration::hours(n), now))
+}
+pub fn render_diagnosis(d: &Diagnosis) -> String {
+    let mut s = format!(
+        "Memory diagnosis: {}\nCurrent: {} to {}\nComparison: {} to {}\nCoverage: {} current samples, {} comparison samples\n",
+        d.status,
+        d.current.start_utc,
+        d.current.end_utc,
+        d.comparison.start_utc,
+        d.comparison.end_utc,
+        d.coverage.current_samples,
+        d.coverage.comparison_samples
+    );
+    for f in &d.findings {
+        s.push_str(&format!("- {f}\n"));
+    }
+    for p in &d.processes {
+        s.push_str(&format!(
+            "- Process {}: {:+} MiB RssAnon ({} to {})\n",
+            p.name,
+            p.rss_anon_change_bytes / 1048576,
+            p.first_seen_utc,
+            p.last_seen_utc
+        ));
+    }
+    for l in &d.limitations {
+        s.push_str(&format!("Limitation: {l}\n"));
+    }
+    s
+}
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    #[test]
+    fn config_defaults_validate() {
+        Config::default().validate().unwrap();
+        assert!(
+            Config {
+                interval_seconds: 4,
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        )
+    }
+    #[test]
+    fn schema_and_pid_reuse() {
+        let d = tempdir().unwrap();
+        let mut c = open_db(&d.path().join("x.sqlite")).unwrap();
+        let mut a = Snapshot {
+            host: HostSample {
+                timestamp: 1,
+                boot_id: "b".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        a.processes.push(ProcessSample {
+            pid: 1,
+            start_ticks: 1,
+            name: "a".into(),
+            executable: None,
+            uid: None,
+            cgroup_name: None,
+            rss_anon: Some(1),
+            rss_file: None,
+            rss_shmem: None,
+            rss_total: None,
+            cpu_ticks: None,
+            read_bytes: None,
+            write_bytes: None,
+        });
+        insert_snapshot(&mut c, &a).unwrap();
+        a.host.timestamp = 2;
+        a.processes[0].start_ticks = 2;
+        insert_snapshot(&mut c, &a).unwrap();
+        assert_eq!(
+            c.query_row("select count(*) from process_identities", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        )
+    }
+
+    #[test]
+    fn memory_diagnosis_reports_observed_growth() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (timestamp, rss) in [
+            (now - 7 * 86_400 - 3 * 3600, 11 * 1024 * 1024),
+            (now - 3600, 13 * 1024 * 1024),
+        ] {
+            let snapshot = Snapshot {
+                host: HostSample {
+                    timestamp,
+                    boot_id: "b".into(),
+                    mem_total: Some(100 * 1024 * 1024),
+                    mem_available: Some(
+                        (100 - if rss > 12 * 1024 * 1024 { 13 } else { 11 }) * 1024 * 1024,
+                    ),
+                    ..Default::default()
+                },
+                processes: vec![ProcessSample {
+                    pid: 7,
+                    start_ticks: 4,
+                    name: "growing".into(),
+                    executable: Some("/usr/bin/growing".into()),
+                    uid: Some(1000),
+                    cgroup_name: None,
+                    rss_anon: Some(rss),
+                    rss_file: None,
+                    rss_shmem: None,
+                    rss_total: Some(rss),
+                    cpu_ticks: None,
+                    read_bytes: None,
+                    write_bytes: None,
+                }],
+                gaps: vec![],
+            };
+            insert_snapshot(&mut c, &snapshot).unwrap();
+        }
+        let result = diagnose_memory(&path, "2h", "previous-week").unwrap();
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.processes[0].name, "growing");
+        assert_eq!(result.processes[0].rss_anon_change_bytes, 2 * 1024 * 1024);
+    }
+}

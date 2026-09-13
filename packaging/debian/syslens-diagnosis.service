@@ -2,9 +2,9 @@
 Description=SysLens local diagnosis companion
 
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/syslens-diagnosis status
-RemainAfterExit=yes
+ExecStart=/usr/bin/syslens-diagnosis daemon --config %h/.config/syslens-diagnosis/config.toml
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=default.target

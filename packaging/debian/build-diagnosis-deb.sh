@@ -56,9 +56,8 @@ Maintainer: Radoslav Chobanov
 Depends: libc6 (>= 2.34)
 Homepage: https://github.com/radoslavchobanov/syslens-core
 Description: Optional local diagnosis companion for SysLens
- This scaffold package provides the separately installable syslens-diagnosis
- command and a disabled-by-default user service template. It does not create
- a diagnosis database, collect evidence, or contact an AI service.
+ This optional package records local RAM and process evidence after explicit
+ enablement. It has a disabled-by-default user service and no AI dependency.
 EOF
 
 mkdir -p "${OUTPUT_DIRECTORY}"

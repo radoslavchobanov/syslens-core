@@ -221,17 +221,30 @@ process smoothing are stored separately in the same file.
 run it, so an absent or disabled add-on adds no writer, database, model client,
 or diagnosis collection to `syslens`.
 
-The package currently provides only scaffold commands:
+The optional add-on records local RAM and process evidence in a SQLite database.
+It has no MQTT, model, or Core dependency. It keeps detailed samples for 185
+days by default and pauses recording rather than silently shortening retention
+when its 16 GiB database budget is reached.
 
 ```bash
 syslens-diagnosis status
 syslens-diagnosis enable
 syslens-diagnosis disable
+syslens-diagnosis diagnose memory --since today --compare previous-week
+syslens diagnose memory --since 7d
 ```
 
-Once installed, Core forwards `syslens diagnose ...`, `syslens chat`, and
-`syslens incidents ...` to that companion on the same host. These commands do
-not yet provide diagnosis, evidence recording, alerts, or AI integration.
+`enable` creates `~/.config/syslens-diagnosis/config.toml` (owner-only),
+initialises `~/.local/state/syslens-diagnosis/diagnosis.sqlite`, then enables
+its user service. The daemon stores host RAM composition plus visible process
+RssAnon/RSS and CPU/I/O counters every 30 seconds. `diagnose memory` compares
+stored local intervals and names observed process growth; it clearly reports
+insufficient coverage and never claims RssAnon is USS/private memory. `chat`
+and `incidents` remain unavailable in this release.
+
+Core forwards `syslens diagnose ...`, `syslens chat`, and `syslens incidents
+...` to the companion on the same host when installed. Core-only installations
+create no diagnosis state or background work.
 See [`packaging/debian`](packaging/debian/README.md) for the independent
 package build.
 
