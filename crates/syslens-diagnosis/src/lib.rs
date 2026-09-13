@@ -625,7 +625,7 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
     let cstart = cend - duration;
     let count = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
         conn.query_row(
-            "SELECT count(*) FROM host_samples WHERE timestamp>=? AND timestamp<=?",
+            "SELECT count(*) FROM host_samples WHERE timestamp>=? AND timestamp<=? AND mem_total IS NOT NULL AND mem_available IS NOT NULL",
             params![a.timestamp(), b.timestamp()],
             |r| r.get(0),
         )
@@ -654,6 +654,11 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
     };
     let current_gaps = gaps(start, end)?;
     let comparison_gaps = gaps(cstart, cend)?;
+    let memory_gaps = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
+        conn.query_row("SELECT count(*) FROM collection_gaps WHERE timestamp>=? AND timestamp<=? AND reason LIKE 'meminfo%'", params![a.timestamp(),b.timestamp()], |r|r.get(0)).map_err(|e|e.to_string())
+    };
+    let current_memory_gaps = memory_gaps(start, end)?;
+    let comparison_memory_gaps = memory_gaps(cstart, cend)?;
     let coverage = Coverage {
         current_samples: n,
         comparison_samples: cn,
@@ -666,8 +671,15 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
     let mut findings = Vec::new();
     let mut limitations=vec!["RssAnon is anonymous resident memory, not private/USS; process RSS cannot exactly reconcile physical RAM.".into()];
-    if coverage.current_ratio < 0.8 || coverage.comparison_ratio < 0.8 {
-        limitations.push("At least 80% sample coverage is required in each interval; stored evidence is incomplete.".into());
+    if coverage.current_ratio < 0.8
+        || coverage.comparison_ratio < 0.8
+        || current_memory_gaps > 0
+        || comparison_memory_gaps > 0
+    {
+        limitations.push("At least 80% valid RAM coverage is required in each interval; stored evidence is incomplete.".into());
+        if current_memory_gaps > 0 || comparison_memory_gaps > 0 {
+            limitations.push("meminfo collection gaps make the RAM evidence incomplete.".into());
+        }
         return Ok(Diagnosis {
             version: 1,
             status: "insufficient evidence".into(),
@@ -693,10 +705,10 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
         conn.query_row("SELECT avg(mem_total),avg(mem_available),avg(cached+buffers+slab) FROM host_samples WHERE timestamp>=? AND timestamp<=?",params![a.timestamp(),b.timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())
     };
     let (total, avail, cache) = avg(start, end)?;
-    let (_, cavail, ccache) = avg(cstart, cend)?;
-    if let (Some(t), Some(a), Some(ca)) = (total, avail, cavail) {
+    let (ctotal, cavail, ccache) = avg(cstart, cend)?;
+    if let (Some(t), Some(a), Some(ct), Some(ca)) = (total, avail, ctotal, cavail) {
         let cur = (t - a) / t * 100.;
-        let old = (t - ca) / t * 100.;
+        let old = (ct - ca) / ct * 100.;
         findings.push(format!("Average used RAM was {:.1}% versus {:.1}% in the comparison interval ({:+.1} percentage points).",cur,old,cur-old));
     }
     if let (Some(x), Some(y)) = (cache, ccache) {
@@ -759,7 +771,7 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
         comparison: Interval {
             start_utc: fmt(cstart),
             end_utc: fmt(cend),
-            mean_mem_total_bytes: total,
+            mean_mem_total_bytes: ctotal,
             mean_mem_available_bytes: cavail,
         },
         coverage,
@@ -906,48 +918,60 @@ mod tests {
         let path = d.path().join("x.sqlite");
         let mut c = open_db(&path).unwrap();
         c.execute(
-            "INSERT INTO metadata(key,value) VALUES('interval_seconds','7200')",
+            "INSERT INTO metadata(key,value) VALUES('interval_seconds','300')",
             [],
         )
         .unwrap();
         let now = unix_now();
-        for (timestamp, rss) in [
-            (now - 7 * 86_400 - 3 * 3600, 11 * 1024 * 1024),
-            (now - 3600, 13 * 1024 * 1024),
-        ] {
-            let snapshot = Snapshot {
-                host: HostSample {
-                    timestamp,
-                    boot_id: "b".into(),
-                    mem_total: Some(100 * 1024 * 1024),
-                    mem_available: Some(
-                        (100 - if rss > 12 * 1024 * 1024 { 13 } else { 11 }) * 1024 * 1024,
-                    ),
-                    ..Default::default()
-                },
-                processes: vec![ProcessSample {
-                    pid: 7,
-                    start_ticks: 4,
-                    name: "growing".into(),
-                    executable: Some("/usr/bin/growing".into()),
-                    uid: Some(1000),
-                    cgroup_name: None,
-                    rss_anon: Some(rss),
-                    rss_file: None,
-                    rss_shmem: None,
-                    rss_total: Some(rss),
-                    cpu_ticks: None,
-                    read_bytes: None,
-                    write_bytes: None,
-                }],
-                gaps: vec![],
-            };
-            insert_snapshot(&mut c, &snapshot).unwrap();
+        for i in 0..12 {
+            for (timestamp, rss) in [
+                (now - 7 * 86_400 - 3600 - i * 300 - 60, 11 * 1024 * 1024),
+                (now - i * 300 - 60, 13 * 1024 * 1024),
+            ] {
+                let snapshot = Snapshot {
+                    host: HostSample {
+                        timestamp,
+                        boot_id: "b".into(),
+                        mem_total: Some(
+                            (if rss > 12 * 1024 * 1024 { 100 } else { 200 }) * 1024 * 1024,
+                        ),
+                        mem_available: Some(
+                            (if rss > 12 * 1024 * 1024 { 87 } else { 178 }) * 1024 * 1024,
+                        ),
+                        ..Default::default()
+                    },
+                    processes: vec![ProcessSample {
+                        pid: 7,
+                        start_ticks: 4,
+                        name: "growing".into(),
+                        executable: Some("/usr/bin/growing".into()),
+                        uid: Some(1000),
+                        cgroup_name: None,
+                        rss_anon: Some(rss),
+                        rss_file: None,
+                        rss_shmem: None,
+                        rss_total: Some(rss),
+                        cpu_ticks: None,
+                        read_bytes: None,
+                        write_bytes: None,
+                    }],
+                    gaps: vec![],
+                };
+                insert_snapshot(&mut c, &snapshot).unwrap();
+            }
         }
-        let result = diagnose_memory(&path, "2h", "previous-week").unwrap();
+        let result = diagnose_memory(&path, "1h", "previous-week").unwrap();
         assert_eq!(result.status, "ok");
         assert_eq!(result.processes[0].name, "growing");
         assert_eq!(result.processes[0].rss_anon_change_bytes, 2 * 1024 * 1024);
+        assert_eq!(
+            result.current.mean_mem_total_bytes,
+            Some((100 * 1024 * 1024) as f64)
+        );
+        assert_eq!(
+            result.comparison.mean_mem_total_bytes,
+            Some((200 * 1024 * 1024) as f64)
+        );
     }
 
     #[test]
@@ -1062,5 +1086,61 @@ mod tests {
                 .status,
             "insufficient evidence"
         );
+    }
+
+    #[test]
+    fn dense_null_meminfo_samples_cannot_claim_a_process_cause() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        c.execute(
+            "INSERT INTO metadata(key,value) VALUES('interval_seconds','300')",
+            [],
+        )
+        .unwrap();
+        let now = unix_now();
+        for i in 0..12 {
+            for (timestamp, valid) in [
+                (now - i * 300 - 60, false),
+                (now - 7 * 86400 - 3600 - i * 300 - 60, true),
+            ] {
+                insert_snapshot(
+                    &mut c,
+                    &Snapshot {
+                        host: HostSample {
+                            timestamp,
+                            boot_id: "b".into(),
+                            mem_total: valid.then_some(100),
+                            mem_available: valid.then_some(80),
+                            ..Default::default()
+                        },
+                        processes: vec![ProcessSample {
+                            pid: 1,
+                            start_ticks: 1,
+                            name: "would-be-cause".into(),
+                            executable: None,
+                            uid: None,
+                            cgroup_name: None,
+                            rss_anon: Some(100),
+                            rss_file: None,
+                            rss_shmem: None,
+                            rss_total: None,
+                            cpu_ticks: None,
+                            read_bytes: None,
+                            write_bytes: None,
+                        }],
+                        gaps: if valid {
+                            vec![]
+                        } else {
+                            vec!["meminfo unavailable".into()]
+                        },
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let result = diagnose_memory(&path, "1h", "previous-week").unwrap();
+        assert_eq!(result.status, "insufficient evidence");
+        assert!(result.processes.is_empty());
     }
 }
