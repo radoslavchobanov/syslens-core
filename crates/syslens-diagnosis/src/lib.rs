@@ -13,8 +13,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 pub const MIN_SQLITE: (i32, i32, i32) = (3, 51, 3);
 pub const GIB: u64 = 1024 * 1024 * 1024;
 const CONTROL_HEADROOM: u64 = 64 * 1024 * 1024;
@@ -32,6 +33,78 @@ pub struct Config {
     pub database_budget_bytes: u64,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub detection: DetectionConfig,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectionConfig {
+    #[serde(default = "default_baseline_hours")]
+    pub baseline_min_hours: u32,
+    #[serde(default = "default_coverage")]
+    pub min_coverage_percent: u8,
+    #[serde(default = "default_sustained")]
+    pub sustained_seconds: u64,
+    #[serde(default = "default_resolve")]
+    pub resolve_seconds: u64,
+    #[serde(default = "default_memory_abs")]
+    pub memory_abs_bytes: u64,
+    #[serde(default = "default_memory_points")]
+    pub memory_percent_points: f64,
+    #[serde(default = "default_storage_warning")]
+    pub storage_warning_percent: u8,
+    #[serde(default = "default_storage_critical")]
+    pub storage_critical_percent: u8,
+    #[serde(default = "default_forecast_days")]
+    pub storage_forecast_days: u8,
+    #[serde(default = "default_cooldown")]
+    pub cooldown_seconds: u64,
+}
+fn default_baseline_hours() -> u32 {
+    24
+}
+fn default_coverage() -> u8 {
+    80
+}
+fn default_sustained() -> u64 {
+    300
+}
+fn default_resolve() -> u64 {
+    600
+}
+fn default_memory_abs() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_memory_points() -> f64 {
+    5.0
+}
+fn default_storage_warning() -> u8 {
+    85
+}
+fn default_storage_critical() -> u8 {
+    95
+}
+fn default_forecast_days() -> u8 {
+    7
+}
+fn default_cooldown() -> u64 {
+    3600
+}
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            baseline_min_hours: default_baseline_hours(),
+            min_coverage_percent: default_coverage(),
+            sustained_seconds: default_sustained(),
+            resolve_seconds: default_resolve(),
+            memory_abs_bytes: default_memory_abs(),
+            memory_percent_points: default_memory_points(),
+            storage_warning_percent: default_storage_warning(),
+            storage_critical_percent: default_storage_critical(),
+            storage_forecast_days: default_forecast_days(),
+            cooldown_seconds: default_cooldown(),
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +164,7 @@ impl Default for Config {
             retention_days: 185,
             database_budget_bytes: 16 * GIB,
             storage: StorageConfig::default(),
+            detection: DetectionConfig::default(),
         }
     }
 }
@@ -123,6 +197,35 @@ impl Config {
         }
         if !(5..=3_600).contains(&s.max_duration_seconds) {
             return Err("storage.max_duration_seconds must be between 5 and 3600".into());
+        }
+        let d = &self.detection;
+        if !(1..=720).contains(&d.baseline_min_hours) {
+            return Err("detection.baseline_min_hours must be between 1 and 720".into());
+        }
+        if !(50..=100).contains(&d.min_coverage_percent) {
+            return Err("detection.min_coverage_percent must be between 50 and 100".into());
+        }
+        if !(60..=3600).contains(&d.sustained_seconds) || !(60..=7200).contains(&d.resolve_seconds)
+        {
+            return Err(
+                "detection sustained_seconds or resolve_seconds is outside allowed range".into(),
+            );
+        }
+        if d.memory_abs_bytes == 0 || !(0.1..=100.0).contains(&d.memory_percent_points) {
+            return Err("invalid memory detection threshold".into());
+        }
+        if d.storage_warning_percent == 0
+            || d.storage_warning_percent >= d.storage_critical_percent
+            || d.storage_critical_percent > 100
+        {
+            return Err(
+                "storage warning threshold must be below critical threshold (both 1..=100)".into(),
+            );
+        }
+        if !(1..=30).contains(&d.storage_forecast_days)
+            || !(60..=86_400).contains(&d.cooldown_seconds)
+        {
+            return Err("invalid storage forecast or cooldown setting".into());
         }
         Ok(())
     }
@@ -330,6 +433,20 @@ CREATE TABLE directory_samples (scan_id INTEGER NOT NULL REFERENCES storage_scan
 CREATE INDEX directory_samples_path ON directory_samples(path);
 PRAGMA user_version=2; COMMIT;").map_err(|e| e.to_string())?;
     }
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if v == 2 {
+        conn.execute_batch("BEGIN IMMEDIATE;
+CREATE TABLE detector_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE incidents (id TEXT PRIMARY KEY, detector TEXT NOT NULL, subject TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, opened_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, recovered_at INTEGER, acknowledged_at INTEGER, evidence_json TEXT NOT NULL);
+CREATE UNIQUE INDEX open_incident_detector_subject ON incidents(detector,subject) WHERE status='open';
+CREATE INDEX incidents_status_updated ON incidents(status,updated_at DESC);
+CREATE TABLE notification_events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, incident_id TEXT NOT NULL REFERENCES incidents(id), kind TEXT NOT NULL, severity TEXT NOT NULL, created_at INTEGER NOT NULL, detector_version TEXT NOT NULL, evidence_json TEXT NOT NULL);
+CREATE INDEX notification_events_created ON notification_events(created_at);
+CREATE TABLE notification_consumers (name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+PRAGMA user_version=3; COMMIT;").map_err(|e|e.to_string())?;
+    }
     Ok(())
 }
 
@@ -456,6 +573,16 @@ pub fn housekeeping(conn: &mut Connection, cutoff: i64, now: i64) -> Result<usiz
     tx.execute("INSERT INTO metadata(key,value) VALUES('next_housekeeping',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(now+3600).to_string()]).map_err(|e|e.to_string())?;
     count += tx.execute("DELETE FROM mount_samples WHERE rowid IN (SELECT rowid FROM mount_samples WHERE timestamp < ? LIMIT 10000)", [cutoff]).map_err(|e|e.to_string())?;
     count += tx.execute("DELETE FROM storage_scans WHERE id IN (SELECT id FROM storage_scans WHERE ended_at < ? LIMIT 1000)", [cutoff]).map_err(|e|e.to_string())?;
+    // Notification evidence is deliberately retained longer than raw telemetry.
+    // Keep every event for an open incident so it remains understandable even
+    // after the underlying minute samples have expired.
+    count += tx.execute("DELETE FROM notification_events WHERE cursor IN (SELECT e.cursor FROM notification_events e JOIN incidents i ON i.id=e.incident_id WHERE e.created_at < ? AND i.status!='open' LIMIT 1000)", [now-365*86400]).map_err(|e| e.to_string())?;
+    let earliest: Option<i64> = tx
+        .query_row("SELECT min(cursor) FROM notification_events", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO metadata(key,value) VALUES('earliest_notification_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [earliest.unwrap_or(0).to_string()]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA incremental_vacuum(1000); PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| e.to_string())?;
@@ -751,6 +878,412 @@ pub fn insert_mounts(conn: &mut Connection, samples: &[MountSample]) -> Result<(
     }
     tx.commit().map_err(|e| e.to_string())
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Incident {
+    pub id: String,
+    pub detector: String,
+    pub subject: String,
+    pub severity: String,
+    pub status: String,
+    pub opened_at: i64,
+    pub updated_at: i64,
+    pub recovered_at: Option<i64>,
+    pub acknowledged_at: Option<i64>,
+    pub evidence: serde_json::Value,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationEvent {
+    pub cursor: i64,
+    pub id: String,
+    pub incident_id: String,
+    pub kind: String,
+    pub severity: String,
+    pub created_at: i64,
+    pub detector_version: String,
+    pub evidence: serde_json::Value,
+}
+
+fn median(mut values: Vec<i64>) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    };
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+fn state_get(tx: &Transaction<'_>, key: &str) -> Result<serde_json::Value, String> {
+    Ok(tx
+        .query_row("SELECT value FROM detector_state WHERE key=?", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({})))
+}
+fn state_set(
+    tx: &Transaction<'_>,
+    key: &str,
+    value: &serde_json::Value,
+    now: i64,
+) -> Result<(), String> {
+    tx.execute("INSERT INTO detector_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,serde_json::to_string(value).map_err(|e|e.to_string())?,now]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+fn bounded_evidence(mut v: serde_json::Value) -> String {
+    let mut s = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+    if s.len() > 32 * 1024 {
+        v["limitations"] = serde_json::json!(["evidence truncated to 32 KiB"]);
+        s = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+        s.truncate(32 * 1024);
+    }
+    s
+}
+#[allow(clippy::too_many_arguments)] // Detector inputs are deliberately explicit at call sites.
+fn transition(
+    tx: &Transaction<'_>,
+    detector: &str,
+    subject: &str,
+    severity: &str,
+    breach: bool,
+    now: i64,
+    cfg: &DetectionConfig,
+    evidence: serde_json::Value,
+) -> Result<(), String> {
+    let key = format!("detector:{detector}:{subject}");
+    let mut state = state_get(tx, &key)?;
+    let since = state.get("since").and_then(|v| v.as_i64());
+    let normal_since = state.get("normal_since").and_then(|v| v.as_i64());
+    if breach {
+        state["normal_since"] = serde_json::Value::Null;
+        if since.is_none() {
+            state["since"] = serde_json::json!(now);
+        }
+    } else {
+        state["since"] = serde_json::Value::Null;
+        if normal_since.is_none() {
+            state["normal_since"] = serde_json::json!(now);
+        }
+    }
+    let open: Option<(String, String)> = tx
+        .query_row(
+            "SELECT id,severity FROM incidents WHERE detector=? AND subject=? AND status='open'",
+            params![detector, subject],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let sustained = state
+        .get("since")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|t| now - t >= cfg.sustained_seconds as i64);
+    let resolved = state
+        .get("normal_since")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|t| now - t >= cfg.resolve_seconds as i64);
+    let evidence = bounded_evidence(evidence);
+    let emit = |id: String, kind: &str, sev: &str| -> Result<(), String> {
+        tx.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES(?,?,?,?,?,?,?)",params![Uuid::new_v4().to_string(),id,kind,sev,now,"v1",evidence]).map_err(|e|e.to_string())?;
+        Ok(())
+    };
+    match open {
+        None if breach && sustained => {
+            let cooldown = state
+                .get("recovered_at")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|t| now - t < cfg.cooldown_seconds as i64);
+            if !cooldown {
+                let id = Uuid::new_v4().to_string();
+                tx.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES(?,?,?,?, 'open',?,?,?)",params![id,detector,subject,severity,now,now,evidence]).map_err(|e|e.to_string())?;
+                emit(id, "opened", severity)?;
+            }
+        }
+        Some((id, old)) if !breach && resolved => {
+            tx.execute("UPDATE incidents SET status='recovered',updated_at=?,recovered_at=?,evidence_json=? WHERE id=?",params![now,now,evidence,id]).map_err(|e|e.to_string())?;
+            state["recovered_at"] = serde_json::json!(now);
+            emit(id, "recovered", &old)?;
+        }
+        Some((id, old)) if breach && rank_severity(severity) > rank_severity(&old) => {
+            tx.execute(
+                "UPDATE incidents SET severity=?,updated_at=?,evidence_json=? WHERE id=?",
+                params![severity, now, evidence, id],
+            )
+            .map_err(|e| e.to_string())?;
+            emit(id, "escalated", severity)?;
+        }
+        _ => {}
+    };
+    state_set(tx, &key, &state, now)
+}
+fn rank_severity(s: &str) -> u8 {
+    match s {
+        "critical" => 2,
+        "warning" => 1,
+        _ => 0,
+    }
+}
+
+/// Executes once a minute after successful local RAM and mount collection.
+pub fn run_detection(
+    conn: &mut Connection,
+    cfg: &DetectionConfig,
+    now: i64,
+) -> Result<bool, String> {
+    let last: i64 = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='last_detection_run'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if now - last < 60 {
+        return Ok(false);
+    };
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let current:Option<(i64,i64,i64)>=tx.query_row("SELECT timestamp,mem_total,mem_available FROM host_samples WHERE timestamp<=? AND mem_total IS NOT NULL AND mem_available IS NOT NULL ORDER BY timestamp DESC LIMIT 1",[now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+    if let Some((ts, total, avail)) = current {
+        let used = total - avail;
+        let end = ts - cfg.sustained_seconds as i64;
+        let start = end - cfg.baseline_min_hours as i64 * 3600;
+        let vals: Vec<i64> = {
+            let mut q=tx.prepare("SELECT mem_total-mem_available FROM host_samples WHERE timestamp BETWEEN ? AND ? AND mem_total IS NOT NULL AND mem_available IS NOT NULL").map_err(|e|e.to_string())?;
+            q.query_map(params![start, end], |r| r.get(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .collect()
+        };
+        // The recorder interval is configuration, not a detector constant.  A
+        // database created before `initialize_db` has no metadata yet (mainly
+        // useful to tests), in which case use the documented default.
+        let interval: i64 = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='interval_seconds'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(30);
+        let expected = ((end - start) / interval + 1).max(1);
+        let coverage = vals.len() as i64 * 100 / expected;
+        if end - start >= cfg.baseline_min_hours as i64 * 3600
+            && coverage >= cfg.min_coverage_percent as i64
+            && let Some(base) = median(vals.clone())
+        {
+            let dev = median(vals.into_iter().map(|v| (v - base).abs()).collect()).unwrap_or(0);
+            let abs = used - base;
+            let points = abs as f64 * 100.0 / total as f64;
+            let robust = if dev == 0 {
+                abs >= cfg.memory_abs_bytes as i64 * 2
+            } else {
+                abs >= dev.saturating_mul(4)
+            };
+            let breach =
+                abs >= cfg.memory_abs_bytes as i64 && points >= cfg.memory_percent_points && robust;
+            transition(
+                &tx,
+                "memory_above_baseline",
+                "host",
+                "warning",
+                breach,
+                now,
+                cfg,
+                serde_json::json!({"conclusion":"host memory usage is above its retained baseline","current_used_bytes":used,"baseline_used_bytes":base,"change_bytes":abs,"change_percentage_points":points,"measured_at":ts,"coverage_percent":coverage,"limitations":["This finding does not claim a process leak or pressure."]}),
+            )?;
+        }
+    }
+    type PressureSample = (Option<i64>, Option<i64>, Option<f64>, Option<f64>);
+    let pressure: Option<PressureSample> = tx
+        .query_row(
+            "SELECT swap_total,swap_free,psi_some,psi_full FROM host_samples WHERE timestamp<=? ORDER BY timestamp DESC LIMIT 1",
+            [now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some((Some(swap_total), Some(swap_free), psi_some, psi_full)) = pressure {
+        let swap_used = swap_total.saturating_sub(swap_free);
+        let pressure_value = psi_full.or(psi_some).unwrap_or(0.0);
+        let breach = swap_used > 0 && pressure_value >= 0.01;
+        let severity = if pressure_value >= 1.0 {
+            "critical"
+        } else {
+            "warning"
+        };
+        transition(
+            &tx,
+            "memory_pressure",
+            "host",
+            severity,
+            breach,
+            now,
+            cfg,
+            serde_json::json!({"conclusion":"swap activity and Linux memory pressure were observed together","swap_used_bytes":swap_used,"psi_some":psi_some,"psi_full":psi_full,"limitations":["This finding does not identify an owning process."]}),
+        )?;
+    }
+    let mut stmt=tx.prepare("SELECT mount_id,mount_point,total_bytes,used_bytes FROM mount_samples WHERE timestamp=(SELECT max(timestamp) FROM mount_samples WHERE timestamp<=?) AND capability='available' AND total_bytes>0 AND used_bytes IS NOT NULL").map_err(|e|e.to_string())?;
+    let mounts: Vec<(String, String, i64, i64)> = stmt
+        .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    drop(stmt);
+    for (id, path, total, used) in mounts {
+        let pct = used as f64 * 100.0 / total as f64;
+        let sev = if pct >= cfg.storage_critical_percent as f64 {
+            "critical"
+        } else {
+            "warning"
+        };
+        transition(
+            &tx,
+            "storage_capacity",
+            &id,
+            sev,
+            pct >= cfg.storage_warning_percent as f64,
+            now,
+            cfg,
+            serde_json::json!({"conclusion":"filesystem capacity is above the configured threshold","mount_id":id,"mount_point":path,"used_bytes":used,"total_bytes":total,"used_percent":pct,"limitations":[]}),
+        )?;
+        let hourly: i64 = tx.query_row("SELECT count(DISTINCT timestamp / 3600) FROM mount_samples WHERE mount_id=? AND timestamp>=? AND capability='available' AND used_bytes IS NOT NULL", params![id, now-7*86400], |r|r.get(0)).map_err(|e|e.to_string())?;
+        let recent: Option<(i64,i64)> = tx.query_row("SELECT timestamp,used_bytes FROM mount_samples WHERE mount_id=? AND timestamp<=? AND timestamp>=? AND capability='available' AND used_bytes IS NOT NULL ORDER BY timestamp DESC LIMIT 1",params![id,now-20*3600,now-26*3600],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        if hourly >= 72
+            && let Some((old_ts, old_used)) = recent
+        {
+            let elapsed = (now - old_ts).max(1);
+            let hourly_growth = (used - old_used) as f64 / (elapsed as f64 / 3600.0);
+            let warn_bytes = total as f64 * cfg.storage_warning_percent as f64 / 100.0;
+            let hours_to = if hourly_growth > 0.0 {
+                (warn_bytes - used as f64) / hourly_growth
+            } else {
+                f64::INFINITY
+            };
+            let forecast = (used as f64) < warn_bytes
+                && hours_to >= 0.0
+                && hours_to <= cfg.storage_forecast_days as f64 * 24.0;
+            transition(
+                &tx,
+                "storage_forecast",
+                &id,
+                "warning",
+                forecast,
+                now,
+                cfg,
+                serde_json::json!({"conclusion":"filesystem growth projects a warning threshold crossing","mount_id":id,"mount_point":path,"current_used_bytes":used,"hourly_growth_bytes":hourly_growth,"forecast_hours":hours_to,"limitations":["Forecast uses the latest 24-hour stable segment; abrupt prior growth that has flattened does not forecast."]}),
+            )?;
+        }
+    }
+    tx.execute("INSERT INTO metadata(key,value) VALUES('last_detection_run',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[now.to_string()]).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+pub fn list_incidents(path: &Path) -> Result<Vec<Incident>, String> {
+    let c = open_readonly(path)?;
+    let mut s=c.prepare("SELECT id,detector,subject,severity,status,opened_at,updated_at,recovered_at,acknowledged_at,evidence_json FROM incidents ORDER BY updated_at DESC").map_err(|e|e.to_string())?;
+    s.query_map([], |r| {
+        Ok(Incident {
+            id: r.get(0)?,
+            detector: r.get(1)?,
+            subject: r.get(2)?,
+            severity: r.get(3)?,
+            status: r.get(4)?,
+            opened_at: r.get(5)?,
+            updated_at: r.get(6)?,
+            recovered_at: r.get(7)?,
+            acknowledged_at: r.get(8)?,
+            evidence: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(9)?)
+                .unwrap_or_default(),
+        })
+    })
+    .map_err(|e| e.to_string())?
+    .filter_map(Result::ok)
+    .collect::<Vec<_>>()
+    .pipe(Ok)
+}
+fn open_readonly(path: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())
+}
+pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), String> {
+    let c = open_db(path)?;
+    if c.execute(
+        "UPDATE incidents SET acknowledged_at=?,updated_at=? WHERE id=?",
+        params![now, now, id],
+    )
+    .map_err(|e| e.to_string())?
+        == 0
+    {
+        return Err("incident not found".into());
+    };
+    Ok(())
+}
+pub fn list_events(path: &Path, after: i64) -> Result<Vec<NotificationEvent>, String> {
+    let c = open_readonly(path)?;
+    let earliest: Option<i64> = c
+        .query_row("SELECT min(cursor) FROM notification_events", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    if let Some(earliest) = earliest
+        && after < earliest.saturating_sub(1)
+    {
+        return Err(format!(
+            "notification history gap: cursor {after} predates earliest retained cursor {earliest}"
+        ));
+    }
+    let mut s=c.prepare("SELECT cursor,id,incident_id,kind,severity,created_at,detector_version,evidence_json FROM notification_events WHERE cursor>? ORDER BY cursor").map_err(|e|e.to_string())?;
+    s.query_map([after], |r| {
+        Ok(NotificationEvent {
+            cursor: r.get(0)?,
+            id: r.get(1)?,
+            incident_id: r.get(2)?,
+            kind: r.get(3)?,
+            severity: r.get(4)?,
+            created_at: r.get(5)?,
+            detector_version: r.get(6)?,
+            evidence: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(7)?)
+                .unwrap_or_default(),
+        })
+    })
+    .map_err(|e| e.to_string())?
+    .filter_map(Result::ok)
+    .collect::<Vec<_>>()
+    .pipe(Ok)
+}
+/// Advance one named transport cursor after it has durably accepted an event.
+/// Human acknowledgement is intentionally separate from transport delivery.
+pub fn acknowledge_consumer(path: &Path, name: &str, cursor: i64, now: i64) -> Result<(), String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("consumer name must be between 1 and 128 characters".into());
+    }
+    let c = open_db(path)?;
+    c.execute(
+        "INSERT INTO notification_consumers(name,cursor,updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET cursor=MAX(notification_consumers.cursor,excluded.cursor),updated_at=excluded.updated_at",
+        params![name, cursor.max(0), now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+pub fn consumer_cursor(path: &Path, name: &str) -> Result<Option<i64>, String> {
+    let c = open_readonly(path)?;
+    c.query_row(
+        "SELECT cursor FROM notification_consumers WHERE name=?",
+        [name],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+trait Pipe: Sized {
+    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
 pub fn insert_collection_gaps(
     conn: &mut Connection,
     timestamp: i64,
@@ -1768,6 +2301,14 @@ mod tests {
         assert!(load_config(&path).is_err());
         fs::write(&path, "[storage]\nmax_depth = 9\n").unwrap();
         assert!(load_config(&path).is_err());
+        fs::write(&path, "[detection]\nunknown = 1\n").unwrap();
+        assert!(load_config(&path).is_err());
+        fs::write(
+            &path,
+            "[detection]\nstorage_warning_percent = 95\nstorage_critical_percent = 90\n",
+        )
+        .unwrap();
+        assert!(load_config(&path).is_err());
         fs::write(
             &path,
             "interval_seconds = 5\nretention_days = 185\ndatabase_budget_bytes = 1073741824\n",
@@ -2089,7 +2630,7 @@ mod tests {
             },
         )
         .unwrap();
-        c.execute_batch("DROP TABLE directory_samples; DROP TABLE storage_scans; DROP TABLE mount_samples; PRAGMA user_version=1;").unwrap();
+        c.execute_batch("DROP TABLE directory_samples; DROP TABLE storage_scans; DROP TABLE mount_samples; DROP TABLE detector_state; DROP TABLE notification_events; DROP TABLE notification_consumers; DROP TABLE incidents; PRAGMA user_version=1;").unwrap();
         drop(c);
         let c = open_db(&path).unwrap();
         assert_eq!(
@@ -2101,7 +2642,7 @@ mod tests {
         assert_eq!(
             c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -2677,5 +3218,335 @@ mod tests {
         let result = diagnose_memory(&path, "1h", "previous-week").unwrap();
         assert_eq!(result.status, "insufficient evidence");
         assert!(result.processes.is_empty());
+    }
+
+    #[test]
+    fn detection_opens_escalates_recovers_and_replays_events() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let cfg = DetectionConfig {
+            baseline_min_hours: 1,
+            min_coverage_percent: 80,
+            sustained_seconds: 60,
+            resolve_seconds: 60,
+            memory_abs_bytes: 100,
+            memory_percent_points: 1.0,
+            cooldown_seconds: 60,
+            ..Default::default()
+        };
+        let now = 2_000_000;
+        for t in (now - 3660..now - 60).step_by(30) {
+            insert_snapshot(
+                &mut c,
+                &Snapshot {
+                    host: HostSample {
+                        timestamp: t,
+                        boot_id: "b".into(),
+                        mem_total: Some(10_000),
+                        mem_available: Some(9_000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        insert_snapshot(
+            &mut c,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: now,
+                    boot_id: "b".into(),
+                    mem_total: Some(10_000),
+                    mem_available: Some(7_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_mounts(
+            &mut c,
+            &[MountSample {
+                timestamp: now,
+                mount_id: "disk-a".into(),
+                mount_point: "/data".into(),
+                fs_type: "ext4".into(),
+                total_bytes: Some(1000),
+                free_bytes: Some(140),
+                used_bytes: Some(860),
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            }],
+        )
+        .unwrap();
+        assert!(run_detection(&mut c, &cfg, now).unwrap());
+        assert!(!run_detection(&mut c, &cfg, now + 30).unwrap());
+        insert_snapshot(
+            &mut c,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: now + 61,
+                    boot_id: "b".into(),
+                    mem_total: Some(10_000),
+                    mem_available: Some(7_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_mounts(
+            &mut c,
+            &[MountSample {
+                timestamp: now + 61,
+                mount_id: "disk-a".into(),
+                mount_point: "/data".into(),
+                fs_type: "ext4".into(),
+                total_bytes: Some(1000),
+                free_bytes: Some(140),
+                used_bytes: Some(860),
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            }],
+        )
+        .unwrap();
+        run_detection(&mut c, &cfg, now + 61).unwrap();
+        insert_snapshot(
+            &mut c,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: now + 122,
+                    boot_id: "b".into(),
+                    mem_total: Some(10_000),
+                    mem_available: Some(7_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_mounts(
+            &mut c,
+            &[MountSample {
+                timestamp: now + 122,
+                mount_id: "disk-a".into(),
+                mount_point: "/data".into(),
+                fs_type: "ext4".into(),
+                total_bytes: Some(1000),
+                free_bytes: Some(40),
+                used_bytes: Some(960),
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            }],
+        )
+        .unwrap();
+        run_detection(&mut c, &cfg, now + 122).unwrap();
+        let events = list_events(&path, 0).unwrap();
+        assert!(events.iter().any(|e| e.kind == "opened"));
+        assert!(events.iter().any(|e| e.kind == "escalated"));
+        let id = list_incidents(&path)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        acknowledge_incident(&path, &id, now + 62).unwrap();
+        assert!(
+            list_incidents(&path)
+                .unwrap()
+                .iter()
+                .any(|i| i.acknowledged_at.is_some())
+        );
+    }
+
+    #[test]
+    fn detection_needs_a_warm_baseline_and_small_difference_does_not_alert() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let cfg = DetectionConfig::default();
+        let now = 3_000_000;
+        insert_snapshot(
+            &mut c,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: now,
+                    boot_id: "b".into(),
+                    mem_total: Some(1000),
+                    mem_available: Some(870),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(run_detection(&mut c, &cfg, now).unwrap());
+        assert!(list_incidents(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn storage_capacity_uses_per_mount_incidents_and_recovers() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let cfg = DetectionConfig {
+            sustained_seconds: 60,
+            resolve_seconds: 60,
+            cooldown_seconds: 60,
+            ..Default::default()
+        };
+        let add = |c: &mut Connection, timestamp, id: &str, used| {
+            insert_mounts(
+                c,
+                &[MountSample {
+                    timestamp,
+                    mount_id: id.into(),
+                    mount_point: format!("/{id}"),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(1_000),
+                    free_bytes: Some(1_000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+        };
+        add(&mut c, 1_000, "a", 860);
+        add(&mut c, 1_000, "b", 960);
+        run_detection(&mut c, &cfg, 1_000).unwrap();
+        add(&mut c, 1_061, "a", 860);
+        add(&mut c, 1_061, "b", 960);
+        run_detection(&mut c, &cfg, 1_061).unwrap();
+        let open = list_incidents(&path).unwrap();
+        assert!(
+            open.iter()
+                .any(|i| i.subject == "a" && i.severity == "warning")
+        );
+        assert!(
+            open.iter()
+                .any(|i| i.subject == "b" && i.severity == "critical")
+        );
+        add(&mut c, 1_122, "a", 400);
+        add(&mut c, 1_122, "b", 400);
+        run_detection(&mut c, &cfg, 1_122).unwrap();
+        add(&mut c, 1_183, "a", 400);
+        add(&mut c, 1_183, "b", 400);
+        run_detection(&mut c, &cfg, 1_183).unwrap();
+        assert!(
+            list_incidents(&path)
+                .unwrap()
+                .iter()
+                .filter(|i| i.detector == "storage_capacity")
+                .all(|i| i.status == "recovered")
+        );
+    }
+
+    #[test]
+    fn storage_forecast_requires_growth_not_a_flat_post_jump() {
+        fn populate(c: &mut Connection, flat: bool) {
+            for hour in 0..73_i64 {
+                let timestamp = 10_000 + hour * 3600;
+                let used = if flat {
+                    if hour < 48 { 500 } else { 800 }
+                } else {
+                    700 + hour * 2
+                };
+                insert_mounts(
+                    c,
+                    &[MountSample {
+                        timestamp,
+                        mount_id: "data".into(),
+                        mount_point: "/data".into(),
+                        fs_type: "ext4".into(),
+                        total_bytes: Some(1_000),
+                        free_bytes: Some(1_000 - used),
+                        used_bytes: Some(used),
+                        total_inodes: None,
+                        free_inodes: None,
+                        read_only: false,
+                        capability: "available".into(),
+                    }],
+                )
+                .unwrap();
+            }
+        }
+        let cfg = DetectionConfig {
+            sustained_seconds: 60,
+            storage_warning_percent: 90,
+            storage_critical_percent: 95,
+            ..Default::default()
+        };
+        let now = 10_000 + 72 * 3600;
+        let d = tempdir().unwrap();
+        let path = d.path().join("growth.sqlite");
+        let mut c = open_db(&path).unwrap();
+        populate(&mut c, false);
+        run_detection(&mut c, &cfg, now).unwrap();
+        run_detection(&mut c, &cfg, now + 61).unwrap();
+        let incidents = list_incidents(&path).unwrap();
+        assert!(
+            incidents.iter().any(|i| i.detector == "storage_forecast"),
+            "{incidents:#?}"
+        );
+
+        let d = tempdir().unwrap();
+        let path = d.path().join("flat.sqlite");
+        let mut c = open_db(&path).unwrap();
+        populate(&mut c, true);
+        run_detection(&mut c, &cfg, now).unwrap();
+        run_detection(&mut c, &cfg, now + 61).unwrap();
+        assert!(
+            list_incidents(&path)
+                .unwrap()
+                .iter()
+                .all(|i| i.detector != "storage_forecast")
+        );
+    }
+
+    #[test]
+    fn event_replay_reports_expired_cursor_and_consumer_ack_is_independent() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = 400 * 86_400;
+        c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('old','d','old','warning','recovered',1,1,'{}')", []).unwrap();
+        c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('old-event','old','opened','warning',1,'v1','{}')", []).unwrap();
+        c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('new','d','new','warning','recovered',?,?, '{}')", params![now, now]).unwrap();
+        c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('new-event','new','opened','warning',?,'v1','{}')", [now]).unwrap();
+        housekeeping(&mut c, 0, now).unwrap();
+        assert!(list_events(&path, 0).unwrap_err().contains("history gap"));
+        let events = list_events(&path, 1).unwrap();
+        assert_eq!(events.len(), 1);
+        let incident = list_incidents(&path)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == "new")
+            .unwrap();
+        acknowledge_incident(&path, &incident.id, now).unwrap();
+        acknowledge_consumer(&path, "terminal", events[0].cursor, now).unwrap();
+        assert_eq!(
+            consumer_cursor(&path, "terminal").unwrap(),
+            Some(events[0].cursor)
+        );
+        assert!(
+            list_incidents(&path)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.id == "new")
+                .unwrap()
+                .acknowledged_at
+                .is_some()
+        );
     }
 }

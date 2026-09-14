@@ -38,7 +38,12 @@ enum CommandLine {
         resource: Diagnose,
     },
     Chat,
-    Incidents,
+    Incidents {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<IncidentCommand>,
+    },
 }
 #[derive(Subcommand)]
 enum Diagnose {
@@ -57,6 +62,31 @@ enum Diagnose {
         compare: String,
         #[arg(long)]
         json: bool,
+    },
+}
+#[derive(Subcommand)]
+enum IncidentCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Acknowledge {
+        id: String,
+    },
+    Events {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    Watch {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
     },
 }
 fn service(args: &[&str]) -> Result<(), String> {
@@ -154,7 +184,9 @@ fn main() -> ExitCode {
             }
         }
         CommandLine::Chat => Err("chat is not available yet; use `syslens diagnose memory`".into()),
-        CommandLine::Incidents => Err("incidents are not available yet".into()),
+        CommandLine::Incidents { config, command } => {
+            incidents(config.unwrap_or_else(diagnosis::config_path), command)
+        }
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -162,6 +194,65 @@ fn main() -> ExitCode {
             eprintln!("syslens-diagnosis: {e}");
             ExitCode::from(1)
         }
+    }
+}
+fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), String> {
+    let db = diagnosis::database_path_for_config(&config);
+    match command.unwrap_or(IncidentCommand::List { json: false }) {
+        IncidentCommand::List { json } => {
+            let x = diagnosis::list_incidents(&db)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&x).unwrap())
+            } else {
+                for i in x {
+                    println!(
+                        "{} {} {} {} {}",
+                        i.id, i.status, i.severity, i.detector, i.subject
+                    );
+                }
+            }
+            Ok(())
+        }
+        IncidentCommand::Show { id, json } => {
+            let x = diagnosis::list_incidents(&db)?
+                .into_iter()
+                .find(|x| x.id == id)
+                .ok_or("incident not found")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&x).unwrap())
+            } else {
+                println!(
+                    "{} {} {} {}\n{}",
+                    x.id,
+                    x.status,
+                    x.severity,
+                    x.detector,
+                    serde_json::to_string_pretty(&x.evidence).unwrap()
+                )
+            };
+            Ok(())
+        }
+        IncidentCommand::Acknowledge { id } => {
+            diagnosis::acknowledge_incident(&db, &id, diagnosis::unix_now())
+        }
+        IncidentCommand::Events { after, json } => {
+            let x = diagnosis::list_events(&db, after)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&x).unwrap())
+            } else {
+                for e in x {
+                    println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id)
+                }
+            };
+            Ok(())
+        }
+        IncidentCommand::Watch { mut after } => loop {
+            for e in diagnosis::list_events(&db, after)? {
+                after = e.cursor;
+                println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id);
+            }
+            thread::sleep(Duration::from_secs(2));
+        },
     }
 }
 fn warn_if_linger_disabled() {
@@ -211,6 +302,7 @@ fn status(config: PathBuf) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     let (mount_count, scan_count, last_scan, partial_scans, unavailable_mounts): (i64, i64, Option<i64>, i64, i64) = conn.query_row("SELECT (SELECT count(DISTINCT mount_id) FROM mount_samples), (SELECT count(*) FROM storage_scans), (SELECT max(ended_at) FROM storage_scans), (SELECT count(*) FROM storage_scans WHERE status!='complete'), (SELECT count(*) FROM mount_samples WHERE timestamp=(SELECT max(timestamp) FROM mount_samples) AND capability='unavailable')", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e| e.to_string())?;
+    let (open_incidents, event_count, last_detection): (i64, i64, Option<String>) = conn.query_row("SELECT (SELECT count(*) FROM incidents WHERE status='open'), (SELECT count(*) FROM notification_events), (SELECT value FROM metadata WHERE key='last_detection_run')", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| e.to_string())?;
     let active = Command::new("systemctl")
         .args(["--user", "is-active", "syslens-diagnosis.service"])
         .output()
@@ -220,7 +312,7 @@ fn status(config: PathBuf) -> Result<(), String> {
     let paused = !diagnosis::budget_allows(&db, cfg.database_budget_bytes)
         || !diagnosis::filesystem_has_reserve(&db);
     println!(
-        "syslens-diagnosis: service={} recording={}\nconfig={}\ndatabase={} ({} bytes)\ninterval={}s retention={}d budget={} bytes\nhost samples={} earliest={:?} latest={:?}\nmounts={} scans={} last_scan={:?} incomplete_scans={} unavailable_mounts={}",
+        "syslens-diagnosis: service={} recording={}\nconfig={}\ndatabase={} ({} bytes)\ninterval={}s retention={}d budget={} bytes\nhost samples={} earliest={:?} latest={:?}\nmounts={} scans={} last_scan={:?} incomplete_scans={} unavailable_mounts={}\nopen_incidents={} notification_events={} detection_last_run={:?}",
         if active {
             "active"
         } else {
@@ -244,7 +336,10 @@ fn status(config: PathBuf) -> Result<(), String> {
         scan_count,
         last_scan,
         partial_scans,
-        unavailable_mounts
+        unavailable_mounts,
+        open_incidents,
+        event_count,
+        last_detection
     );
     Ok(())
 }
@@ -289,13 +384,26 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
             && diagnosis::filesystem_has_reserve(&db)
         {
             let snap = collector.collect(diagnosis::unix_now());
-            if let Err(e) = diagnosis::insert_snapshot(&mut conn, &snap) {
-                eprintln!("syslens-diagnosis: collection write failed: {e}")
-            }
+            let ram_ok = if let Err(e) = diagnosis::insert_snapshot(&mut conn, &snap) {
+                eprintln!("syslens-diagnosis: collection write failed: {e}");
+                false
+            } else {
+                true
+            };
             let (mounts, mount_gaps) =
                 diagnosis::collect_mounts(&diagnosis::LinuxFilesystemReader, diagnosis::unix_now());
-            if let Err(e) = diagnosis::insert_mounts(&mut conn, &mounts) {
-                eprintln!("syslens-diagnosis: mount collection write failed: {e}")
+            let mounts_ok = if let Err(e) = diagnosis::insert_mounts(&mut conn, &mounts) {
+                eprintln!("syslens-diagnosis: mount collection write failed: {e}");
+                false
+            } else {
+                true
+            };
+            if ram_ok
+                && mounts_ok
+                && let Err(e) =
+                    diagnosis::run_detection(&mut conn, &cfg.detection, diagnosis::unix_now())
+            {
+                eprintln!("syslens-diagnosis: detection failed: {e}");
             }
             if !mount_gaps.is_empty() {
                 eprintln!("syslens-diagnosis: {}", mount_gaps.join("; "));

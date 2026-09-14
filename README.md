@@ -240,8 +240,16 @@ initialises `~/.local/state/syslens-diagnosis/diagnosis.sqlite`, then enables
 its user service. The daemon stores host RAM composition plus visible process
 RssAnon/RSS and CPU/I/O counters every 30 seconds. `diagnose memory` compares
 stored local intervals and names observed process growth; it clearly reports
-insufficient coverage below 80% in either interval and never claims RssAnon is USS/private memory. `chat`
-and `incidents` remain unavailable in this release.
+insufficient coverage below 80% in either interval and never claims RssAnon is USS/private memory.
+
+The add-on also records durable local warning, escalation, and recovery events
+for sustained unusual memory use, Linux memory pressure, filesystem capacity,
+and supported storage-growth forecasts. It has no push transport: inspect or
+replay events with `syslens-diagnosis incidents list`, `events --after CURSOR`,
+`show ID`, and `acknowledge ID`. Reading events never marks them delivered.
+The strict `[detection]` configuration defaults to a 24-hour warm baseline and
+80% coverage before a memory-baseline alert can open. `chat` remains unavailable
+in this release.
 
 The add-on also records local writable mount capacity and inode counters every
 collection interval. It scans eligible local mount roots at startup and then
