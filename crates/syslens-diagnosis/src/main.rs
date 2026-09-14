@@ -354,6 +354,7 @@ fn status(config: PathBuf) -> Result<(), String> {
         );
         return Ok(());
     }
+    let permission_warning = diagnosis::database_permissions_warning(&db);
     let conn =
         rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| e.to_string())?;
@@ -404,10 +405,14 @@ fn status(config: PathBuf) -> Result<(), String> {
         event_count,
         last_detection
     );
+    if let Some(warning) = permission_warning {
+        println!("warning: unsafe evidence permissions: {warning}");
+    }
     Ok(())
 }
 fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
     let cfg = diagnosis::load_config(&config)?;
+    diagnosis::secure_config(&config)?;
     let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
     let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir())?;
     let mut conn = diagnosis::initialize_db(&db, &cfg)?;
@@ -426,6 +431,9 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
         let deleted = match diagnosis::housekeeping(&mut conn, cutoff, now) {
             Ok(count) => count,
             Err(e) => {
+                if diagnosis::is_evidence_permission_error(&e) {
+                    return Err(e);
+                }
                 eprintln!("syslens-diagnosis: retention housekeeping failed: {e}");
                 0
             }
@@ -439,6 +447,9 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
         ) {
             Ok(value) => value,
             Err(e) => {
+                if diagnosis::is_evidence_permission_error(&e) {
+                    return Err(e);
+                }
                 eprintln!("syslens-diagnosis: budget compaction failed: {e}");
                 false
             }
@@ -448,6 +459,9 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
         {
             let snap = collector.collect(diagnosis::unix_now());
             let ram_ok = if let Err(e) = diagnosis::insert_snapshot(&mut conn, &snap) {
+                if diagnosis::is_evidence_permission_error(&e) {
+                    return Err(e);
+                }
                 eprintln!("syslens-diagnosis: collection write failed: {e}");
                 false
             } else {
@@ -456,6 +470,9 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
             let (mounts, mount_gaps) =
                 diagnosis::collect_mounts(&diagnosis::LinuxFilesystemReader, diagnosis::unix_now());
             let mounts_ok = if let Err(e) = diagnosis::insert_mounts(&mut conn, &mounts) {
+                if diagnosis::is_evidence_permission_error(&e) {
+                    return Err(e);
+                }
                 eprintln!("syslens-diagnosis: mount collection write failed: {e}");
                 false
             } else {
@@ -466,6 +483,9 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
                 && let Err(e) =
                     diagnosis::run_detection(&mut conn, &cfg.detection, diagnosis::unix_now())
             {
+                if diagnosis::is_evidence_permission_error(&e) {
+                    return Err(e);
+                }
                 eprintln!("syslens-diagnosis: detection failed: {e}");
             }
             if !mount_gaps.is_empty() {
@@ -473,6 +493,9 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
                 if let Err(e) =
                     diagnosis::insert_collection_gaps(&mut conn, diagnosis::unix_now(), &mount_gaps)
                 {
+                    if diagnosis::is_evidence_permission_error(&e) {
+                        return Err(e);
+                    }
                     eprintln!("syslens-diagnosis: mount gap write failed: {e}")
                 }
             }
@@ -547,7 +570,8 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
                         }
                     }
                 }));
-                let _=conn.execute("INSERT INTO metadata(key,value) VALUES('next_storage_scan',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(diagnosis::unix_now()+cfg.storage.scan_interval_seconds as i64).to_string()]);
+                conn.execute("INSERT INTO metadata(key,value) VALUES('next_storage_scan',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(diagnosis::unix_now()+cfg.storage.scan_interval_seconds as i64).to_string()]).map_err(|e| e.to_string())?;
+                diagnosis::secure_database_files(&db)?;
             }
         } else {
             eprintln!(

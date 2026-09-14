@@ -290,6 +290,7 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
 }
 pub fn ensure_config(path: &Path) -> Result<Config, String> {
     if path.exists() {
+        secure_config(path)?;
         return load_config(path);
     }
     let parent = path.parent().ok_or("config path has no parent")?;
@@ -306,8 +307,15 @@ pub fn ensure_config(path: &Path) -> Result<Config, String> {
     use std::io::Write;
     file.write_all(text.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    secure_config(path)?;
     Config::default().validate()?;
     Ok(Config::default())
+}
+
+pub fn secure_config(path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("config path has no parent")?;
+    secure_directory(parent)?;
+    secure_file(path, 0o600, "configuration")
 }
 
 #[derive(Debug)]
@@ -316,6 +324,7 @@ pub struct WriterLock {
 }
 pub fn acquire_writer_lock(dir: &Path) -> Result<WriterLock, String> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    secure_directory(dir)?;
     let p = dir.join("daemon.lock");
     let file = OpenOptions::new()
         .write(true)
@@ -324,6 +333,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<WriterLock, String> {
         .mode(0o600)
         .open(&p)
         .map_err(|e| format!("cannot open writer lock: {e}"))?;
+    secure_file(&p, 0o600, "writer lock")?;
     // `flock` stays held for this open descriptor and is released on process exit.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err("another syslens-diagnosis daemon is already recording".into());
@@ -334,8 +344,7 @@ pub fn acquire_writer_lock(dir: &Path) -> Result<WriterLock, String> {
 pub fn open_db(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
+        secure_directory(parent)?;
     }
     let conn = Connection::open_with_flags(
         path,
@@ -378,12 +387,109 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
         ));
     }
     migrate(&conn)?;
+    secure_database_files(path)?;
     Ok(conn)
 }
 pub fn initialize_db(path: &Path, config: &Config) -> Result<Connection, String> {
     let conn = open_db(path)?;
     conn.execute("INSERT INTO metadata(key,value) VALUES('interval_seconds',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [config.interval_seconds.to_string()]).map_err(|e| e.to_string())?;
+    secure_database_files(path)?;
     Ok(conn)
+}
+
+/// Database evidence is private to the local SysLens owner.  SQLite creates
+/// WAL/SHM files lazily, so every writer path calls this after a commit too.
+pub fn secure_database_files(path: &Path) -> Result<(), String> {
+    secure_file(path, 0o600, "evidence database")?;
+    for sidecar in [
+        path.with_extension("sqlite-wal"),
+        path.with_extension("sqlite-shm"),
+    ] {
+        if sidecar.exists() {
+            secure_file(&sidecar, 0o600, "evidence database sidecar")?;
+        }
+    }
+    Ok(())
+}
+
+/// Return a non-mutating diagnostic suitable for read-only commands.  Readers
+/// never repair permissions because that could alter evidence unexpectedly.
+pub fn database_permissions_warning(path: &Path) -> Option<String> {
+    for candidate in [
+        path.to_path_buf(),
+        path.with_extension("sqlite-wal"),
+        path.with_extension("sqlite-shm"),
+    ] {
+        if !candidate.exists() {
+            continue;
+        }
+        match fs::metadata(&candidate) {
+            Ok(metadata) if metadata.permissions().mode() & 0o777 == 0o600 => {}
+            Ok(metadata) => {
+                return Some(format!(
+                    "{} has mode {:o}, expected 600; run the diagnosis daemon or `syslens-diagnosis enable` as its owner to repair evidence permissions",
+                    candidate.display(),
+                    metadata.permissions().mode() & 0o777
+                ));
+            }
+            Err(error) => {
+                return Some(format!(
+                    "cannot inspect {} permissions: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+pub fn is_evidence_permission_error(error: &str) -> bool {
+    error.contains("evidence database") || error.contains("evidence database sidecar")
+}
+
+fn secure_directory(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot secure {}: {e}", path.display()))?;
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o700 {
+        return Err(format!(
+            "cannot secure {}: mode is {:o}, expected 700",
+            path.display(),
+            mode
+        ));
+    }
+    Ok(())
+}
+
+fn secure_file(path: &Path, expected_mode: u32, kind: &str) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(expected_mode))
+        .map_err(|e| format!("cannot secure {kind} {}: {e}", path.display()))?;
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("cannot inspect {kind} {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != expected_mode {
+        return Err(format!(
+            "cannot secure {kind} {}: mode is {:o}, expected {:o}",
+            path.display(),
+            mode,
+            expected_mode
+        ));
+    }
+    Ok(())
+}
+
+fn secure_connection_files(conn: &Connection) -> Result<(), String> {
+    let path = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .ok_or("cannot determine evidence database path for permission check")?;
+    secure_database_files(Path::new(path))
 }
 fn version_at_least(text: &str, min: (i32, i32, i32)) -> bool {
     let p: Vec<i32> = text.split('.').filter_map(|x| x.parse().ok()).collect();
@@ -492,7 +598,8 @@ pub struct Snapshot {
 pub fn insert_snapshot(conn: &mut Connection, snapshot: &Snapshot) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     insert_snapshot_tx(&tx, snapshot)?;
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    secure_connection_files(conn)
 }
 fn insert_snapshot_tx(tx: &Transaction<'_>, s: &Snapshot) -> Result<(), String> {
     let h = &s.host;
@@ -601,6 +708,7 @@ pub fn housekeeping(conn: &mut Connection, cutoff: i64, now: i64) -> Result<usiz
     tx.commit().map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA incremental_vacuum(1000); PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| e.to_string())?;
+    secure_connection_files(conn)?;
     Ok(count)
 }
 pub fn cleanup(conn: &mut Connection, cutoff: i64) -> Result<usize, String> {
@@ -679,6 +787,7 @@ pub fn recover_budget_after_cleanup(
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
         .map_err(|e| e.to_string())?;
     conn.execute("INSERT INTO metadata(key,value) VALUES('last_budget_vacuum',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(now).to_string()]).map_err(|e|e.to_string())?;
+    secure_database_files(path)?;
     Ok(budget_allows(path, budget))
 }
 
@@ -891,7 +1000,8 @@ pub fn insert_mounts(conn: &mut Connection, samples: &[MountSample]) -> Result<(
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    secure_connection_files(conn)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1454,6 +1564,7 @@ pub fn run_detection(
     }
     tx.execute("INSERT INTO metadata(key,value) VALUES('last_detection_run',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[now.to_string()]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+    secure_connection_files(conn)?;
     Ok(true)
 }
 
@@ -1481,6 +1592,9 @@ pub fn list_incidents(path: &Path) -> Result<Vec<Incident>, String> {
     .pipe(Ok)
 }
 fn open_readonly(path: &Path) -> Result<Connection, String> {
+    if let Some(warning) = database_permissions_warning(path) {
+        return Err(format!("unsafe evidence permissions: {warning}"));
+    }
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())
 }
 pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), String> {
@@ -1494,7 +1608,7 @@ pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), Strin
     {
         return Err("incident not found".into());
     };
-    Ok(())
+    secure_database_files(path)
 }
 pub fn list_events(path: &Path, after: i64, limit: usize) -> Result<EventPage, String> {
     if !(1..=MAX_EVENT_PAGE_SIZE).contains(&limit) {
@@ -1614,7 +1728,7 @@ pub fn acknowledge_consumer(path: &Path, name: &str, cursor: i64, now: i64) -> R
         params![name, cursor.max(0), now],
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
+    secure_database_files(path)
 }
 pub fn consumer_cursor(path: &Path, name: &str) -> Result<Option<i64>, String> {
     let c = open_readonly(path)?;
@@ -1645,7 +1759,8 @@ pub fn insert_collection_gaps(
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    secure_connection_files(conn)
 }
 
 /// Select one shortest root for bind/duplicate mounts while retaining a nested
@@ -1951,7 +2066,8 @@ pub fn insert_scan(conn: &mut Connection, s: &ScanResult) -> Result<(), String> 
         )
         .map_err(|e| e.to_string())?;
     }
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    secure_connection_files(conn)
 }
 
 pub struct Collector {
@@ -2624,7 +2740,62 @@ pub fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    fn assert_private_database_files(path: &Path) {
+        for file in [
+            path.to_path_buf(),
+            path.with_extension("sqlite-wal"),
+            path.with_extension("sqlite-shm"),
+        ] {
+            assert!(file.exists(), "{} should exist", file.display());
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{} should be owner-only",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_database_and_sidecars_are_owner_only_after_initialization_and_write() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut conn = initialize_db(&path, &Config::default()).unwrap();
+        assert_private_database_files(&path);
+        insert_snapshot(
+            &mut conn,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: 1,
+                    boot_id: "boot".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_private_database_files(&path);
+    }
+
+    #[test]
+    fn writer_repairs_legacy_permissive_evidence_files() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let _conn = initialize_db(&path, &Config::default()).unwrap();
+        for file in [
+            path.to_path_buf(),
+            path.with_extension("sqlite-wal"),
+            path.with_extension("sqlite-shm"),
+        ] {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _conn = open_db(&path).unwrap();
+        assert_private_database_files(&path);
+    }
+
     #[test]
     fn config_defaults_validate() {
         Config::default().validate().unwrap();
