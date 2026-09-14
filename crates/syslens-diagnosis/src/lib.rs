@@ -82,7 +82,7 @@ pub fn user_service_path() -> PathBuf {
 }
 pub fn service_unit(binary: &Path, config: &Path, database: &Path) -> String {
     format!(
-        "[Unit]\nDescription=SysLens local diagnosis companion\n\n[Service]\nExecStart={} daemon --config {} --database {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=SysLens local diagnosis companion\n\n[Service]\nType=simple\nExecStart={} daemon --config {} --database {}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         binary.display(),
         config.display(),
         database.display()
@@ -248,7 +248,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if v == SCHEMA_VERSION {
         return Ok(());
     }
-    conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+    conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
         .map_err(|e| e.to_string())?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -420,6 +420,51 @@ pub fn filesystem_has_reserve(path: &Path) -> bool {
     let available = info.f_bavail.saturating_mul(info.f_frsize);
     let total = info.f_blocks.saturating_mul(info.f_frsize);
     available >= GIB.max(total / 20)
+}
+pub fn recover_budget_after_cleanup(
+    conn: &mut Connection,
+    path: &Path,
+    budget: u64,
+    now: i64,
+    deleted: usize,
+) -> Result<bool, String> {
+    if budget_allows(path, budget) {
+        return Ok(true);
+    }
+    if deleted == 0 {
+        return Ok(false);
+    }
+    let last: i64 = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='last_budget_vacuum'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0);
+    if last != 0 && now < last + 3600 {
+        return Ok(false);
+    }
+    let parent = path.parent().unwrap_or(path);
+    let c_path = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
+        .map_err(|_| "database path contains NUL")?;
+    let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c_path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        return Ok(false);
+    }
+    let info = unsafe { info.assume_init() };
+    let available = info.f_bavail.saturating_mul(info.f_frsize);
+    let required = database_size(path)
+        .saturating_add(GIB.max(info.f_blocks.saturating_mul(info.f_frsize) / 20));
+    if available < required {
+        return Ok(false);
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+        .map_err(|e| e.to_string())?;
+    conn.execute("INSERT INTO metadata(key,value) VALUES('last_budget_vacuum',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(now).to_string()]).map_err(|e|e.to_string())?;
+    Ok(budget_allows(path, budget))
 }
 
 pub struct Collector {
@@ -1088,6 +1133,14 @@ mod tests {
     fn package_service_and_linger_warning_are_truthful() {
         let asset = include_str!("../../../packaging/debian/syslens-diagnosis.service");
         assert!(asset.contains("daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
+        assert!(asset.contains("Type=simple"));
+        let repo_asset = include_str!("../../../systemd/syslens-diagnosis.service");
+        assert!(repo_asset.contains("Type=simple"));
+        assert!(repo_asset.contains("daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
+        assert!(
+            service_unit(Path::new("/bin/d"), Path::new("/c"), Path::new("/d"))
+                .contains("Type=simple")
+        );
         assert!(
             linger_warning_message("alice", false)
                 .unwrap()
@@ -1133,6 +1186,58 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+    #[test]
+    fn expired_rows_can_compact_an_over_budget_database_and_resume() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let auto: i64 = c.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+        assert_eq!(auto, 2);
+        for pid in 0..4 {
+            let snapshot = Snapshot {
+                host: HostSample {
+                    timestamp: pid + 1,
+                    boot_id: "b".into(),
+                    ..Default::default()
+                },
+                processes: vec![ProcessSample {
+                    pid,
+                    start_ticks: pid,
+                    name: "x".repeat(1024 * 1024),
+                    executable: None,
+                    uid: None,
+                    cgroup_name: None,
+                    rss_anon: None,
+                    rss_file: None,
+                    rss_shmem: None,
+                    rss_total: None,
+                    cpu_ticks: None,
+                    read_bytes: None,
+                    write_bytes: None,
+                }],
+                gaps: vec![],
+            };
+            insert_snapshot(&mut c, &snapshot).unwrap();
+        }
+        let budget = CONTROL_HEADROOM + database_size(&path) - 1;
+        assert!(!budget_allows(&path, budget));
+        let deleted = housekeeping(&mut c, 10, 100).unwrap();
+        assert!(deleted > 0);
+        assert!(recover_budget_after_cleanup(&mut c, &path, budget, 100, deleted).unwrap());
+        assert!(budget_allows(&path, budget));
+        insert_snapshot(
+            &mut c,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: 200,
+                    boot_id: "b".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]

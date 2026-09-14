@@ -216,10 +216,28 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
     let collector = diagnosis::Collector::new(PathBuf::from("/proc"));
     loop {
         let cutoff = diagnosis::unix_now() - i64::from(cfg.retention_days) * 86400;
-        if let Err(e) = diagnosis::housekeeping(&mut conn, cutoff, diagnosis::unix_now()) {
-            eprintln!("syslens-diagnosis: retention housekeeping failed: {e}")
-        }
-        if diagnosis::budget_allows(&db, cfg.database_budget_bytes)
+        let now = diagnosis::unix_now();
+        let deleted = match diagnosis::housekeeping(&mut conn, cutoff, now) {
+            Ok(count) => count,
+            Err(e) => {
+                eprintln!("syslens-diagnosis: retention housekeeping failed: {e}");
+                0
+            }
+        };
+        let recovered = match diagnosis::recover_budget_after_cleanup(
+            &mut conn,
+            &db,
+            cfg.database_budget_bytes,
+            now,
+            deleted,
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("syslens-diagnosis: budget compaction failed: {e}");
+                false
+            }
+        };
+        if (recovered || diagnosis::budget_allows(&db, cfg.database_budget_bytes))
             && diagnosis::filesystem_has_reserve(&db)
         {
             let snap = collector.collect(diagnosis::unix_now());

@@ -2,9 +2,10 @@
 Description=SysLens local diagnosis companion
 
 [Service]
-Type=oneshot
-ExecStart=%h/.local/bin/syslens-diagnosis status
-RemainAfterExit=yes
+Type=simple
+ExecStart=%h/.local/bin/syslens-diagnosis daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=default.target
