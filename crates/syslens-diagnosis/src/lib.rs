@@ -943,7 +943,12 @@ fn median_f64(mut values: Vec<f64>) -> Option<f64> {
 }
 /// Returns a robust bytes/hour slope for a complete, compatible latest
 /// segment.  Hour bucketing bounds Theil-Sen work to at most one week.
-fn robust_storage_slope(samples: &[(i64, i64, i64)]) -> Option<f64> {
+enum ForecastAssessment {
+    Insufficient,
+    Normal { hourly_growth: f64 },
+    Growth { hourly_growth: f64 },
+}
+fn robust_storage_slope(samples: &[(i64, i64, i64)]) -> ForecastAssessment {
     let mut hourly = BTreeMap::<i64, (i64, i64, i64)>::new();
     for &(timestamp, used, total) in samples {
         hourly.insert(timestamp / 3600, (timestamp, used, total));
@@ -965,9 +970,12 @@ fn robust_storage_slope(samples: &[(i64, i64, i64)]) -> Option<f64> {
     }
     let segment = &values[start..];
     if segment.len() < 72 {
-        return None;
+        return ForecastAssessment::Insufficient;
     }
-    let latest = segment.last()?.0;
+    let Some(last) = segment.last() else {
+        return ForecastAssessment::Insufficient;
+    };
+    let latest = last.0;
     let recent = segment
         .iter()
         .filter(|sample| sample.0 >= latest - 24 * 3600)
@@ -977,7 +985,7 @@ fn robust_storage_slope(samples: &[(i64, i64, i64)]) -> Option<f64> {
             .windows(2)
             .any(|pair| pair[1].0 - pair[0].0 > 2 * 3600)
     {
-        return None;
+        return ForecastAssessment::Insufficient;
     }
     let mut slopes = Vec::new();
     for (index, left) in segment.iter().enumerate() {
@@ -985,26 +993,40 @@ fn robust_storage_slope(samples: &[(i64, i64, i64)]) -> Option<f64> {
             slopes.push((right.1 - left.1) as f64 / ((right.0 - left.0) as f64 / 3600.0));
         }
     }
-    let slope = median_f64(slopes)?;
+    let Some(slope) = median_f64(slopes) else {
+        return ForecastAssessment::Insufficient;
+    };
     if slope <= 0.0 {
-        return None;
+        return ForecastAssessment::Normal {
+            hourly_growth: slope,
+        };
     }
-    let intercept = median_f64(
+    let Some(intercept) = median_f64(
         segment
             .iter()
             .map(|sample| sample.1 as f64 - slope * (sample.0 as f64 / 3600.0))
             .collect(),
-    )?;
-    let residual = median_f64(
+    ) else {
+        return ForecastAssessment::Insufficient;
+    };
+    let Some(residual) = median_f64(
         segment
             .iter()
             .map(|sample| {
                 (sample.1 as f64 - (intercept + slope * (sample.0 as f64 / 3600.0))).abs()
             })
             .collect(),
-    )?;
-    let total = segment.last()?.2 as f64;
-    (residual <= (total * 0.02).max(slope * 24.0)).then_some(slope)
+    ) else {
+        return ForecastAssessment::Insufficient;
+    };
+    let total = last.2 as f64;
+    if residual <= (total * 0.02).max(slope * 24.0) {
+        ForecastAssessment::Growth {
+            hourly_growth: slope,
+        }
+    } else {
+        ForecastAssessment::Insufficient
+    }
 }
 fn state_get(tx: &Transaction<'_>, key: &str) -> Result<serde_json::Value, String> {
     Ok(tx
@@ -1401,14 +1423,21 @@ pub fn run_detection(
                 .filter_map(Result::ok)
                 .collect()
         };
-        if let Some(hourly_growth) = robust_storage_slope(&trend_samples) {
+        let assessment = robust_storage_slope(&trend_samples);
+        let verified = match assessment {
+            ForecastAssessment::Insufficient => None,
+            ForecastAssessment::Normal { hourly_growth } => Some((hourly_growth, false)),
+            ForecastAssessment::Growth { hourly_growth } => Some((hourly_growth, true)),
+        };
+        if let Some((hourly_growth, verified_growth)) = verified {
             let warn_bytes = total as f64 * cfg.storage_warning_percent as f64 / 100.0;
             let hours_to = if hourly_growth > 0.0 {
                 (warn_bytes - used as f64) / hourly_growth
             } else {
                 f64::INFINITY
             };
-            let forecast = (used as f64) < warn_bytes
+            let forecast = verified_growth
+                && (used as f64) < warn_bytes
                 && hours_to >= 0.0
                 && hours_to <= cfg.storage_forecast_days as f64 * 24.0;
             transition(
@@ -1553,7 +1582,7 @@ pub fn acknowledge_consumer(path: &Path, name: &str, cursor: i64, now: i64) -> R
             "consumer cursor {cursor} exceeds high watermark {high_watermark}"
         ));
     }
-    if cursor > 0 {
+    if cursor > 0 && cursor != replay_floor {
         let exists: Option<i64> = c
             .query_row(
                 "SELECT cursor FROM notification_events WHERE cursor=?",
@@ -3887,6 +3916,8 @@ mod tests {
                 .contains("history gap")
         );
         assert!(list_events(&path, 1, 10).unwrap().events.is_empty());
+        acknowledge_consumer(&path, "recovered", 1, 400 * 86_400).unwrap();
+        assert_eq!(consumer_cursor(&path, "recovered").unwrap(), Some(1));
     }
 
     #[test]
