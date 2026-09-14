@@ -1450,6 +1450,7 @@ pub struct MountFinding {
 #[derive(Serialize)]
 pub struct DirectoryFinding {
     pub mount_id: String,
+    pub root: String,
     pub path: String,
     pub allocated_bytes_change: i64,
     pub apparent_bytes_change: i64,
@@ -1524,6 +1525,7 @@ pub fn diagnose_storage(
             |x| {
                 Ok(DirectoryFinding {
                     mount_id: x.get(0)?,
+                    root: x.get(1)?,
                     path: x.get(2)?,
                     allocated_bytes_change: x.get(3)?,
                     apparent_bytes_change: x.get(4)?,
@@ -1537,19 +1539,10 @@ pub fn diagnose_storage(
         .collect();
     // Each retained directory includes its descendants.  Reporting only direct
     // children of a scan root avoids double counting parent and child totals.
-    let scan_roots: std::collections::HashMap<String, String> = conn
-        .prepare("SELECT DISTINCT mount_id,root FROM storage_scans WHERE mount_id IS NOT NULL")
-        .map_err(|e| e.to_string())?
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .collect();
     candidates.retain(|d| {
-        scan_roots.get(&d.mount_id).is_some_and(|root| {
-            Path::new(&d.path)
-                .parent()
-                .is_some_and(|p| p == Path::new(root))
-        })
+        Path::new(&d.path)
+            .parent()
+            .is_some_and(|p| p == Path::new(&d.root))
     });
     candidates.sort_by_key(|b| std::cmp::Reverse(b.allocated_bytes_change));
     let directories: Vec<_> = candidates.into_iter().take(20).collect();
