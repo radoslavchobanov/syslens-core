@@ -450,12 +450,12 @@ pub fn housekeeping(conn: &mut Connection, cutoff: i64, now: i64) -> Result<usiz
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS expired_identity_ids(id INTEGER PRIMARY KEY); DELETE FROM expired_identity_ids;").map_err(|e|e.to_string())?;
     tx.execute("INSERT OR IGNORE INTO expired_identity_ids SELECT DISTINCT identity_id FROM process_samples WHERE timestamp < ? LIMIT 10000",[cutoff]).map_err(|e|e.to_string())?;
-    let count=tx.execute("DELETE FROM host_samples WHERE timestamp IN (SELECT timestamp FROM host_samples WHERE timestamp < ? LIMIT 10000)", [cutoff])
+    let mut count=tx.execute("DELETE FROM host_samples WHERE timestamp IN (SELECT timestamp FROM host_samples WHERE timestamp < ? LIMIT 10000)", [cutoff])
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM process_identities WHERE id IN (SELECT id FROM expired_identity_ids) AND NOT EXISTS (SELECT 1 FROM process_samples WHERE process_samples.identity_id=process_identities.id)", []).map_err(|e|e.to_string())?;
     tx.execute("INSERT INTO metadata(key,value) VALUES('next_housekeeping',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(now+3600).to_string()]).map_err(|e|e.to_string())?;
-    tx.execute("DELETE FROM mount_samples WHERE rowid IN (SELECT rowid FROM mount_samples WHERE timestamp < ? LIMIT 10000)", [cutoff]).map_err(|e|e.to_string())?;
-    tx.execute("DELETE FROM storage_scans WHERE id IN (SELECT id FROM storage_scans WHERE ended_at < ? LIMIT 1000)", [cutoff]).map_err(|e|e.to_string())?;
+    count += tx.execute("DELETE FROM mount_samples WHERE rowid IN (SELECT rowid FROM mount_samples WHERE timestamp < ? LIMIT 10000)", [cutoff]).map_err(|e|e.to_string())?;
+    count += tx.execute("DELETE FROM storage_scans WHERE id IN (SELECT id FROM storage_scans WHERE ended_at < ? LIMIT 1000)", [cutoff]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA incremental_vacuum(1000); PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| e.to_string())?;
@@ -859,18 +859,21 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         };
     }
     let root_dev = std::os::unix::fs::MetadataExt::dev(&root_meta);
+    let root_key = (root_dev, std::os::unix::fs::MetadataExt::ino(&root_meta));
+    let root_allocated = (std::os::unix::fs::MetadataExt::blocks(&root_meta) as i64) * 512;
+    let root_apparent = std::os::unix::fs::MetadataExt::size(&root_meta) as i64;
     let mut directories = BTreeMap::<PathBuf, DirectorySample>::new();
     directories.insert(
         root.to_path_buf(),
         DirectorySample {
             path: root_s.clone(),
-            allocated_bytes: 0,
-            apparent_bytes: 0,
-            entry_count: 0,
+            allocated_bytes: root_allocated,
+            apparent_bytes: root_apparent,
+            entry_count: 1,
             file_count: 0,
         },
     );
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::from([root_key]);
     let mut entries = 0u64;
     let mut reason = None;
     #[allow(clippy::too_many_arguments)]
@@ -949,6 +952,15 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
             } else {
                 0
             };
+            if is_dir && depth < cfg.max_depth {
+                dirs.entry(path.clone()).or_insert(DirectorySample {
+                    path: path.display().to_string(),
+                    allocated_bytes: 0,
+                    apparent_bytes: 0,
+                    entry_count: 0,
+                    file_count: 0,
+                });
+            }
             let ancestors: Vec<PathBuf> = dirs
                 .keys()
                 .filter(|p| path.starts_with(p))
@@ -963,14 +975,7 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
                     d.file_count += 1
                 }
             }
-            if is_dir && depth < cfg.max_depth {
-                dirs.entry(path.clone()).or_insert(DirectorySample {
-                    path: path.display().to_string(),
-                    allocated_bytes: 0,
-                    apparent_bytes: 0,
-                    entry_count: 0,
-                    file_count: 0,
-                });
+            if is_dir {
                 walk(
                     &path,
                     dev,
@@ -1438,6 +1443,7 @@ pub struct StorageDiagnosis {
     pub comparison: StorageInterval,
     pub mounts: Vec<MountFinding>,
     pub directories: Vec<DirectoryFinding>,
+    pub path_attribution_status: String,
     pub limitations: Vec<String>,
 }
 #[derive(Serialize)]
@@ -1519,6 +1525,7 @@ pub fn diagnose_storage(
             },
             mounts: vec![],
             directories: vec![],
+            path_attribution_status: "unavailable".into(),
             limitations: limits,
         });
     }
@@ -1595,17 +1602,15 @@ pub fn diagnose_storage(
             limits.push(format!("Directory allocation growth on {} exceeds mount used-byte growth; filesystem allocation accounting differs, so the negative unexplained value is reported without claiming a cause.", mount.mount_point));
         }
     }
-    if directories.is_empty() {
-        limits.push("No pair of complete, comparable directory scans was retained; mount growth cannot yet be attributed to a path.".into())
-    };
-    let status = if directories.is_empty() {
-        "insufficient evidence"
+    let path_attribution_status = if directories.is_empty() {
+        limits.push("Mount capacity evidence is complete, but no complete retained directory scans identify paths for this interval.".into());
+        "unavailable"
     } else {
-        "ok"
+        "available"
     };
     Ok(StorageDiagnosis {
         version: 1,
-        status: status.into(),
+        status: "ok".into(),
         current: StorageInterval {
             start_utc: fmt(start),
             end_utc: fmt(end),
@@ -1616,13 +1621,15 @@ pub fn diagnose_storage(
         },
         mounts,
         directories,
+        path_attribution_status: path_attribution_status.into(),
         limitations: limits,
     })
 }
 pub fn render_storage_diagnosis(d: &StorageDiagnosis) -> String {
     let mut s = format!(
-        "Storage diagnosis: {}\nCurrent: {} to {}\nComparison: {} to {}\n",
+        "Storage diagnosis: {} (path attribution: {})\nCurrent: {} to {}\nComparison: {} to {}\n",
         d.status,
+        d.path_attribution_status,
         d.current.start_utc,
         d.current.end_utc,
         d.comparison.start_utc,
@@ -2144,6 +2151,46 @@ mod tests {
     }
 
     #[test]
+    fn deep_descendants_are_aggregated_at_retained_depth() {
+        let d = tempdir().unwrap();
+        let root = d.path().join("root");
+        let mut current = root.clone();
+        fs::create_dir(&root).unwrap();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            current = current.join(name);
+            fs::create_dir(&current).unwrap();
+        }
+        fs::write(current.join("payload"), vec![7_u8; 4096]).unwrap();
+        let scan = scan_directory(
+            &root,
+            Some("m".into()),
+            &StorageConfig {
+                max_depth: 2,
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(scan.status, "complete");
+        assert!(
+            scan.directories
+                .iter()
+                .all(|x| Path::new(&x.path).components().count() <= root.components().count() + 2)
+        );
+        let deepest = scan
+            .directories
+            .iter()
+            .find(|x| x.path == root.join("a/b").display().to_string())
+            .unwrap();
+        assert!(deepest.apparent_bytes >= 4096);
+        let root_sample = scan
+            .directories
+            .iter()
+            .find(|x| x.path == root.display().to_string())
+            .unwrap();
+        assert!(root_sample.apparent_bytes >= 4096);
+    }
+
+    #[test]
     fn scan_roots_deduplicate_bind_mounts_but_keep_nested_filesystems() {
         let mounts = vec![
             MountSample {
@@ -2311,12 +2358,9 @@ mod tests {
             [now - 3600],
         )
         .unwrap();
-        assert_eq!(
-            diagnose_storage(&path, "1h", "previous-week")
-                .unwrap()
-                .status,
-            "insufficient evidence"
-        );
+        let mount_only = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(mount_only.status, "ok");
+        assert_eq!(mount_only.path_attribution_status, "unavailable");
     }
 
     #[test]
@@ -2500,7 +2544,7 @@ mod tests {
             },
         )
         .unwrap();
-        cleanup(&mut c, 2).unwrap();
+        assert!(cleanup(&mut c, 2).unwrap() >= 2);
         assert_eq!(
             c.query_row("SELECT count(*) FROM mount_samples", [], |r| r
                 .get::<_, i64>(0))

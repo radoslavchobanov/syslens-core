@@ -248,7 +248,8 @@ collection interval. It scans eligible local mount roots at startup and then
 hourly by default, retaining directory summaries to four levels. Directory
 paths remain only in the host-local SQLite database. The unprivileged scanner
 does not follow symlinks or cross mount boundaries, applies configured time and
-entry budgets, and marks permission-limited or partial scans as incomplete.
+entry budgets, traverses deeper descendants into the deepest retained summary,
+includes directory metadata allocation consistently, and marks permission-limited or partial scans as incomplete.
 `diagnose storage` only attributes growth to a path when two complete scans are
 comparable; it can prove mount growth without guessing a path or process cause.
 The optional `[storage]` configuration accepts `scan_interval_seconds` (300 to
