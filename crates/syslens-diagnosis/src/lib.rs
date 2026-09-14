@@ -3074,6 +3074,7 @@ fn send_chat_request(config: &AiConfig, request: &Value) -> Result<Value, String
         .endpoint_url
         .as_deref()
         .ok_or("AI chat is enabled but no endpoint is configured")?;
+    validate_ai_endpoint(endpoint, config.allow_insecure_http)?;
     let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
     let agent = ai_http_agent(config.request_timeout_seconds, config.allow_insecure_http);
     let mut builder = agent
@@ -3256,6 +3257,9 @@ mod tests {
         assert!(
             validate_ai_endpoint("https://example.test/v1/chat/completions?key=x", false).is_err()
         );
+        assert!(
+            validate_ai_endpoint("https://example.test/v1/chat/completions#token", false).is_err()
+        );
     }
 
     #[test]
@@ -3281,6 +3285,7 @@ mod tests {
             "http://[2001:db8::1]/v1/chat/completions",
             "http://token@127.0.0.1/v1/chat/completions",
             "http://127.0.0.1/v1/chat/completions?key=x",
+            "http://127.0.0.1/v1/chat/completions#token",
         ] {
             assert!(validate_ai_endpoint(endpoint, true).is_err(), "{endpoint}");
         }
@@ -3293,6 +3298,17 @@ mod tests {
         assert!(config.validate().is_err());
         config.ai.allow_insecure_http = true;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn public_chat_entrypoint_rejects_public_http_before_a_request() {
+        let mut config = Config::default();
+        config.ai.enabled = true;
+        config.ai.allow_insecure_http = true;
+        config.ai.endpoint_url = Some("http://8.8.8.8/v1/chat/completions".into());
+        config.ai.model = Some("test-model".into());
+        let error = run_chat(&config, Path::new("/not-used.sqlite"), "test question").unwrap_err();
+        assert!(error.contains("loopback, private, or link-local"));
     }
 
     #[test]
