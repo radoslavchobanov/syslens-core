@@ -83,6 +83,8 @@ enum IncidentCommand {
     Events {
         #[arg(long, default_value_t = 0)]
         after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -269,39 +271,47 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
             }
             Ok(())
         }
-        IncidentCommand::Events { after, json } => {
-            let x = diagnosis::list_events(&db, after)?;
+        IncidentCommand::Events { after, limit, json } => {
+            let page = diagnosis::list_events(&db, after, limit)?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "version": 1,
                         "type": "notification_event_list",
-                        "events": x,
+                        "events": page.events,
+                        "next_cursor": page.next_cursor,
+                        "has_more": page.has_more,
                     }))
                     .unwrap()
                 )
             } else {
-                for e in x {
+                for e in page.events {
                     println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id)
                 }
             };
             Ok(())
         }
         IncidentCommand::Watch { mut after, json } => loop {
-            for e in diagnosis::list_events(&db, after)? {
-                after = e.cursor;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "version": 1,
-                            "type": "notification_event",
-                            "event": e,
-                        })
-                    );
-                } else {
-                    println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id);
+            loop {
+                let page = diagnosis::list_events(&db, after, diagnosis::MAX_EVENT_PAGE_SIZE)?;
+                for e in page.events {
+                    after = e.cursor;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "version": 1,
+                                "type": "notification_event",
+                                "event": e,
+                            })
+                        );
+                    } else {
+                        println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id);
+                    }
+                }
+                if !page.has_more {
+                    break;
                 }
             }
             thread::sleep(Duration::from_secs(2));

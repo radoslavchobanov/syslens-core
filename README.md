@@ -255,7 +255,11 @@ Every `incidents ... --json` response uses a version `1` envelope. `watch`
 emits one notification-event envelope per event, while `list`, `show`, and
 `events` emit list or item envelopes. `acknowledge ID --json` emits an
 acknowledgement envelope. Event replay reports a history gap when the requested
-cursor predates retained events.
+cursor predates retained events. `events --limit` is paginated (at most 256
+events per request); use `next_cursor` until `has_more` is false. Storage
+forecasts require a contiguous compatible history and use a robust Theil-Sen
+hourly growth slope, so isolated spikes and flat post-jump usage do not predict
+capacity exhaustion.
 
 The add-on also records local writable mount capacity and inode counters every
 collection interval. It scans eligible local mount roots at startup and then

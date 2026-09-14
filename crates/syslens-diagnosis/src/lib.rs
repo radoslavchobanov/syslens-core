@@ -918,6 +918,13 @@ pub struct NotificationEvent {
     pub detector_version: String,
     pub evidence: serde_json::Value,
 }
+#[derive(Debug, Clone, Serialize)]
+pub struct EventPage {
+    pub events: Vec<NotificationEvent>,
+    pub next_cursor: i64,
+    pub has_more: bool,
+}
+pub const MAX_EVENT_PAGE_SIZE: usize = 256;
 
 fn median(mut values: Vec<i64>) -> Option<i64> {
     if values.is_empty() {
@@ -925,6 +932,79 @@ fn median(mut values: Vec<i64>) -> Option<i64> {
     };
     values.sort_unstable();
     Some(values[values.len() / 2])
+}
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    Some(values[values.len() / 2])
+}
+/// Returns a robust bytes/hour slope for a complete, compatible latest
+/// segment.  Hour bucketing bounds Theil-Sen work to at most one week.
+fn robust_storage_slope(samples: &[(i64, i64, i64)]) -> Option<f64> {
+    let mut hourly = BTreeMap::<i64, (i64, i64, i64)>::new();
+    for &(timestamp, used, total) in samples {
+        hourly.insert(timestamp / 3600, (timestamp, used, total));
+    }
+    let values = hourly.into_values().collect::<Vec<_>>();
+    let mut start = 0;
+    for index in 1..values.len() {
+        let previous = values[index - 1];
+        let current = values[index];
+        let threshold = (current.2 / 10).max(1);
+        let large_step = (current.1 - previous.1).abs() > threshold;
+        let persists = values
+            .get(index + 1)
+            .is_some_and(|next| (next.1 - current.1).abs() <= threshold);
+        if current.0 - previous.0 > 2 * 3600 || current.2 != previous.2 || (large_step && persists)
+        {
+            start = index;
+        }
+    }
+    let segment = &values[start..];
+    if segment.len() < 72 {
+        return None;
+    }
+    let latest = segment.last()?.0;
+    let recent = segment
+        .iter()
+        .filter(|sample| sample.0 >= latest - 24 * 3600)
+        .count();
+    if recent < 20
+        || segment
+            .windows(2)
+            .any(|pair| pair[1].0 - pair[0].0 > 2 * 3600)
+    {
+        return None;
+    }
+    let mut slopes = Vec::new();
+    for (index, left) in segment.iter().enumerate() {
+        for right in &segment[index + 1..] {
+            slopes.push((right.1 - left.1) as f64 / ((right.0 - left.0) as f64 / 3600.0));
+        }
+    }
+    let slope = median_f64(slopes)?;
+    if slope <= 0.0 {
+        return None;
+    }
+    let intercept = median_f64(
+        segment
+            .iter()
+            .map(|sample| sample.1 as f64 - slope * (sample.0 as f64 / 3600.0))
+            .collect(),
+    )?;
+    let residual = median_f64(
+        segment
+            .iter()
+            .map(|sample| {
+                (sample.1 as f64 - (intercept + slope * (sample.0 as f64 / 3600.0))).abs()
+            })
+            .collect(),
+    )?;
+    let total = segment.last()?.2 as f64;
+    (residual <= (total * 0.02).max(slope * 24.0)).then_some(slope)
 }
 fn state_get(tx: &Transaction<'_>, key: &str) -> Result<serde_json::Value, String> {
     Ok(tx
@@ -946,11 +1026,31 @@ fn state_set(
     Ok(())
 }
 fn truncate_text(value: &str, limit: usize) -> String {
-    let mut text = value.chars().take(limit).collect::<String>();
-    if value.chars().count() > limit {
-        text.push('…');
+    let mut text = String::new();
+    for character in value.chars() {
+        if text.len() + character.len_utf8() > limit {
+            text.push('…');
+            return text;
+        }
+        text.push(character);
     }
     text
+}
+fn shrink_evidence_summary(summary: &mut serde_json::Map<String, serde_json::Value>) {
+    for value in summary.values_mut() {
+        match value {
+            serde_json::Value::String(text) => *text = truncate_text(text, 64),
+            serde_json::Value::Array(values) => {
+                values.truncate(4);
+                for value in values {
+                    if let serde_json::Value::String(text) = value {
+                        *text = truncate_text(text, 32);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 fn canonical_evidence_value(value: &serde_json::Value) -> Option<serde_json::Value> {
     match value {
@@ -958,21 +1058,21 @@ fn canonical_evidence_value(value: &serde_json::Value) -> Option<serde_json::Val
             Some(value.clone())
         }
         serde_json::Value::String(text) => {
-            Some(serde_json::Value::String(truncate_text(text, 1024)))
+            Some(serde_json::Value::String(truncate_text(text, 512)))
         }
         serde_json::Value::Array(values) => Some(serde_json::Value::Array(
             values
                 .iter()
                 .filter_map(|value| match value {
                     serde_json::Value::String(text) => {
-                        Some(serde_json::Value::String(truncate_text(text, 256)))
+                        Some(serde_json::Value::String(truncate_text(text, 128)))
                     }
                     serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
                         Some(value.clone())
                     }
                     _ => None,
                 })
-                .take(16)
+                .take(8)
                 .collect(),
         )),
         serde_json::Value::Object(_) => None,
@@ -1033,8 +1133,34 @@ fn bounded_evidence(value: serde_json::Value) -> String {
         "limitations".into(),
         serde_json::json!(["evidence exceeded the 32 KiB event limit"]),
     );
-    serde_json::to_string(&serde_json::Value::Object(summary))
-        .expect("fixed evidence summary serializes")
+    let mut output = serde_json::to_string(&serde_json::Value::Object(summary.clone()))
+        .expect("fixed evidence summary serializes");
+    if output.len() > LIMIT {
+        shrink_evidence_summary(&mut summary);
+        output = serde_json::to_string(&serde_json::Value::Object(summary.clone()))
+            .expect("shrunk evidence summary serializes");
+    }
+    if output.len() > LIMIT {
+        let core = [
+            "conclusion",
+            "detector",
+            "detector_version",
+            "type",
+            "subject",
+            "severity",
+            "current_bytes",
+            "baseline_bytes",
+            "change_bytes",
+            "measured_at",
+        ];
+        summary.retain(|key, _| {
+            core.contains(&key.as_str()) || key == "truncated" || key == "original_bytes"
+        });
+        output = serde_json::to_string(&serde_json::Value::Object(summary))
+            .expect("minimal evidence summary serializes");
+    }
+    debug_assert!(output.len() <= LIMIT);
+    output
 }
 #[allow(clippy::too_many_arguments)] // Detector inputs are deliberately explicit at call sites.
 fn transition(
@@ -1115,6 +1241,14 @@ fn transition(
             )
             .map_err(|e| e.to_string())?;
             emit(id, "escalated", severity)?;
+        }
+        Some((id, old)) if breach && rank_severity(severity) < rank_severity(&old) => {
+            tx.execute(
+                "UPDATE incidents SET severity=?,updated_at=?,evidence_json=? WHERE id=?",
+                params![severity, now, evidence, id],
+            )
+            .map_err(|e| e.to_string())?;
+            emit(id, "deescalated", severity)?;
         }
         _ => {}
     };
@@ -1256,35 +1390,18 @@ pub fn run_detection(
             cfg,
             serde_json::json!({"conclusion":"filesystem capacity is above the configured threshold","mount_id":id,"mount_point":path,"used_bytes":used,"total_bytes":total,"used_percent":pct,"limitations":[]}),
         )?;
-        let hourly: i64 = tx.query_row("SELECT count(DISTINCT timestamp / 3600) FROM mount_samples WHERE mount_id=? AND timestamp>=? AND timestamp<=? AND capability='available' AND used_bytes IS NOT NULL", params![id, sample_timestamp-7*86400, sample_timestamp], |r|r.get(0)).map_err(|e|e.to_string())?;
-        let latest_segment: Vec<i64> = {
-            let mut samples = tx.prepare("SELECT timestamp FROM mount_samples WHERE mount_id=? AND timestamp>=? AND timestamp<=? AND capability='available' AND used_bytes IS NOT NULL ORDER BY timestamp").map_err(|e|e.to_string())?;
+        let trend_samples: Vec<(i64, i64, i64)> = {
+            let mut samples = tx.prepare("SELECT timestamp,used_bytes,total_bytes FROM mount_samples WHERE mount_id=? AND timestamp>=? AND timestamp<=? AND capability='available' AND used_bytes IS NOT NULL AND total_bytes IS NOT NULL ORDER BY timestamp").map_err(|e|e.to_string())?;
             samples
                 .query_map(
-                    params![id, sample_timestamp - 24 * 3600, sample_timestamp],
-                    |r| r.get(0),
+                    params![id, sample_timestamp - 7 * 86400, sample_timestamp],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .map_err(|e| e.to_string())?
                 .filter_map(Result::ok)
                 .collect()
         };
-        // A forecast must be based on an observed, mostly contiguous latest
-        // day.  This prevents a sparse history or a collection gap from being
-        // treated as a smooth storage-growth trend.
-        let latest_covered = latest_segment.len() >= 20
-            && latest_segment
-                .first()
-                .is_some_and(|first| first - (sample_timestamp - 24 * 3600) <= 2 * 3600)
-            && latest_segment
-                .windows(2)
-                .all(|pair| pair[1] - pair[0] <= 2 * 3600);
-        let recent: Option<(i64,i64)> = tx.query_row("SELECT timestamp,used_bytes FROM mount_samples WHERE mount_id=? AND timestamp<=? AND timestamp>=? AND capability='available' AND used_bytes IS NOT NULL ORDER BY timestamp DESC LIMIT 1",params![id,sample_timestamp-20*3600,sample_timestamp-26*3600],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
-        if hourly >= 72
-            && latest_covered
-            && let Some((old_ts, old_used)) = recent
-        {
-            let elapsed = (sample_timestamp - old_ts).max(1);
-            let hourly_growth = (used - old_used) as f64 / (elapsed as f64 / 3600.0);
+        if let Some(hourly_growth) = robust_storage_slope(&trend_samples) {
             let warn_bytes = total as f64 * cfg.storage_warning_percent as f64 / 100.0;
             let hours_to = if hourly_growth > 0.0 {
                 (warn_bytes - used as f64) / hourly_growth
@@ -1302,7 +1419,7 @@ pub fn run_detection(
                 forecast,
                 now,
                 cfg,
-                serde_json::json!({"conclusion":"filesystem growth projects a warning threshold crossing","mount_id":id,"mount_point":path,"current_used_bytes":used,"hourly_growth_bytes":hourly_growth,"forecast_hours":hours_to,"limitations":["Forecast uses the latest 24-hour stable segment; abrupt prior growth that has flattened does not forecast."]}),
+                serde_json::json!({"conclusion":"filesystem growth projects a warning threshold crossing","mount_id":id,"mount_point":path,"current_used_bytes":used,"hourly_growth_bytes":hourly_growth,"forecast_hours":hours_to,"limitations":["Forecast uses a robust Theil-Sen slope over a contiguous compatible hourly segment."]}),
             )?;
         }
     }
@@ -1350,7 +1467,12 @@ pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), Strin
     };
     Ok(())
 }
-pub fn list_events(path: &Path, after: i64) -> Result<Vec<NotificationEvent>, String> {
+pub fn list_events(path: &Path, after: i64, limit: usize) -> Result<EventPage, String> {
+    if !(1..=MAX_EVENT_PAGE_SIZE).contains(&limit) {
+        return Err(format!(
+            "event limit must be between 1 and {MAX_EVENT_PAGE_SIZE}"
+        ));
+    }
     let c = open_readonly(path)?;
     let replay_floor: Option<String> = c
         .query_row(
@@ -1368,24 +1490,32 @@ pub fn list_events(path: &Path, after: i64) -> Result<Vec<NotificationEvent>, St
             "notification history gap: cursor {after} predates deleted cursor {replay_floor}"
         ));
     }
-    let mut s=c.prepare("SELECT cursor,id,incident_id,kind,severity,created_at,detector_version,evidence_json FROM notification_events WHERE cursor>? ORDER BY cursor").map_err(|e|e.to_string())?;
-    s.query_map([after], |r| {
-        Ok(NotificationEvent {
-            cursor: r.get(0)?,
-            id: r.get(1)?,
-            incident_id: r.get(2)?,
-            kind: r.get(3)?,
-            severity: r.get(4)?,
-            created_at: r.get(5)?,
-            detector_version: r.get(6)?,
-            evidence: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(7)?)
-                .unwrap_or_default(),
+    let mut s=c.prepare("SELECT cursor,id,incident_id,kind,severity,created_at,detector_version,evidence_json FROM notification_events WHERE cursor>? ORDER BY cursor LIMIT ?").map_err(|e|e.to_string())?;
+    let mut events = s
+        .query_map(params![after, (limit + 1) as i64], |r| {
+            Ok(NotificationEvent {
+                cursor: r.get(0)?,
+                id: r.get(1)?,
+                incident_id: r.get(2)?,
+                kind: r.get(3)?,
+                severity: r.get(4)?,
+                created_at: r.get(5)?,
+                detector_version: r.get(6)?,
+                evidence: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(7)?)
+                    .unwrap_or_default(),
+            })
         })
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    let next_cursor = events.last().map(|event| event.cursor).unwrap_or(after);
+    Ok(EventPage {
+        events,
+        next_cursor,
+        has_more,
     })
-    .map_err(|e| e.to_string())?
-    .filter_map(Result::ok)
-    .collect::<Vec<_>>()
-    .pipe(Ok)
 }
 /// Advance one named transport cursor after it has durably accepted an event.
 /// Human acknowledgement is intentionally separate from transport delivery.
@@ -1394,6 +1524,62 @@ pub fn acknowledge_consumer(path: &Path, name: &str, cursor: i64, now: i64) -> R
         return Err("consumer name must be between 1 and 128 characters".into());
     }
     let c = open_db(path)?;
+    if cursor < 0 {
+        return Err("consumer cursor cannot be negative".into());
+    }
+    let replay_floor: i64 = c
+        .query_row(
+            "SELECT value FROM metadata WHERE key='notification_replay_floor'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if cursor < replay_floor {
+        return Err(format!(
+            "consumer cursor {cursor} predates deleted cursor {replay_floor}"
+        ));
+    }
+    let high_watermark: i64 = c
+        .query_row("SELECT max(cursor) FROM notification_events", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .map_err(|e| e.to_string())?
+        .unwrap_or(replay_floor);
+    if cursor > high_watermark {
+        return Err(format!(
+            "consumer cursor {cursor} exceeds high watermark {high_watermark}"
+        ));
+    }
+    if cursor > 0 {
+        let exists: Option<i64> = c
+            .query_row(
+                "SELECT cursor FROM notification_events WHERE cursor=?",
+                [cursor],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Err(format!("consumer cursor {cursor} is not an emitted event"));
+        }
+    }
+    let current: i64 = c
+        .query_row(
+            "SELECT cursor FROM notification_consumers WHERE name=?",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    if cursor < current {
+        return Err(format!(
+            "consumer cursor {cursor} is behind current acknowledgement {current}"
+        ));
+    }
     c.execute(
         "INSERT INTO notification_consumers(name,cursor,updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET cursor=MAX(notification_consumers.cursor,excluded.cursor),updated_at=excluded.updated_at",
         params![name, cursor.max(0), now],
@@ -3482,7 +3668,7 @@ mod tests {
         )
         .unwrap();
         run_detection(&mut c, &cfg, now + 122).unwrap();
-        let events = list_events(&path, 0).unwrap();
+        let events = list_events(&path, 0, MAX_EVENT_PAGE_SIZE).unwrap().events;
         assert!(events.iter().any(|e| e.kind == "opened"));
         assert!(events.iter().any(|e| e.kind == "escalated"));
         let id = list_incidents(&path)
@@ -3658,8 +3844,12 @@ mod tests {
         c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('new','d','new','warning','recovered',?,?, '{}')", params![now, now]).unwrap();
         c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('new-event','new','opened','warning',?,'v1','{}')", [now]).unwrap();
         housekeeping(&mut c, 0, now).unwrap();
-        assert!(list_events(&path, 0).unwrap_err().contains("history gap"));
-        let events = list_events(&path, 1).unwrap();
+        assert!(
+            list_events(&path, 0, 10)
+                .unwrap_err()
+                .contains("history gap")
+        );
+        let events = list_events(&path, 1, 10).unwrap().events;
         assert_eq!(events.len(), 1);
         let incident = list_incidents(&path)
             .unwrap()
@@ -3691,8 +3881,12 @@ mod tests {
         c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('gone','d','gone','warning','recovered',1,1,'{}')", []).unwrap();
         c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('gone-event','gone','opened','warning',1,'v1','{}')", []).unwrap();
         housekeeping(&mut c, 0, 400 * 86_400).unwrap();
-        assert!(list_events(&path, 0).unwrap_err().contains("history gap"));
-        assert!(list_events(&path, 1).unwrap().is_empty());
+        assert!(
+            list_events(&path, 0, 10)
+                .unwrap_err()
+                .contains("history gap")
+        );
+        assert!(list_events(&path, 1, 10).unwrap().events.is_empty());
     }
 
     #[test]
@@ -3711,6 +3905,102 @@ mod tests {
         assert_eq!(parsed["current_bytes"], 1300);
         assert_eq!(parsed["baseline_bytes"], 1100);
         assert_eq!(parsed["change_bytes"], 200);
+        let unicode = bounded_evidence(
+            serde_json::json!({"conclusion":"ok", "current_bytes":1, "large":"界".repeat(40 * 1024)}),
+        );
+        assert!(unicode.len() <= 32 * 1024);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&unicode).unwrap()["conclusion"],
+            "ok"
+        );
+    }
+
+    #[test]
+    fn event_pages_and_consumer_cursors_are_bounded_and_validated() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let c = open_db(&path).unwrap();
+        for cursor in 1..=3 {
+            c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES(?,?,?,'warning','open',1,1,'{}')", params![format!("i{cursor}"), "d", format!("s{cursor}")]).unwrap();
+            c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES(?,?, 'opened','warning',1,'v1','{}')", params![format!("e{cursor}"),format!("i{cursor}")]).unwrap();
+        }
+        let first = list_events(&path, 0, 2).unwrap();
+        assert_eq!(first.events.len(), 2);
+        assert!(first.has_more);
+        assert_eq!(first.next_cursor, 2);
+        let second = list_events(&path, first.next_cursor, 2).unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert!(!second.has_more);
+        assert_eq!(second.events[0].cursor, 3);
+        acknowledge_consumer(&path, "x", 2, 1).unwrap();
+        assert!(acknowledge_consumer(&path, "x", 4, 1).is_err());
+        assert!(acknowledge_consumer(&path, "x", 1, 1).is_err());
+        c.execute(
+            "INSERT INTO metadata(key,value) VALUES('notification_replay_floor','2')",
+            [],
+        )
+        .unwrap();
+        assert!(acknowledge_consumer(&path, "y", 1, 1).is_err());
+    }
+
+    #[test]
+    fn open_incident_deescalates_without_reopening() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let cfg = DetectionConfig {
+            sustained_seconds: 60,
+            ..Default::default()
+        };
+        let tx = c.transaction().unwrap();
+        transition(
+            &tx,
+            "storage_capacity",
+            "disk",
+            "critical",
+            true,
+            0,
+            &cfg,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = c.transaction().unwrap();
+        transition(
+            &tx,
+            "storage_capacity",
+            "disk",
+            "critical",
+            true,
+            61,
+            &cfg,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = c.transaction().unwrap();
+        transition(
+            &tx,
+            "storage_capacity",
+            "disk",
+            "warning",
+            true,
+            122,
+            &cfg,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let incident = list_incidents(&path).unwrap().pop().unwrap();
+        assert_eq!(incident.severity, "warning");
+        assert_eq!(incident.status, "open");
+        assert!(
+            list_events(&path, 0, 10)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == "deescalated")
+        );
     }
 
     #[test]
