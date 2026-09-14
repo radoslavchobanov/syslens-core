@@ -6,6 +6,7 @@
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -35,6 +36,39 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub detection: DetectionConfig,
+    /// Optional, outbound-only OpenAI-compatible chat endpoint.
+    #[serde(default)]
+    pub ai: AiConfig,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Name of an environment variable containing a bearer token.  Tokens are
+    /// deliberately not stored in the configuration file.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_ai_timeout")]
+    pub request_timeout_seconds: u64,
+}
+fn default_ai_timeout() -> u64 {
+    20
+}
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_url: None,
+            model: None,
+            api_key_env: None,
+            request_timeout_seconds: default_ai_timeout(),
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +199,7 @@ impl Default for Config {
             database_budget_bytes: 16 * GIB,
             storage: StorageConfig::default(),
             detection: DetectionConfig::default(),
+            ai: AiConfig::default(),
         }
     }
 }
@@ -227,8 +262,57 @@ impl Config {
         {
             return Err("invalid storage forecast or cooldown setting".into());
         }
+        let ai = &self.ai;
+        if !(5..=120).contains(&ai.request_timeout_seconds) {
+            return Err("ai.request_timeout_seconds must be between 5 and 120".into());
+        }
+        if let Some(endpoint) = ai.endpoint_url.as_deref() {
+            validate_ai_endpoint(endpoint)?;
+        }
+        if let Some(model) = ai.model.as_deref()
+            && (model.trim().is_empty() || model.len() > 200)
+        {
+            return Err("ai.model must be between 1 and 200 characters".into());
+        }
+        if let Some(name) = ai.api_key_env.as_deref()
+            && (!is_environment_variable_name(name) || name.len() > 128)
+        {
+            return Err("ai.api_key_env must be a valid environment variable name".into());
+        }
+        if ai.enabled {
+            ai.endpoint_url
+                .as_deref()
+                .ok_or("ai.endpoint_url is required when ai.enabled is true")?;
+            ai.model
+                .as_deref()
+                .ok_or("ai.model is required when ai.enabled is true")?;
+        }
         Ok(())
     }
+}
+
+fn is_environment_variable_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        })
+}
+
+/// The chat client accepts a generic HTTPS OpenAI-compatible endpoint, but
+/// never embeds credentials in a URL where they could escape in diagnostics.
+pub fn validate_ai_endpoint(value: &str) -> Result<(), String> {
+    if value.len() > 2_048 || !value.starts_with("https://") {
+        return Err("ai.endpoint_url must be an HTTPS URL".into());
+    }
+    let authority = value[8..].split('/').next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains(char::is_whitespace)
+        || value.contains(['?', '#'])
+    {
+        return Err("ai.endpoint_url must not contain embedded credentials or whitespace".into());
+    }
+    Ok(())
 }
 
 pub fn config_path() -> PathBuf {
@@ -1569,9 +1653,20 @@ pub fn run_detection(
 }
 
 pub fn list_incidents(path: &Path) -> Result<Vec<Incident>, String> {
+    list_incidents_bounded(path, -1)
+}
+pub fn list_recent_incidents(path: &Path, limit: usize) -> Result<Vec<Incident>, String> {
+    if !(1..=CHAT_MAX_INCIDENTS).contains(&limit) {
+        return Err(format!(
+            "incident limit must be between 1 and {CHAT_MAX_INCIDENTS}"
+        ));
+    }
+    list_incidents_bounded(path, limit as i64)
+}
+fn list_incidents_bounded(path: &Path, limit: i64) -> Result<Vec<Incident>, String> {
     let c = open_readonly(path)?;
-    let mut s=c.prepare("SELECT id,detector,subject,severity,status,opened_at,updated_at,recovered_at,acknowledged_at,evidence_json FROM incidents ORDER BY updated_at DESC").map_err(|e|e.to_string())?;
-    s.query_map([], |r| {
+    let mut s=c.prepare("SELECT id,detector,subject,severity,status,opened_at,updated_at,recovered_at,acknowledged_at,evidence_json FROM incidents ORDER BY updated_at DESC LIMIT ?").map_err(|e|e.to_string())?;
+    s.query_map([limit], |r| {
         Ok(Incident {
             id: r.get(0)?,
             detector: r.get(1)?,
@@ -2728,6 +2823,336 @@ pub fn render_diagnosis(d: &Diagnosis) -> String {
     }
     s
 }
+
+const CHAT_MAX_QUESTION_BYTES: usize = 4_000;
+const CHAT_MAX_RESPONSE_BYTES: u64 = 256 * 1024;
+const CHAT_MAX_EVIDENCE_BYTES: usize = 32 * 1024;
+const CHAT_MAX_ROUNDS: usize = 3;
+const CHAT_MAX_INCIDENTS: usize = 20;
+
+/// The only local evidence operations a remote chat endpoint can request.
+/// There is intentionally no shell, SQL, filesystem, or arbitrary-command
+/// action in this protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatAction {
+    MemoryDiagnosis { since: String },
+    StorageDiagnosis { since: String },
+    CurrentStatus,
+    RecentIncidents { limit: usize },
+}
+
+pub fn parse_chat_action(name: &str, arguments: &Value) -> Result<ChatAction, String> {
+    let object = arguments
+        .as_object()
+        .ok_or("chat action arguments must be a JSON object")?;
+    let only = |allowed: &[&str]| {
+        object
+            .keys()
+            .all(|key| allowed.iter().any(|candidate| key == candidate))
+    };
+    match name {
+        "memory_diagnosis" => {
+            if !only(&["since"]) {
+                return Err("memory_diagnosis accepts only since".into());
+            }
+            let since = object
+                .get("since")
+                .and_then(Value::as_str)
+                .ok_or("memory_diagnosis.since must be a string")?;
+            validate_chat_since(since)?;
+            Ok(ChatAction::MemoryDiagnosis {
+                since: since.into(),
+            })
+        }
+        "storage_diagnosis" => {
+            if !only(&["since"]) {
+                return Err("storage_diagnosis accepts only since".into());
+            }
+            let since = object
+                .get("since")
+                .and_then(Value::as_str)
+                .ok_or("storage_diagnosis.since must be a string")?;
+            validate_chat_since(since)?;
+            Ok(ChatAction::StorageDiagnosis {
+                since: since.into(),
+            })
+        }
+        "current_status" if object.is_empty() => Ok(ChatAction::CurrentStatus),
+        "recent_incidents" => {
+            if !only(&["limit"]) {
+                return Err("recent_incidents accepts only limit".into());
+            }
+            let limit = object
+                .get("limit")
+                .and_then(Value::as_u64)
+                .ok_or("recent_incidents.limit must be an integer")?;
+            let limit =
+                usize::try_from(limit).map_err(|_| "recent_incidents.limit is too large")?;
+            if !(1..=CHAT_MAX_INCIDENTS).contains(&limit) {
+                return Err(format!(
+                    "recent_incidents.limit must be between 1 and {CHAT_MAX_INCIDENTS}"
+                ));
+            }
+            Ok(ChatAction::RecentIncidents { limit })
+        }
+        "current_status" => Err("current_status accepts no arguments".into()),
+        _ => Err("chat requested an unsupported evidence action".into()),
+    }
+}
+
+fn validate_chat_since(since: &str) -> Result<(), String> {
+    if since == "today" {
+        return Ok(());
+    }
+    let hours = since
+        .strip_suffix('h')
+        .and_then(|value| value.parse::<u32>().ok())
+        .or_else(|| {
+            since
+                .strip_suffix('d')
+                .and_then(|value| value.parse::<u32>().ok().map(|days| days * 24))
+        })
+        .ok_or("chat evidence since must be today, 1h..720h, or 1d..30d")?;
+    if !(1..=720).contains(&hours) {
+        return Err("chat evidence since must be today, 1h..720h, or 1d..30d".into());
+    }
+    Ok(())
+}
+
+fn chat_tools() -> Value {
+    json!([
+        {"type":"function","function":{"name":"memory_diagnosis","description":"Read the bounded local memory diagnosis and its evidence limitations.","parameters":{"type":"object","additionalProperties":false,"required":["since"],"properties":{"since":{"type":"string","description":"today, 1h..720h, or 1d..30d"}}}}},
+        {"type":"function","function":{"name":"storage_diagnosis","description":"Read the bounded local storage diagnosis and its evidence limitations.","parameters":{"type":"object","additionalProperties":false,"required":["since"],"properties":{"since":{"type":"string","description":"today, 1h..720h, or 1d..30d"}}}}},
+        {"type":"function","function":{"name":"current_status","description":"Read current local evidence availability and counts. Takes no arguments.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}},
+        {"type":"function","function":{"name":"recent_incidents","description":"Read a bounded list of most recently updated local incidents.","parameters":{"type":"object","additionalProperties":false,"required":["limit"],"properties":{"limit":{"type":"integer","minimum":1,"maximum":20}}}}}
+    ])
+}
+
+pub fn chat_capability_message() -> &'static str {
+    "You are a local SysLens evidence assistant. Answer only from evidence returned by the supplied tools. You may answer without tools when the question needs no local evidence. Never claim unobserved facts. Available read-only evidence actions are bounded memory diagnosis, bounded storage diagnosis, current evidence status, and recent incidents. There is no shell, SQL, filesystem, network, or arbitrary tool access. State evidence limitations clearly."
+}
+
+fn chat_status(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(json!({"database": "missing", "evidence_available": false}));
+    }
+    let connection = open_readonly(path)?;
+    let (samples, latest, open_incidents): (i64, Option<i64>, i64) = connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM host_samples), (SELECT max(timestamp) FROM host_samples), (SELECT count(*) FROM incidents WHERE status='open')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "database": "available",
+        "evidence_available": samples > 0,
+        "host_samples": samples,
+        "latest_host_sample_unix": latest,
+        "open_incidents": open_incidents,
+    }))
+}
+
+pub fn execute_chat_action(action: &ChatAction, database: &Path) -> Result<Value, String> {
+    match action {
+        ChatAction::MemoryDiagnosis { since } => {
+            serde_json::to_value(diagnose_memory(database, since, "previous-week")?)
+                .map_err(|error| error.to_string())
+        }
+        ChatAction::StorageDiagnosis { since } => {
+            serde_json::to_value(diagnose_storage(database, since, "previous-week")?)
+                .map_err(|error| error.to_string())
+        }
+        ChatAction::CurrentStatus => chat_status(database),
+        ChatAction::RecentIncidents { limit } => {
+            Ok(json!(list_recent_incidents(database, *limit)?))
+        }
+    }
+}
+
+fn bounded_chat_evidence(result: Result<Value, String>) -> Value {
+    match result {
+        Ok(evidence) => match serde_json::to_vec(&evidence) {
+            Ok(serialized) if serialized.len() <= CHAT_MAX_EVIDENCE_BYTES => {
+                json!({"ok":true,"evidence":evidence})
+            }
+            Ok(_) => json!({"ok":false,"error":"validated evidence result exceeds the size limit"}),
+            Err(error) => {
+                json!({"ok":false,"error":format!("cannot encode validated evidence: {error}")})
+            }
+        },
+        Err(error) => json!({"ok":false,"error":error}),
+    }
+}
+
+fn redact_endpoint(endpoint: &str) -> String {
+    let authority = endpoint
+        .strip_prefix("https://")
+        .unwrap_or("configured endpoint")
+        .split('/')
+        .next()
+        .unwrap_or("configured endpoint");
+    format!("https://{authority}/…")
+}
+
+fn ai_http_agent(timeout: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(StdDuration::from_secs(timeout)))
+        .https_only(true)
+        .max_redirects(0)
+        .build()
+        .into()
+}
+
+fn send_chat_request(config: &AiConfig, request: &Value) -> Result<Value, String> {
+    let endpoint = config
+        .endpoint_url
+        .as_deref()
+        .ok_or("AI chat is enabled but no endpoint is configured")?;
+    let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let agent = ai_http_agent(config.request_timeout_seconds);
+    let mut builder = agent
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .header("accept", "application/json");
+    if let Some(variable) = config.api_key_env.as_deref() {
+        let token = std::env::var(variable).map_err(|_| {
+            format!("AI chat credential environment variable {variable} is not set")
+        })?;
+        if token.is_empty() {
+            return Err(format!(
+                "AI chat credential environment variable {variable} is empty"
+            ));
+        }
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = builder.send(&payload).map_err(|error| {
+        format!(
+            "AI chat endpoint {} is unreachable or rejected the request: {}",
+            redact_endpoint(endpoint),
+            error
+        )
+    })?;
+    let body = response
+        .into_body()
+        .into_with_config()
+        .limit(CHAT_MAX_RESPONSE_BYTES)
+        .read_to_string()
+        .map_err(|error| {
+            format!(
+                "AI chat endpoint {} returned an unreadable response: {error}",
+                redact_endpoint(endpoint)
+            )
+        })?;
+    serde_json::from_str(&body).map_err(|_| {
+        format!(
+            "AI chat endpoint {} returned malformed JSON",
+            redact_endpoint(endpoint)
+        )
+    })
+}
+
+fn assistant_message(response: &Value) -> Result<Value, String> {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| "AI chat endpoint response has no assistant message".to_string())
+}
+
+fn response_text(message: &Value) -> Result<Option<String>, String> {
+    match message.get("content") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.len() <= CHAT_MAX_RESPONSE_BYTES as usize => {
+            Ok(Some(text.clone()))
+        }
+        Some(Value::String(_)) => Err("AI chat answer exceeds the response size limit".into()),
+        _ => Err("AI chat endpoint returned a malformed assistant answer".into()),
+    }
+}
+
+/// Runs a bounded OpenAI-compatible tool loop.  The endpoint receives the
+/// question and capability description first; local evidence is released only
+/// after each requested action has passed strict validation.
+pub fn run_chat(config: &Config, database: &Path, question: &str) -> Result<String, String> {
+    config.validate()?;
+    if !config.ai.enabled {
+        return Err("AI chat is disabled. Set [ai].enabled = true and configure its HTTPS endpoint and model in the owner-only diagnosis config.".into());
+    }
+    if question.trim().is_empty() || question.len() > CHAT_MAX_QUESTION_BYTES {
+        return Err(format!(
+            "chat question must contain 1 to {CHAT_MAX_QUESTION_BYTES} bytes"
+        ));
+    }
+    let model = config
+        .ai
+        .model
+        .as_deref()
+        .ok_or("AI chat is enabled but no model is configured")?;
+    let mut messages = vec![
+        json!({"role":"system","content":chat_capability_message()}),
+        json!({"role":"user","content":question}),
+    ];
+    let mut evidence_actions = 0;
+    for round in 0..=CHAT_MAX_ROUNDS {
+        let request = json!({"model":model,"messages":messages,"tools":chat_tools(),"tool_choice":"auto","temperature":0});
+        let assistant = assistant_message(&send_chat_request(&config.ai, &request)?)?;
+        let calls = assistant
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if calls.is_empty() {
+            let answer = response_text(&assistant)?
+                .ok_or("AI chat endpoint returned neither an answer nor an evidence action".into());
+            return if evidence_actions == 0 {
+                answer.map(|text| {
+                    format!("No local evidence was requested by the endpoint.\n\n{text}")
+                })
+            } else {
+                answer
+            };
+        }
+        if round == CHAT_MAX_ROUNDS || calls.len() > 4 {
+            return Err("AI chat requested too many evidence-action rounds".into());
+        }
+        messages.push(assistant);
+        for call in calls {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("AI chat endpoint returned a tool call without an id")?;
+            let function = call
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or("AI chat endpoint returned a malformed tool call")?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("AI chat endpoint returned a tool call without a name")?;
+            let raw = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or("AI chat endpoint returned tool arguments in an invalid format")?;
+            if raw.len() > 8_192 {
+                return Err("AI chat endpoint requested oversized tool arguments".into());
+            }
+            let arguments: Value = serde_json::from_str(raw)
+                .map_err(|_| "AI chat endpoint returned malformed tool arguments")?;
+            let evidence = bounded_chat_evidence(
+                parse_chat_action(name, &arguments)
+                    .and_then(|action| execute_chat_action(&action, database)),
+            );
+            evidence_actions += 1;
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":serde_json::to_string(&evidence).map_err(|error| error.to_string())?}));
+        }
+    }
+    Err("AI chat exhausted its evidence-action budget".into())
+}
+
 pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2751,6 +3176,54 @@ mod tests {
                 file.display()
             );
         }
+    }
+
+    #[test]
+    fn chat_is_default_disabled_and_rejects_unsafe_endpoint_configuration() {
+        let config = Config::default();
+        assert!(!config.ai.enabled);
+        assert!(config.validate().is_ok());
+        assert!(validate_ai_endpoint("http://localhost/v1/chat/completions").is_err());
+        assert!(validate_ai_endpoint("https://token@example.test/v1/chat/completions").is_err());
+        assert!(validate_ai_endpoint("https://example.test/v1/chat/completions?key=x").is_err());
+    }
+
+    #[test]
+    fn chat_protocol_allows_only_bounded_typed_evidence_actions() {
+        assert_eq!(
+            parse_chat_action("memory_diagnosis", &json!({"since":"30d"})).unwrap(),
+            ChatAction::MemoryDiagnosis {
+                since: "30d".into()
+            }
+        );
+        assert_eq!(
+            parse_chat_action("recent_incidents", &json!({"limit":20})).unwrap(),
+            ChatAction::RecentIncidents { limit: 20 }
+        );
+        for (name, arguments) in [
+            ("shell", json!({"command":"id"})),
+            ("memory_diagnosis", json!({"since":"31d"})),
+            ("storage_diagnosis", json!({"since":"1d","extra":true})),
+            ("recent_incidents", json!({"limit":21})),
+            ("current_status", json!({"anything":true})),
+        ] {
+            assert!(parse_chat_action(name, &arguments).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn chat_evidence_results_are_size_bounded_before_they_leave_the_host() {
+        let oversized = Value::String("x".repeat(CHAT_MAX_EVIDENCE_BYTES + 1));
+        let result = bounded_chat_evidence(Ok(oversized));
+        assert_eq!(result["ok"], false);
+        assert!(result["error"].as_str().unwrap().contains("size limit"));
+    }
+
+    #[test]
+    fn chat_http_client_never_follows_or_downgrades_redirects() {
+        let agent = ai_http_agent(20);
+        assert!(agent.config().https_only());
+        assert_eq!(agent.config().max_redirects(), 0);
     }
 
     #[test]

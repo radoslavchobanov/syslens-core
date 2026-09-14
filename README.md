@@ -233,6 +233,7 @@ syslens-diagnosis disable
 syslens-diagnosis diagnose memory --since today --compare previous-week
 syslens-diagnosis diagnose storage --since 7d --compare previous-week
 syslens diagnose memory --since 7d
+syslens-diagnosis chat "What local evidence explains the recent RAM increase?"
 ```
 
 `enable` creates `~/.config/syslens-diagnosis/config.toml` (owner-only),
@@ -248,8 +249,36 @@ and supported storage-growth forecasts. It has no push transport: inspect or
 replay events with `syslens-diagnosis incidents list`, `events --after CURSOR`,
 `show ID`, and `acknowledge ID`. Reading events never marks them delivered.
 The strict `[detection]` configuration defaults to a 24-hour warm baseline and
-80% coverage before a memory-baseline alert can open. `chat` remains unavailable
-in this release.
+80% coverage before a memory-baseline alert can open.
+
+### Optional AI chat
+
+The add-on's outbound OpenAI-compatible `/v1/chat/completions` client is
+disabled by default. It neither installs nor runs a model. Enable it only in
+the owner-only diagnosis configuration created by `enable`:
+
+```toml
+[ai]
+enabled = true
+endpoint_url = "https://ai.example.net/v1/chat/completions"
+model = "your-compatible-model"
+# Optional: bearer token is read from this environment variable, never TOML.
+api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
+request_timeout_seconds = 20
+```
+
+[`crates/syslens-diagnosis/config.toml.example`](crates/syslens-diagnosis/config.toml.example)
+is a minimal equivalent example. Do not place this `[ai]` section in the Core
+MQTT configuration.
+
+`syslens-diagnosis chat "question"` sends the question and a fixed capability
+description first. The endpoint can then request only validated, read-only
+memory or storage diagnoses (up to 30 days), current evidence status, or up to
+20 recent incidents. It cannot invoke a shell, SQL, filesystem, network, or
+arbitrary tools. The client limits action rounds, results, response size, and
+HTTP time, and reports disabled, unreachable, or malformed endpoints without
+printing endpoint credentials. A plain answer is permitted, but it must not be
+treated as local evidence unless the endpoint requested and received it.
 
 Every `incidents ... --json` response uses a version `1` envelope. `watch`
 emits one notification-event envelope per event, while `list`, `show`, and

@@ -37,7 +37,15 @@ enum CommandLine {
         #[command(subcommand)]
         resource: Diagnose,
     },
-    Chat,
+    /// Ask the configured optional AI endpoint about bounded local evidence.
+    Chat {
+        /// The question to ask. A question is required so automated callers
+        /// cannot accidentally start an interactive session.
+        #[arg(required = true, num_args = 1..)]
+        question: Vec<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     Incidents {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -189,7 +197,23 @@ fn main() -> ExitCode {
                 Err(e) => Err(e),
             }
         }
-        CommandLine::Chat => Err("chat is not available yet; use `syslens diagnose memory`".into()),
+        CommandLine::Chat { question, config } => (|| {
+            let config = config.unwrap_or_else(diagnosis::config_path);
+            if !config.exists() {
+                return Err(format!(
+                    "AI chat is disabled: diagnosis configuration is not enabled at {}; run `syslens-diagnosis enable` first",
+                    config.display()
+                ));
+            }
+            diagnosis::secure_config(&config)?;
+            let configured = diagnosis::load_config(&config)?;
+            diagnosis::run_chat(
+                &configured,
+                &diagnosis::database_path_for_config(&config),
+                &question.join(" "),
+            )
+            .map(|answer| println!("{answer}"))
+        })(),
         CommandLine::Incidents { config, command } => {
             incidents(config.unwrap_or_else(diagnosis::config_path), command)
         }

@@ -63,6 +63,27 @@ fn help_lists_local_storage_diagnosis() {
 }
 
 #[test]
+fn chat_requires_a_question_and_reports_disabled_configuration() {
+    let binary = env!("CARGO_BIN_EXE_syslens-diagnosis");
+    let missing_question = Command::new(binary).args(["chat"]).output().unwrap();
+    assert!(!missing_question.status.success());
+
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("missing.toml");
+    let output = Command::new(binary)
+        .args([
+            "chat",
+            "what happened?",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("AI chat is disabled"));
+}
+
+#[test]
 fn acknowledgement_json_has_stable_v1_fields() {
     let (_dir, config) = incident_database();
     let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))

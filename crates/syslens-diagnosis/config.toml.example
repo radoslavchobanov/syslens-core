@@ -1,0 +1,14 @@
+# Copy this only to ~/.config/syslens-diagnosis/config.toml and keep it 0600.
+# `syslens-diagnosis enable` creates an equivalent owner-only default file.
+version = 1
+interval_seconds = 30
+retention_days = 185
+database_budget_bytes = 17179869184
+
+[ai]
+# The endpoint client is opt-in. It never installs or starts a local model.
+enabled = false
+# endpoint_url = "https://ai.example.net/v1/chat/completions"
+# model = "your-compatible-model"
+# api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
+request_timeout_seconds = 20
