@@ -562,7 +562,9 @@ pub trait FilesystemReader {
 pub struct MountInfo {
     pub mount_point: PathBuf,
     pub fs_type: String,
+    /// Kernel major:minor device identity from mountinfo, stable across bind mounts.
     pub device: String,
+    pub source: String,
     pub read_only: bool,
 }
 #[derive(Debug, Clone)]
@@ -605,7 +607,8 @@ pub fn read_mountinfo(path: &Path) -> Result<Vec<MountInfo>, String> {
         out.push(MountInfo {
             mount_point: unescape_mount(left[4]),
             fs_type: right[0].into(),
-            device: right[1].into(),
+            device: left[2].into(),
+            source: right[1].into(),
             read_only: opts,
         });
     }
@@ -627,31 +630,24 @@ fn stat_filesystem(path: &Path) -> Result<FsStat, String> {
         files_free: s.f_ffree,
     })
 }
-fn excluded_filesystem(t: &str) -> bool {
+fn local_physical_filesystem(t: &str) -> bool {
     matches!(
         t,
-        "proc"
-            | "sysfs"
-            | "tmpfs"
-            | "devtmpfs"
-            | "devpts"
-            | "cgroup"
-            | "cgroup2"
-            | "overlay"
-            | "squashfs"
-            | "nsfs"
-            | "mqueue"
-            | "securityfs"
-            | "tracefs"
-            | "debugfs"
-            | "pstore"
-            | "fusectl"
-            | "autofs"
-            | "configfs"
-            | "ramfs"
-    ) || t.starts_with("nfs")
-        || t == "cifs"
-        || t == "sshfs"
+        "ext2"
+            | "ext3"
+            | "ext4"
+            | "xfs"
+            | "btrfs"
+            | "f2fs"
+            | "zfs"
+            | "jfs"
+            | "reiserfs"
+            | "ufs"
+            | "ntfs"
+            | "ntfs3"
+            | "vfat"
+            | "exfat"
+    )
 }
 pub fn collect_mounts(
     reader: &dyn FilesystemReader,
@@ -664,24 +660,26 @@ pub fn collect_mounts(
     let mut seen = HashSet::new();
     let mut out = vec![];
     let mut gaps = vec![];
+    let mut mounts = mounts;
+    mounts.sort_by_key(|m| m.mount_point.components().count());
     for m in mounts {
-        let id = format!("{}|{}|{}", m.device, m.fs_type, m.mount_point.display());
+        let id = format!("{}|{}|{}", m.device, m.fs_type, m.source);
         if !seen.insert(id.clone()) {
             continue;
         };
-        if excluded_filesystem(&m.fs_type) {
+        if !local_physical_filesystem(&m.fs_type) {
             out.push(MountSample {
                 timestamp,
                 mount_id: id,
                 mount_point: m.mount_point.display().to_string(),
-                fs_type: m.fs_type,
+                fs_type: m.fs_type.clone(),
                 total_bytes: None,
                 free_bytes: None,
                 used_bytes: None,
                 total_inodes: None,
                 free_inodes: None,
                 read_only: m.read_only,
-                capability: "excluded filesystem type".into(),
+                capability: format!("excluded non-local filesystem type {}", m.fs_type),
             });
             continue;
         }
@@ -769,6 +767,34 @@ pub fn insert_collection_gaps(
     tx.commit().map_err(|e| e.to_string())
 }
 
+/// Select one shortest root for bind/duplicate mounts while retaining a nested
+/// mount when it is a distinct filesystem identity.
+pub fn default_scan_roots(mounts: &[MountSample]) -> Vec<(PathBuf, String)> {
+    let mut candidates: Vec<_> = mounts
+        .iter()
+        .filter(|m| m.capability == "available" && !m.read_only)
+        .map(|m| (PathBuf::from(&m.mount_point), m.mount_id.clone()))
+        .collect();
+    candidates.sort_by_key(|(p, _)| p.components().count());
+    let mut selected: Vec<(PathBuf, String)> = vec![];
+    for candidate in candidates {
+        if selected
+            .iter()
+            .any(|(root, id)| candidate.0.starts_with(root) && *id == candidate.1)
+        {
+            continue;
+        }
+        selected.push(candidate);
+    }
+    selected
+}
+pub fn containing_mount<'a>(root: &Path, mounts: &'a [MountSample]) -> Option<&'a MountSample> {
+    mounts
+        .iter()
+        .filter(|m| root.starts_with(&m.mount_point))
+        .max_by_key(|m| Path::new(&m.mount_point).components().count())
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectorySample {
     pub path: String,
@@ -811,6 +837,18 @@ pub fn scan_directory(
             };
         }
     };
+    if root_meta.file_type().is_symlink() {
+        return ScanResult {
+            root: root_s,
+            mount_id,
+            started_at: now,
+            ended_at: now,
+            status: "partial".into(),
+            reason: Some("root is a symlink".into()),
+            entries_seen: 0,
+            directories: vec![],
+        };
+    }
     let root_dev = std::os::unix::fs::MetadataExt::dev(&root_meta);
     let mut directories = BTreeMap::<PathBuf, DirectorySample>::new();
     directories.insert(
@@ -980,6 +1018,20 @@ pub fn insert_scan(conn: &mut Connection, s: &ScanResult) -> Result<(), String> 
                 d.entry_count,
                 d.file_count
             ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if s.status != "complete" {
+        let category = match s.reason.as_deref().unwrap_or("") {
+            x if x.contains("duration") => "duration_limit",
+            x if x.contains("entry") => "entry_limit",
+            x if x.contains("permission") || x.contains("cannot read") => "permission_or_read",
+            x if x.contains("symlink") => "symlink_root",
+            _ => "unavailable",
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO collection_gaps(timestamp,reason,duration_ms) VALUES(?,?,NULL)",
+            params![s.ended_at, format!("storage_scan:{}:{category}", s.root)],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -1386,14 +1438,18 @@ pub struct StorageInterval {
 }
 #[derive(Serialize)]
 pub struct MountFinding {
+    pub mount_id: String,
     pub mount_point: String,
     pub fs_type: String,
     pub used_bytes_change: i64,
     pub current_used_bytes: i64,
     pub comparison_used_bytes: i64,
+    pub attributable_bytes: i64,
+    pub unexplained_bytes: i64,
 }
 #[derive(Serialize)]
 pub struct DirectoryFinding {
+    pub mount_id: String,
     pub path: String,
     pub allocated_bytes_change: i64,
     pub apparent_bytes_change: i64,
@@ -1413,7 +1469,7 @@ pub fn diagnose_storage(
     let (cs, ce) = (start - Duration::days(7), end - Duration::days(7));
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
     let mut limits=vec!["Directory evidence is unprivileged and local. It does not attribute storage use to a process.".into()];
-    let mut stmt=conn.prepare("SELECT a.mount_point,a.fs_type,a.used_bytes,b.used_bytes FROM mount_samples a JOIN mount_samples b ON a.mount_id=b.mount_id WHERE a.timestamp=(SELECT max(timestamp) FROM mount_samples x WHERE x.mount_id=a.mount_id AND x.timestamp>=?1 AND x.timestamp<=?2 AND x.used_bytes IS NOT NULL) AND b.timestamp=(SELECT max(timestamp) FROM mount_samples y WHERE y.mount_id=b.mount_id AND y.timestamp>=?3 AND y.timestamp<=?4 AND y.used_bytes IS NOT NULL)").map_err(|e|e.to_string())?;
+    let mut stmt=conn.prepare("SELECT a.mount_id,a.mount_point,a.fs_type,a.used_bytes,b.used_bytes FROM mount_samples a JOIN mount_samples b ON a.mount_id=b.mount_id WHERE a.timestamp=(SELECT max(timestamp) FROM mount_samples x WHERE x.mount_id=a.mount_id AND x.timestamp>=?1 AND x.timestamp<=?2 AND x.used_bytes IS NOT NULL) AND b.timestamp=(SELECT max(timestamp) FROM mount_samples y WHERE y.mount_id=b.mount_id AND y.timestamp>=?3 AND y.timestamp<=?4 AND y.used_bytes IS NOT NULL)").map_err(|e|e.to_string())?;
     let rows = stmt
         .query_map(
             params![
@@ -1424,16 +1480,19 @@ pub fn diagnose_storage(
             ],
             |r| {
                 Ok(MountFinding {
-                    mount_point: r.get(0)?,
-                    fs_type: r.get(1)?,
-                    current_used_bytes: r.get(2)?,
-                    comparison_used_bytes: r.get(3)?,
-                    used_bytes_change: r.get::<_, i64>(2)? - r.get::<_, i64>(3)?,
+                    mount_id: r.get(0)?,
+                    mount_point: r.get(1)?,
+                    fs_type: r.get(2)?,
+                    current_used_bytes: r.get(3)?,
+                    comparison_used_bytes: r.get(4)?,
+                    used_bytes_change: r.get::<_, i64>(3)? - r.get::<_, i64>(4)?,
+                    attributable_bytes: 0,
+                    unexplained_bytes: 0,
                 })
             },
         )
         .map_err(|e| e.to_string())?;
-    let mounts: Vec<_> = rows.filter_map(Result::ok).collect();
+    let mut mounts: Vec<_> = rows.filter_map(Result::ok).collect();
     if mounts.is_empty() {
         limits
             .push("No comparable available mount-capacity samples exist in both intervals.".into());
@@ -1453,7 +1512,7 @@ pub fn diagnose_storage(
             limitations: limits,
         });
     }
-    let mut dstmt=conn.prepare("SELECT dc.path,dc.allocated_bytes-dp.allocated_bytes,dc.apparent_bytes-dp.apparent_bytes FROM storage_scans sc JOIN directory_samples dc ON dc.scan_id=sc.id JOIN storage_scans sp ON sp.root=sc.root JOIN directory_samples dp ON dp.scan_id=sp.id AND dp.path=dc.path WHERE sc.status='complete' AND sp.status='complete' AND sc.started_at=(SELECT max(x.started_at) FROM storage_scans x WHERE x.root=sc.root AND x.status='complete' AND x.started_at>=?1 AND x.started_at<=?2) AND sp.started_at=(SELECT max(y.started_at) FROM storage_scans y WHERE y.root=sp.root AND y.status='complete' AND y.started_at>=?3 AND y.started_at<=?4) ORDER BY 2 DESC LIMIT 20").map_err(|e|e.to_string())?;
+    let mut dstmt=conn.prepare("SELECT sc.mount_id,sc.root,dc.path,dc.allocated_bytes-dp.allocated_bytes,dc.apparent_bytes-dp.apparent_bytes FROM storage_scans sc JOIN directory_samples dc ON dc.scan_id=sc.id JOIN storage_scans sp ON sp.root=sc.root AND sp.mount_id=sc.mount_id JOIN directory_samples dp ON dp.scan_id=sp.id AND dp.path=dc.path WHERE sc.status='complete' AND sp.status='complete' AND sc.mount_id IS NOT NULL AND sc.started_at=(SELECT max(x.started_at) FROM storage_scans x WHERE x.root=sc.root AND x.mount_id=sc.mount_id AND x.status='complete' AND x.started_at>=?1 AND x.started_at<=?2) AND sp.started_at=(SELECT max(y.started_at) FROM storage_scans y WHERE y.root=sp.root AND y.mount_id=sp.mount_id AND y.status='complete' AND y.started_at>=?3 AND y.started_at<=?4) ORDER BY 4 DESC LIMIT 200").map_err(|e|e.to_string())?;
     let r = dstmt
         .query_map(
             params![
@@ -1464,17 +1523,46 @@ pub fn diagnose_storage(
             ],
             |x| {
                 Ok(DirectoryFinding {
-                    path: x.get(0)?,
-                    allocated_bytes_change: x.get(1)?,
-                    apparent_bytes_change: x.get(2)?,
+                    mount_id: x.get(0)?,
+                    path: x.get(2)?,
+                    allocated_bytes_change: x.get(3)?,
+                    apparent_bytes_change: x.get(4)?,
                 })
             },
         )
         .map_err(|e| e.to_string())?;
-    let directories: Vec<_> = r
+    let mut candidates: Vec<_> = r
         .filter_map(Result::ok)
         .filter(|x| x.allocated_bytes_change > 0)
         .collect();
+    // Each retained directory includes its descendants.  Reporting only direct
+    // children of a scan root avoids double counting parent and child totals.
+    let scan_roots: std::collections::HashMap<String, String> = conn
+        .prepare("SELECT DISTINCT mount_id,root FROM storage_scans WHERE mount_id IS NOT NULL")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    candidates.retain(|d| {
+        scan_roots.get(&d.mount_id).is_some_and(|root| {
+            Path::new(&d.path)
+                .parent()
+                .is_some_and(|p| p == Path::new(root))
+        })
+    });
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.allocated_bytes_change));
+    let directories: Vec<_> = candidates.into_iter().take(20).collect();
+    for mount in &mut mounts {
+        mount.attributable_bytes = directories
+            .iter()
+            .filter(|d| d.mount_id == mount.mount_id)
+            .map(|d| d.allocated_bytes_change)
+            .sum();
+        mount.unexplained_bytes = mount
+            .used_bytes_change
+            .saturating_sub(mount.attributable_bytes);
+    }
     if directories.is_empty() {
         limits.push("No pair of complete, comparable directory scans was retained; mount growth cannot yet be attributed to a path.".into())
     };
@@ -1510,10 +1598,12 @@ pub fn render_storage_diagnosis(d: &StorageDiagnosis) -> String {
     );
     for m in &d.mounts {
         s.push_str(&format!(
-            "- Mount {} ({}): {:+} MiB used\n",
+            "- Mount {} ({}): {:+} MiB used; {:+} MiB attributed to retained top-level directories; {:+} MiB unexplained\n",
             m.mount_point,
             m.fs_type,
-            m.used_bytes_change / 1048576
+            m.used_bytes_change / 1048576,
+            m.attributable_bytes / 1048576,
+            m.unexplained_bytes / 1048576,
         ));
     }
     for x in &d.directories {
@@ -1965,12 +2055,14 @@ mod tests {
                         mount_point: PathBuf::from("/data"),
                         fs_type: "ext4".into(),
                         device: "/dev/x".into(),
+                        source: "/dev/x".into(),
                         read_only: false,
                     },
                     MountInfo {
                         mount_point: PathBuf::from("/proc"),
                         fs_type: "proc".into(),
                         device: "proc".into(),
+                        source: "proc".into(),
                         read_only: true,
                     },
                 ])
@@ -1988,7 +2080,7 @@ mod tests {
         let (m, gaps) = collect_mounts(&Fake, 4);
         assert!(gaps.is_empty());
         assert_eq!(m[0].used_bytes, Some(15 * 1024));
-        assert_eq!(m[1].capability, "excluded filesystem type");
+        assert!(m[1].capability.contains("excluded non-local"));
     }
 
     #[test]
@@ -2017,6 +2109,86 @@ mod tests {
             .unwrap();
         assert_eq!(r.file_count, 2);
         assert!(r.apparent_bytes >= 4096 && r.apparent_bytes < 8192);
+    }
+
+    #[test]
+    fn scan_roots_deduplicate_bind_mounts_but_keep_nested_filesystems() {
+        let mounts = vec![
+            MountSample {
+                timestamp: 1,
+                mount_id: "8:1|ext4|/dev/root".into(),
+                mount_point: "/data".into(),
+                fs_type: "ext4".into(),
+                total_bytes: None,
+                free_bytes: None,
+                used_bytes: None,
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            },
+            MountSample {
+                timestamp: 1,
+                mount_id: "8:1|ext4|/dev/root".into(),
+                mount_point: "/data/bind".into(),
+                fs_type: "ext4".into(),
+                total_bytes: None,
+                free_bytes: None,
+                used_bytes: None,
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            },
+            MountSample {
+                timestamp: 1,
+                mount_id: "8:2|ext4|/dev/other".into(),
+                mount_point: "/data/other".into(),
+                fs_type: "ext4".into(),
+                total_bytes: None,
+                free_bytes: None,
+                used_bytes: None,
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            },
+        ];
+        let roots = default_scan_roots(&mounts);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].0, PathBuf::from("/data"));
+        assert_eq!(roots[1].0, PathBuf::from("/data/other"));
+    }
+    #[test]
+    fn symlink_root_and_entry_budget_are_persisted_as_partial_gaps() {
+        let d = tempdir().unwrap();
+        let target = d.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("a"), "x").unwrap();
+        fs::write(target.join("b"), "x").unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let cfg = StorageConfig {
+            max_entries: 1,
+            ..Default::default()
+        };
+        let symlink_scan = scan_directory(&link, Some("m".into()), &cfg, 1);
+        assert_eq!(symlink_scan.status, "partial");
+        let bounded = scan_directory(&target, Some("m".into()), &cfg, 2);
+        assert_eq!(bounded.status, "partial");
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        insert_scan(&mut c, &symlink_scan).unwrap();
+        insert_scan(&mut c, &bounded).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM collection_gaps WHERE reason LIKE 'storage_scan:%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -2083,6 +2255,59 @@ mod tests {
             [now - 3600],
         )
         .unwrap();
+        assert_eq!(
+            diagnose_storage(&path, "1h", "previous-week")
+                .unwrap()
+                .status,
+            "insufficient evidence"
+        );
+    }
+
+    #[test]
+    fn storage_remount_identity_cannot_attribute_paths() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (time, mount) in [(now - 7 * 86400 - 60, "old"), (now - 60, "new")] {
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp: time,
+                    mount_id: mount.into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100),
+                    free_bytes: Some(50),
+                    used_bytes: Some(50),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/data".into(),
+                    mount_id: Some(mount.into()),
+                    started_at: time,
+                    ended_at: time,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 0,
+                    directories: vec![DirectorySample {
+                        path: "/data/a".into(),
+                        allocated_bytes: 10,
+                        apparent_bytes: 10,
+                        entry_count: 1,
+                        file_count: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        }
         assert_eq!(
             diagnose_storage(&path, "1h", "previous-week")
                 .unwrap()

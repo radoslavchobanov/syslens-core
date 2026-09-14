@@ -315,33 +315,52 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             if diagnosis::unix_now() >= next_scan && scan_worker.is_none() {
-                let roots = cfg.storage.roots.clone().unwrap_or_else(|| {
-                    mounts
-                        .iter()
-                        .filter(|m| m.capability == "available" && !m.read_only)
-                        .map(|m| PathBuf::from(&m.mount_point))
+                let planned: Vec<_> = if let Some(roots) = cfg.storage.roots.clone() {
+                    roots
+                        .into_iter()
+                        .map(|root| {
+                            let mount = diagnosis::containing_mount(&root, &mounts);
+                            (
+                                root,
+                                mount
+                                    .filter(|m| m.capability == "available")
+                                    .map(|m| m.mount_id.clone()),
+                            )
+                        })
                         .collect()
-                });
-                let planned: Vec<_> = roots
-                    .into_iter()
-                    .map(|root| {
-                        let mount_id = mounts
-                            .iter()
-                            .find(|m| std::path::Path::new(&m.mount_point) == root)
-                            .map(|m| m.mount_id.clone());
-                        (root, mount_id)
-                    })
-                    .collect();
+                } else {
+                    diagnosis::default_scan_roots(&mounts)
+                        .into_iter()
+                        .map(|(root, id)| (root, Some(id)))
+                        .collect()
+                };
                 let scan_db = db.clone();
                 let scan_config = cfg.storage.clone();
                 scan_worker = Some(thread::spawn(move || {
                     for (root, mount_id) in planned {
-                        let scan = diagnosis::scan_directory(
-                            &root,
-                            mount_id,
-                            &scan_config,
-                            diagnosis::unix_now(),
-                        );
+                        let scan = match mount_id {
+                            Some(id) => diagnosis::scan_directory(
+                                &root,
+                                Some(id),
+                                &scan_config,
+                                diagnosis::unix_now(),
+                            ),
+                            None => {
+                                let now = diagnosis::unix_now();
+                                diagnosis::ScanResult {
+                                    root: root.display().to_string(),
+                                    mount_id: None,
+                                    started_at: now,
+                                    ended_at: now,
+                                    status: "partial".into(),
+                                    reason: Some(
+                                        "root has no eligible local physical mount".into(),
+                                    ),
+                                    entries_seen: 0,
+                                    directories: vec![],
+                                }
+                            }
+                        };
                         match diagnosis::open_db(&scan_db)
                             .and_then(|mut c| diagnosis::insert_scan(&mut c, &scan))
                         {
