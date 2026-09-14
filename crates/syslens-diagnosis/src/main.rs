@@ -77,6 +77,8 @@ enum IncidentCommand {
     },
     Acknowledge {
         id: String,
+        #[arg(long)]
+        json: bool,
     },
     Events {
         #[arg(long, default_value_t = 0)]
@@ -87,6 +89,8 @@ enum IncidentCommand {
     Watch {
         #[arg(long, default_value_t = 0)]
         after: i64,
+        #[arg(long)]
+        json: bool,
     },
 }
 fn service(args: &[&str]) -> Result<(), String> {
@@ -232,8 +236,22 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
             };
             Ok(())
         }
-        IncidentCommand::Acknowledge { id } => {
-            diagnosis::acknowledge_incident(&db, &id, diagnosis::unix_now())
+        IncidentCommand::Acknowledge { id, json } => {
+            let now = diagnosis::unix_now();
+            diagnosis::acknowledge_incident(&db, &id, now)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "version": "v1",
+                        "type": "incident_acknowledgement",
+                        "id": id,
+                        "acknowledged_at": now,
+                        "status": "acknowledged",
+                    })
+                );
+            }
+            Ok(())
         }
         IncidentCommand::Events { after, json } => {
             let x = diagnosis::list_events(&db, after)?;
@@ -246,10 +264,21 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
             };
             Ok(())
         }
-        IncidentCommand::Watch { mut after } => loop {
+        IncidentCommand::Watch { mut after, json } => loop {
             for e in diagnosis::list_events(&db, after)? {
                 after = e.cursor;
-                println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "version": "v1",
+                            "type": "notification_event",
+                            "event": e,
+                        })
+                    );
+                } else {
+                    println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id);
+                }
             }
             thread::sleep(Duration::from_secs(2));
         },

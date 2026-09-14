@@ -251,6 +251,10 @@ The strict `[detection]` configuration defaults to a 24-hour warm baseline and
 80% coverage before a memory-baseline alert can open. `chat` remains unavailable
 in this release.
 
+`incidents watch --json` emits one stable v1 JSON object per event, and
+`incidents acknowledge ID --json` emits a v1 acknowledgement result. Event
+replay reports a history gap when the requested cursor predates retained events.
+
 The add-on also records local writable mount capacity and inode counters every
 collection interval. It scans eligible local mount roots at startup and then
 hourly by default, retaining directory summaries to four levels. Directory

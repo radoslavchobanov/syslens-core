@@ -1,4 +1,17 @@
-use std::process::Command;
+use std::io::BufRead;
+use std::process::{Command, Stdio};
+use syslens_diagnosis::open_db;
+use tempfile::tempdir;
+
+fn incident_database() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("diagnosis.toml");
+    let db = config.with_extension("sqlite");
+    let c = open_db(&db).unwrap();
+    c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('i','d','s','warning','open',1,1,'{}')", []).unwrap();
+    c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('e','i','opened','warning',1,'v1','{}')", []).unwrap();
+    (dir, config)
+}
 
 #[test]
 fn help_lists_local_memory_diagnosis() {
@@ -18,4 +31,53 @@ fn help_lists_local_storage_diagnosis() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("previous-week"));
+}
+
+#[test]
+fn acknowledgement_json_has_stable_v1_fields() {
+    let (_dir, config) = incident_database();
+    let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .args([
+            "incidents",
+            "--config",
+            config.to_str().unwrap(),
+            "acknowledge",
+            "i",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["version"], "v1");
+    assert_eq!(value["type"], "incident_acknowledgement");
+    assert_eq!(value["id"], "i");
+    assert_eq!(value["status"], "acknowledged");
+}
+
+#[test]
+fn watch_json_emits_one_v1_object_per_event() {
+    let (_dir, config) = incident_database();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .args([
+            "incidents",
+            "--config",
+            config.to_str().unwrap(),
+            "watch",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    child.kill().unwrap();
+    let _ = child.wait();
+    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(value["version"], "v1");
+    assert_eq!(value["type"], "notification_event");
+    assert_eq!(value["event"]["cursor"], 1);
+    assert_eq!(value["event"]["id"], "e");
 }

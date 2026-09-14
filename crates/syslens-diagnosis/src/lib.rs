@@ -576,13 +576,28 @@ pub fn housekeeping(conn: &mut Connection, cutoff: i64, now: i64) -> Result<usiz
     // Notification evidence is deliberately retained longer than raw telemetry.
     // Keep every event for an open incident so it remains understandable even
     // after the underlying minute samples have expired.
-    count += tx.execute("DELETE FROM notification_events WHERE cursor IN (SELECT e.cursor FROM notification_events e JOIN incidents i ON i.id=e.incident_id WHERE e.created_at < ? AND i.status!='open' LIMIT 1000)", [now-365*86400]).map_err(|e| e.to_string())?;
-    let earliest: Option<i64> = tx
-        .query_row("SELECT min(cursor) FROM notification_events", [], |r| {
-            r.get(0)
-        })
+    let event_cutoff = now - 365 * 86400;
+    let last_deleted: Option<i64> = tx
+        .query_row(
+            "SELECT max(cursor) FROM (SELECT e.cursor FROM notification_events e JOIN incidents i ON i.id=e.incident_id WHERE e.created_at < ? AND i.status!='open' ORDER BY e.cursor LIMIT 1000)",
+            [event_cutoff],
+            |r| r.get(0),
+        )
         .map_err(|e| e.to_string())?;
-    tx.execute("INSERT INTO metadata(key,value) VALUES('earliest_notification_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [earliest.unwrap_or(0).to_string()]).map_err(|e|e.to_string())?;
+    count += tx.execute("DELETE FROM notification_events WHERE cursor IN (SELECT cursor FROM (SELECT e.cursor FROM notification_events e JOIN incidents i ON i.id=e.incident_id WHERE e.created_at < ? AND i.status!='open' ORDER BY e.cursor LIMIT 1000))", [event_cutoff]).map_err(|e| e.to_string())?;
+    if let Some(last_deleted) = last_deleted {
+        let previous: i64 = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='notification_replay_floor'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        tx.execute("INSERT INTO metadata(key,value) VALUES('notification_replay_floor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [previous.max(last_deleted).to_string()]).map_err(|e|e.to_string())?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA incremental_vacuum(1000); PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| e.to_string())?;
@@ -930,14 +945,26 @@ fn state_set(
     tx.execute("INSERT INTO detector_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,serde_json::to_string(value).map_err(|e|e.to_string())?,now]).map_err(|e|e.to_string())?;
     Ok(())
 }
-fn bounded_evidence(mut v: serde_json::Value) -> String {
-    let mut s = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
-    if s.len() > 32 * 1024 {
-        v["limitations"] = serde_json::json!(["evidence truncated to 32 KiB"]);
-        s = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
-        s.truncate(32 * 1024);
+fn bounded_evidence(value: serde_json::Value) -> String {
+    const LIMIT: usize = 32 * 1024;
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
+    if serialized.len() <= LIMIT {
+        return serialized;
     }
-    s
+    // Keep a small, deterministic and always parseable record.  Raw byte
+    // truncation can corrupt JSON and make an otherwise durable event useless.
+    let mut keys = match &value {
+        serde_json::Value::Object(object) => object.keys().cloned().collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    keys.sort();
+    serde_json::to_string(&serde_json::json!({
+        "truncated": true,
+        "original_bytes": serialized.len(),
+        "top_level_keys": keys,
+        "limitations": ["evidence exceeded the 32 KiB event limit"],
+    }))
+    .expect("fixed evidence summary serializes")
 }
 #[allow(clippy::too_many_arguments)] // Detector inputs are deliberately explicit at call sites.
 fn transition(
@@ -1125,14 +1152,16 @@ pub fn run_detection(
             serde_json::json!({"conclusion":"swap activity and Linux memory pressure were observed together","swap_used_bytes":swap_used,"psi_some":psi_some,"psi_full":psi_full,"limitations":["This finding does not identify an owning process."]}),
         )?;
     }
-    let mut stmt=tx.prepare("SELECT mount_id,mount_point,total_bytes,used_bytes FROM mount_samples WHERE timestamp=(SELECT max(timestamp) FROM mount_samples WHERE timestamp<=?) AND capability='available' AND total_bytes>0 AND used_bytes IS NOT NULL").map_err(|e|e.to_string())?;
-    let mounts: Vec<(String, String, i64, i64)> = stmt
-        .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+    let mut stmt=tx.prepare("SELECT timestamp,mount_id,mount_point,total_bytes,used_bytes FROM mount_samples WHERE timestamp=(SELECT max(timestamp) FROM mount_samples WHERE timestamp<=?) AND capability='available' AND total_bytes>0 AND used_bytes IS NOT NULL").map_err(|e|e.to_string())?;
+    let mounts: Vec<(i64, String, String, i64, i64)> = stmt
+        .query_map([now], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .map_err(|e| e.to_string())?
         .filter_map(Result::ok)
         .collect();
     drop(stmt);
-    for (id, path, total, used) in mounts {
+    for (sample_timestamp, id, path, total, used) in mounts {
         let pct = used as f64 * 100.0 / total as f64;
         let sev = if pct >= cfg.storage_critical_percent as f64 {
             "critical"
@@ -1149,12 +1178,34 @@ pub fn run_detection(
             cfg,
             serde_json::json!({"conclusion":"filesystem capacity is above the configured threshold","mount_id":id,"mount_point":path,"used_bytes":used,"total_bytes":total,"used_percent":pct,"limitations":[]}),
         )?;
-        let hourly: i64 = tx.query_row("SELECT count(DISTINCT timestamp / 3600) FROM mount_samples WHERE mount_id=? AND timestamp>=? AND capability='available' AND used_bytes IS NOT NULL", params![id, now-7*86400], |r|r.get(0)).map_err(|e|e.to_string())?;
-        let recent: Option<(i64,i64)> = tx.query_row("SELECT timestamp,used_bytes FROM mount_samples WHERE mount_id=? AND timestamp<=? AND timestamp>=? AND capability='available' AND used_bytes IS NOT NULL ORDER BY timestamp DESC LIMIT 1",params![id,now-20*3600,now-26*3600],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+        let hourly: i64 = tx.query_row("SELECT count(DISTINCT timestamp / 3600) FROM mount_samples WHERE mount_id=? AND timestamp>=? AND timestamp<=? AND capability='available' AND used_bytes IS NOT NULL", params![id, sample_timestamp-7*86400, sample_timestamp], |r|r.get(0)).map_err(|e|e.to_string())?;
+        let latest_segment: Vec<i64> = {
+            let mut samples = tx.prepare("SELECT timestamp FROM mount_samples WHERE mount_id=? AND timestamp>=? AND timestamp<=? AND capability='available' AND used_bytes IS NOT NULL ORDER BY timestamp").map_err(|e|e.to_string())?;
+            samples
+                .query_map(
+                    params![id, sample_timestamp - 24 * 3600, sample_timestamp],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .collect()
+        };
+        // A forecast must be based on an observed, mostly contiguous latest
+        // day.  This prevents a sparse history or a collection gap from being
+        // treated as a smooth storage-growth trend.
+        let latest_covered = latest_segment.len() >= 20
+            && latest_segment
+                .first()
+                .is_some_and(|first| first - (sample_timestamp - 24 * 3600) <= 2 * 3600)
+            && latest_segment
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] <= 2 * 3600);
+        let recent: Option<(i64,i64)> = tx.query_row("SELECT timestamp,used_bytes FROM mount_samples WHERE mount_id=? AND timestamp<=? AND timestamp>=? AND capability='available' AND used_bytes IS NOT NULL ORDER BY timestamp DESC LIMIT 1",params![id,sample_timestamp-20*3600,sample_timestamp-26*3600],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         if hourly >= 72
+            && latest_covered
             && let Some((old_ts, old_used)) = recent
         {
-            let elapsed = (now - old_ts).max(1);
+            let elapsed = (sample_timestamp - old_ts).max(1);
             let hourly_growth = (used - old_used) as f64 / (elapsed as f64 / 3600.0);
             let warn_bytes = total as f64 * cfg.storage_warning_percent as f64 / 100.0;
             let hours_to = if hourly_growth > 0.0 {
@@ -1223,16 +1274,20 @@ pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), Strin
 }
 pub fn list_events(path: &Path, after: i64) -> Result<Vec<NotificationEvent>, String> {
     let c = open_readonly(path)?;
-    let earliest: Option<i64> = c
-        .query_row("SELECT min(cursor) FROM notification_events", [], |r| {
-            r.get(0)
-        })
+    let replay_floor: Option<String> = c
+        .query_row(
+            "SELECT value FROM metadata WHERE key='notification_replay_floor'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
         .map_err(|e| e.to_string())?;
-    if let Some(earliest) = earliest
-        && after < earliest.saturating_sub(1)
-    {
+    let replay_floor = replay_floor
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if after < replay_floor {
         return Err(format!(
-            "notification history gap: cursor {after} predates earliest retained cursor {earliest}"
+            "notification history gap: cursor {after} predates deleted cursor {replay_floor}"
         ));
     }
     let mut s=c.prepare("SELECT cursor,id,incident_id,kind,severity,created_at,detector_version,evidence_json FROM notification_events WHERE cursor>? ORDER BY cursor").map_err(|e|e.to_string())?;
@@ -3547,6 +3602,77 @@ mod tests {
                 .unwrap()
                 .acknowledged_at
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn replay_floor_survives_when_all_events_expire() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('gone','d','gone','warning','recovered',1,1,'{}')", []).unwrap();
+        c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('gone-event','gone','opened','warning',1,'v1','{}')", []).unwrap();
+        housekeeping(&mut c, 0, 400 * 86_400).unwrap();
+        assert!(list_events(&path, 0).unwrap_err().contains("history gap"));
+        assert!(list_events(&path, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_evidence_is_valid_json_when_large() {
+        let evidence =
+            bounded_evidence(serde_json::json!({"conclusion":"x", "large": "z".repeat(40 * 1024)}));
+        assert!(evidence.len() < 32 * 1024);
+        let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(
+            parsed["top_level_keys"],
+            serde_json::json!(["conclusion", "large"])
+        );
+    }
+
+    #[test]
+    fn storage_forecast_rejects_gappy_latest_segment() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("gappy.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = 20_000 + 72 * 3600;
+        for hour in 0..73_i64 {
+            if (55..70).contains(&hour) {
+                continue;
+            }
+            let timestamp = 20_000 + hour * 3600;
+            let used = 700 + hour * 2;
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp,
+                    mount_id: "data".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(1_000),
+                    free_bytes: Some(1_000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+        }
+        let cfg = DetectionConfig {
+            sustained_seconds: 60,
+            storage_warning_percent: 90,
+            storage_critical_percent: 95,
+            ..Default::default()
+        };
+        run_detection(&mut c, &cfg, now).unwrap();
+        run_detection(&mut c, &cfg, now + 61).unwrap();
+        assert!(
+            list_incidents(&path)
+                .unwrap()
+                .iter()
+                .all(|i| i.detector != "storage_forecast")
         );
     }
 }
