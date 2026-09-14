@@ -814,6 +814,28 @@ pub struct ScanResult {
     pub entries_seen: i64,
     pub directories: Vec<DirectorySample>,
 }
+/// The scanner stores only root plus at most `max_depth` nested directories.
+/// This computes the bounded aggregation targets for one observed entry without
+/// inspecting every retained directory.
+fn retained_ancestor_paths(root: &Path, path: &Path, max_depth: u8) -> Vec<PathBuf> {
+    let mut result = vec![root.to_path_buf()];
+    let Ok(relative) = path.strip_prefix(root) else {
+        return result;
+    };
+    let mut current = root.to_path_buf();
+    let mut depth = 0_u8;
+    for component in relative.components() {
+        if depth >= max_depth {
+            break;
+        }
+        if let std::path::Component::Normal(part) = component {
+            current.push(part);
+            depth += 1;
+            result.push(current.clone());
+        }
+    }
+    result
+}
 pub fn scan_directory(
     root: &Path,
     mount_id: Option<String>,
@@ -879,6 +901,7 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
     #[allow(clippy::too_many_arguments)]
     fn walk(
         dir: &Path,
+        root: &Path,
         dev: u64,
         depth: u8,
         cfg: &StorageConfig,
@@ -961,23 +984,20 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
                     file_count: 0,
                 });
             }
-            let ancestors: Vec<PathBuf> = dirs
-                .keys()
-                .filter(|p| path.starts_with(p))
-                .cloned()
-                .collect();
-            for a in ancestors {
-                let d = dirs.get_mut(&a).unwrap();
-                d.allocated_bytes += allocated;
-                d.apparent_bytes += apparent;
-                d.entry_count += 1;
-                if !is_dir {
-                    d.file_count += 1
+            for ancestor in retained_ancestor_paths(root, &path, cfg.max_depth) {
+                if let Some(d) = dirs.get_mut(&ancestor) {
+                    d.allocated_bytes += allocated;
+                    d.apparent_bytes += apparent;
+                    d.entry_count += 1;
+                    if !is_dir {
+                        d.file_count += 1
+                    }
                 }
             }
             if is_dir {
                 walk(
                     &path,
+                    root,
                     dev,
                     depth + 1,
                     cfg,
@@ -991,6 +1011,7 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         }
     }
     walk(
+        root,
         root,
         root_dev,
         0,
@@ -2160,7 +2181,7 @@ mod tests {
             current = current.join(name);
             fs::create_dir(&current).unwrap();
         }
-        fs::write(current.join("payload"), vec![7_u8; 4096]).unwrap();
+        fs::write(current.join("payload"), vec![7_u8; 1024 * 1024]).unwrap();
         let scan = scan_directory(
             &root,
             Some("m".into()),
@@ -2181,13 +2202,28 @@ mod tests {
             .iter()
             .find(|x| x.path == root.join("a/b").display().to_string())
             .unwrap();
-        assert!(deepest.apparent_bytes >= 4096);
+        assert!(deepest.apparent_bytes >= 1024 * 1024);
+        assert!(deepest.allocated_bytes >= 1024 * 1024);
         let root_sample = scan
             .directories
             .iter()
             .find(|x| x.path == root.display().to_string())
             .unwrap();
-        assert!(root_sample.apparent_bytes >= 4096);
+        assert!(root_sample.apparent_bytes >= 1024 * 1024);
+    }
+
+    #[test]
+    fn retained_ancestor_lookup_is_bounded_by_max_depth() {
+        let root = Path::new("/data");
+        let path = Path::new("/data/a/b/c/d/file");
+        assert_eq!(
+            retained_ancestor_paths(root, path, 2),
+            vec![
+                PathBuf::from("/data"),
+                PathBuf::from("/data/a"),
+                PathBuf::from("/data/a/b")
+            ]
+        );
     }
 
     #[test]

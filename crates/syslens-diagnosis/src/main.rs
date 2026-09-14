@@ -337,6 +337,11 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
                 let scan_db = db.clone();
                 let scan_config = cfg.storage.clone();
                 scan_worker = Some(thread::spawn(move || {
+                    // Best effort: scans are scheduled separately and should yield CPU
+                    // to interactive monitoring and normal server work.
+                    // SAFETY: affects only this process/thread's scheduler nice value;
+                    // failure is harmless and intentionally ignored.
+                    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
                     for (root, mount_id) in planned {
                         let scan = match mount_id {
                             Some(id) => diagnosis::scan_directory(
