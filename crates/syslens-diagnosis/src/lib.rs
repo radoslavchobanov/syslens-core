@@ -945,6 +945,39 @@ fn state_set(
     tx.execute("INSERT INTO detector_state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,serde_json::to_string(value).map_err(|e|e.to_string())?,now]).map_err(|e|e.to_string())?;
     Ok(())
 }
+fn truncate_text(value: &str, limit: usize) -> String {
+    let mut text = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        text.push('…');
+    }
+    text
+}
+fn canonical_evidence_value(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Some(value.clone())
+        }
+        serde_json::Value::String(text) => {
+            Some(serde_json::Value::String(truncate_text(text, 1024)))
+        }
+        serde_json::Value::Array(values) => Some(serde_json::Value::Array(
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    serde_json::Value::String(text) => {
+                        Some(serde_json::Value::String(truncate_text(text, 256)))
+                    }
+                    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                })
+                .take(16)
+                .collect(),
+        )),
+        serde_json::Value::Object(_) => None,
+    }
+}
 fn bounded_evidence(value: serde_json::Value) -> String {
     const LIMIT: usize = 32 * 1024;
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
@@ -953,18 +986,55 @@ fn bounded_evidence(value: serde_json::Value) -> String {
     }
     // Keep a small, deterministic and always parseable record.  Raw byte
     // truncation can corrupt JSON and make an otherwise durable event useless.
-    let mut keys = match &value {
-        serde_json::Value::Object(object) => object.keys().cloned().collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    keys.sort();
-    serde_json::to_string(&serde_json::json!({
-        "truncated": true,
-        "original_bytes": serialized.len(),
-        "top_level_keys": keys,
-        "limitations": ["evidence exceeded the 32 KiB event limit"],
-    }))
-    .expect("fixed evidence summary serializes")
+    let mut summary = serde_json::Map::new();
+    // These fields make an expired or capped incident understandable without
+    // retaining arbitrary large arrays, paths, or detector internals.
+    const KEYS: &[&str] = &[
+        "conclusion",
+        "detector",
+        "detector_version",
+        "type",
+        "subject",
+        "severity",
+        "mount_id",
+        "mount_point",
+        "process_id",
+        "process_name",
+        "pid",
+        "cgroup_name",
+        "current_used_bytes",
+        "current_used_percent",
+        "current_bytes",
+        "baseline_used_bytes",
+        "baseline_bytes",
+        "change_bytes",
+        "change_percentage_points",
+        "hourly_growth_bytes",
+        "forecast_hours",
+        "measured_at",
+        "timestamp",
+        "start_at",
+        "end_at",
+        "interval_start",
+        "interval_end",
+        "coverage_percent",
+        "limitations",
+    ];
+    if let serde_json::Value::Object(object) = &value {
+        for key in KEYS {
+            if let Some(value) = object.get(*key).and_then(canonical_evidence_value) {
+                summary.insert((*key).to_owned(), value);
+            }
+        }
+    }
+    summary.insert("truncated".into(), serde_json::Value::Bool(true));
+    summary.insert("original_bytes".into(), serde_json::json!(serialized.len()));
+    summary.insert(
+        "limitations".into(),
+        serde_json::json!(["evidence exceeded the 32 KiB event limit"]),
+    );
+    serde_json::to_string(&serde_json::Value::Object(summary))
+        .expect("fixed evidence summary serializes")
 }
 #[allow(clippy::too_many_arguments)] // Detector inputs are deliberately explicit at call sites.
 fn transition(
@@ -1008,6 +1078,14 @@ fn transition(
         .get("normal_since")
         .and_then(|v| v.as_i64())
         .is_some_and(|t| now - t >= cfg.resolve_seconds as i64);
+    let mut evidence = evidence;
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert("detector".into(), serde_json::json!(detector));
+        object.insert("detector_version".into(), serde_json::json!("v1"));
+        object.insert("type".into(), serde_json::json!("detector_evidence"));
+        object.insert("subject".into(), serde_json::json!(subject));
+        object.insert("severity".into(), serde_json::json!(severity));
+    }
     let evidence = bounded_evidence(evidence);
     let emit = |id: String, kind: &str, sev: &str| -> Result<(), String> {
         tx.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES(?,?,?,?,?,?,?)",params![Uuid::new_v4().to_string(),id,kind,sev,now,"v1",evidence]).map_err(|e|e.to_string())?;
@@ -3619,15 +3697,20 @@ mod tests {
 
     #[test]
     fn bounded_evidence_is_valid_json_when_large() {
-        let evidence =
-            bounded_evidence(serde_json::json!({"conclusion":"x", "large": "z".repeat(40 * 1024)}));
+        let evidence = bounded_evidence(serde_json::json!({
+            "conclusion":"host RAM is above baseline",
+            "current_bytes": 1300,
+            "baseline_bytes": 1100,
+            "change_bytes": 200,
+            "large": "z".repeat(40 * 1024),
+        }));
         assert!(evidence.len() < 32 * 1024);
         let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
         assert_eq!(parsed["truncated"], true);
-        assert_eq!(
-            parsed["top_level_keys"],
-            serde_json::json!(["conclusion", "large"])
-        );
+        assert_eq!(parsed["conclusion"], "host RAM is above baseline");
+        assert_eq!(parsed["current_bytes"], 1300);
+        assert_eq!(parsed["baseline_bytes"], 1100);
+        assert_eq!(parsed["change_bytes"], 200);
     }
 
     #[test]

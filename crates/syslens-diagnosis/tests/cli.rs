@@ -49,7 +49,7 @@ fn acknowledgement_json_has_stable_v1_fields() {
         .unwrap();
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["version"], "v1");
+    assert_eq!(value["version"], 1);
     assert_eq!(value["type"], "incident_acknowledgement");
     assert_eq!(value["id"], "i");
     assert_eq!(value["status"], "acknowledged");
@@ -76,8 +76,27 @@ fn watch_json_emits_one_v1_object_per_event() {
     child.kill().unwrap();
     let _ = child.wait();
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(value["version"], "v1");
+    assert_eq!(value["version"], 1);
     assert_eq!(value["type"], "notification_event");
     assert_eq!(value["event"]["cursor"], 1);
     assert_eq!(value["event"]["id"], "e");
+}
+
+#[test]
+fn incident_json_commands_use_versioned_envelopes() {
+    let (_dir, config) = incident_database();
+    let binary = env!("CARGO_BIN_EXE_syslens-diagnosis");
+    for (command, member) in [
+        (vec!["list", "--json"], "incidents"),
+        (vec!["show", "i", "--json"], "incident"),
+        (vec!["events", "--json"], "events"),
+    ] {
+        let mut args = vec!["incidents", "--config", config.to_str().unwrap()];
+        args.extend(command);
+        let output = Command::new(binary).args(args).output().unwrap();
+        assert!(output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value[member].is_array() || value[member].is_object());
+    }
 }

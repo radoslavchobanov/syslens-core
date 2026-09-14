@@ -206,7 +206,15 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
         IncidentCommand::List { json } => {
             let x = diagnosis::list_incidents(&db)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&x).unwrap())
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "version": 1,
+                        "type": "incident_list",
+                        "incidents": x,
+                    }))
+                    .unwrap()
+                )
             } else {
                 for i in x {
                     println!(
@@ -223,7 +231,15 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
                 .find(|x| x.id == id)
                 .ok_or("incident not found")?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&x).unwrap())
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "version": 1,
+                        "type": "incident",
+                        "incident": x,
+                    }))
+                    .unwrap()
+                )
             } else {
                 println!(
                     "{} {} {} {}\n{}",
@@ -243,7 +259,7 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
                 println!(
                     "{}",
                     serde_json::json!({
-                        "version": "v1",
+                        "version": 1,
                         "type": "incident_acknowledgement",
                         "id": id,
                         "acknowledged_at": now,
@@ -256,7 +272,15 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
         IncidentCommand::Events { after, json } => {
             let x = diagnosis::list_events(&db, after)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&x).unwrap())
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "version": 1,
+                        "type": "notification_event_list",
+                        "events": x,
+                    }))
+                    .unwrap()
+                )
             } else {
                 for e in x {
                     println!("{} {} {} {}", e.cursor, e.kind, e.severity, e.incident_id)
@@ -271,7 +295,7 @@ fn incidents(config: PathBuf, command: Option<IncidentCommand>) -> Result<(), St
                     println!(
                         "{}",
                         serde_json::json!({
-                            "version": "v1",
+                            "version": 1,
                             "type": "notification_event",
                             "event": e,
                         })
