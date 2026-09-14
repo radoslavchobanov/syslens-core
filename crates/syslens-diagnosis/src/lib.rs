@@ -4079,4 +4079,137 @@ mod tests {
                 .all(|i| i.detector != "storage_forecast")
         );
     }
+
+    #[test]
+    fn verified_flat_storage_history_recovers_an_open_forecast() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("forecast.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let cfg = DetectionConfig {
+            sustained_seconds: 60,
+            resolve_seconds: 60,
+            storage_warning_percent: 90,
+            storage_critical_percent: 95,
+            ..Default::default()
+        };
+        let add = |c: &mut Connection, timestamp, used| {
+            insert_mounts(
+                c,
+                &[MountSample {
+                    timestamp,
+                    mount_id: "data".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(1000),
+                    free_bytes: Some(1000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let base = 50_000;
+        for hour in 0..73_i64 {
+            add(&mut c, base + hour * 3600, 700 + hour * 2);
+        }
+        let growth_now = base + 72 * 3600;
+        run_detection(&mut c, &cfg, growth_now).unwrap();
+        run_detection(&mut c, &cfg, growth_now + 61).unwrap();
+        assert!(
+            list_incidents(&path)
+                .unwrap()
+                .iter()
+                .any(
+                    |incident| incident.detector == "storage_forecast" && incident.status == "open"
+                )
+        );
+        let flat_start = growth_now + 3600;
+        for hour in 0..73_i64 {
+            add(&mut c, flat_start + hour * 3600, 500);
+        }
+        let flat_now = flat_start + 72 * 3600;
+        run_detection(&mut c, &cfg, flat_now).unwrap();
+        add(&mut c, flat_now + 61, 500);
+        run_detection(&mut c, &cfg, flat_now + 61).unwrap();
+        let incident = list_incidents(&path)
+            .unwrap()
+            .into_iter()
+            .find(|incident| incident.detector == "storage_forecast")
+            .unwrap();
+        assert_eq!(incident.status, "recovered");
+        assert!(
+            list_events(&path, 0, 20)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == "recovered" && event.incident_id == incident.id)
+        );
+    }
+
+    #[test]
+    fn insufficient_gappy_storage_history_does_not_close_open_forecast() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("forecast.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let cfg = DetectionConfig {
+            sustained_seconds: 60,
+            resolve_seconds: 60,
+            storage_warning_percent: 90,
+            storage_critical_percent: 95,
+            ..Default::default()
+        };
+        let add = |c: &mut Connection, timestamp, used| {
+            insert_mounts(
+                c,
+                &[MountSample {
+                    timestamp,
+                    mount_id: "data".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(1000),
+                    free_bytes: Some(1000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let base = 80_000;
+        for hour in 0..73_i64 {
+            add(&mut c, base + hour * 3600, 700 + hour * 2);
+        }
+        let now = base + 72 * 3600;
+        run_detection(&mut c, &cfg, now).unwrap();
+        run_detection(&mut c, &cfg, now + 61).unwrap();
+        let id = list_incidents(&path)
+            .unwrap()
+            .into_iter()
+            .find(|incident| incident.detector == "storage_forecast")
+            .unwrap()
+            .id;
+        let gap_now = now + 8 * 86400;
+        add(&mut c, gap_now, 500);
+        run_detection(&mut c, &cfg, gap_now).unwrap();
+        add(&mut c, gap_now + 61, 500);
+        run_detection(&mut c, &cfg, gap_now + 61).unwrap();
+        let incident = list_incidents(&path)
+            .unwrap()
+            .into_iter()
+            .find(|incident| incident.id == id)
+            .unwrap();
+        assert_eq!(incident.status, "open");
+        assert!(
+            !list_events(&path, 0, 20)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == "recovered" && event.incident_id == id)
+        );
+    }
 }
