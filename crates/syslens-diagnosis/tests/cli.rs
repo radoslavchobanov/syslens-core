@@ -1,7 +1,7 @@
 use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use syslens_diagnosis::{Config, open_db};
+use syslens_diagnosis::{Config, database_sidecar_paths, open_db};
 use tempfile::tempdir;
 
 fn incident_database() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -21,11 +21,9 @@ fn status_reports_unsafe_evidence_permissions_without_repairing_files() {
     std::fs::write(&config, toml::to_string_pretty(&Config::default()).unwrap()).unwrap();
     let db = config.with_extension("sqlite");
     let _conn = open_db(&db).unwrap();
-    let files = [
-        db.clone(),
-        db.with_extension("sqlite-wal"),
-        db.with_extension("sqlite-shm"),
-    ];
+    let files: Vec<_> = std::iter::once(db.clone())
+        .chain(database_sidecar_paths(&db))
+        .collect();
     for file in &files {
         std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
     }

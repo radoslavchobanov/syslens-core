@@ -411,8 +411,8 @@ fn status(config: PathBuf) -> Result<(), String> {
     Ok(())
 }
 fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
-    let cfg = diagnosis::load_config(&config)?;
     diagnosis::secure_config(&config)?;
+    let cfg = diagnosis::load_config(&config)?;
     let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
     let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir())?;
     let mut conn = diagnosis::initialize_db(&db, &cfg)?;

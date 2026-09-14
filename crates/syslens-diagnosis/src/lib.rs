@@ -401,10 +401,7 @@ pub fn initialize_db(path: &Path, config: &Config) -> Result<Connection, String>
 /// WAL/SHM files lazily, so every writer path calls this after a commit too.
 pub fn secure_database_files(path: &Path) -> Result<(), String> {
     secure_file(path, 0o600, "evidence database")?;
-    for sidecar in [
-        path.with_extension("sqlite-wal"),
-        path.with_extension("sqlite-shm"),
-    ] {
+    for sidecar in database_sidecar_paths(path) {
         if sidecar.exists() {
             secure_file(&sidecar, 0o600, "evidence database sidecar")?;
         }
@@ -415,11 +412,7 @@ pub fn secure_database_files(path: &Path) -> Result<(), String> {
 /// Return a non-mutating diagnostic suitable for read-only commands.  Readers
 /// never repair permissions because that could alter evidence unexpectedly.
 pub fn database_permissions_warning(path: &Path) -> Option<String> {
-    for candidate in [
-        path.to_path_buf(),
-        path.with_extension("sqlite-wal"),
-        path.with_extension("sqlite-shm"),
-    ] {
+    for candidate in std::iter::once(path.to_path_buf()).chain(database_sidecar_paths(path)) {
         if !candidate.exists() {
             continue;
         }
@@ -445,6 +438,17 @@ pub fn database_permissions_warning(path: &Path) -> Option<String> {
 
 pub fn is_evidence_permission_error(error: &str) -> bool {
     error.contains("evidence database") || error.contains("evidence database sidecar")
+}
+
+/// SQLite appends these suffixes to the full database filename.  Do not use
+/// `Path::with_extension`: a custom `evidence.db` must use `evidence.db-wal`.
+pub fn database_sidecar_paths(path: &Path) -> [PathBuf; 2] {
+    let append = |suffix: &str| {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    [append("-wal"), append("-shm")]
 }
 
 fn secure_directory(path: &Path) -> Result<(), String> {
@@ -716,15 +720,11 @@ pub fn cleanup(conn: &mut Connection, cutoff: i64) -> Result<usize, String> {
 }
 
 pub fn database_size(path: &Path) -> u64 {
-    [
-        path.to_path_buf(),
-        path.with_extension("sqlite-wal"),
-        path.with_extension("sqlite-shm"),
-    ]
-    .iter()
-    .filter_map(|p| fs::metadata(p).ok())
-    .map(|m| m.len())
-    .sum()
+    std::iter::once(path.to_path_buf())
+        .chain(database_sidecar_paths(path))
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
 }
 pub fn budget_allows(path: &Path, budget: u64) -> bool {
     database_size(path).saturating_add(CONTROL_HEADROOM) <= budget
@@ -2742,11 +2742,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn assert_private_database_files(path: &Path) {
-        for file in [
-            path.to_path_buf(),
-            path.with_extension("sqlite-wal"),
-            path.with_extension("sqlite-shm"),
-        ] {
+        for file in std::iter::once(path.to_path_buf()).chain(database_sidecar_paths(path)) {
             assert!(file.exists(), "{} should exist", file.display());
             assert_eq!(
                 fs::metadata(&file).unwrap().permissions().mode() & 0o777,
@@ -2783,11 +2779,7 @@ mod tests {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
         let _conn = initialize_db(&path, &Config::default()).unwrap();
-        for file in [
-            path.to_path_buf(),
-            path.with_extension("sqlite-wal"),
-            path.with_extension("sqlite-shm"),
-        ] {
+        for file in std::iter::once(path.to_path_buf()).chain(database_sidecar_paths(&path)) {
             fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         }
         let _conn = open_db(&path).unwrap();
@@ -2799,11 +2791,9 @@ mod tests {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
         let _conn = initialize_db(&path, &Config::default()).unwrap();
-        let files = [
-            path.to_path_buf(),
-            path.with_extension("sqlite-wal"),
-            path.with_extension("sqlite-shm"),
-        ];
+        let files: Vec<_> = std::iter::once(path.to_path_buf())
+            .chain(database_sidecar_paths(&path))
+            .collect();
         for file in &files {
             fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
         }
@@ -2827,6 +2817,28 @@ mod tests {
                 file.display()
             );
         }
+    }
+
+    #[test]
+    fn custom_database_name_uses_sqlite_appended_sidecars() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("evidence.db");
+        let mut conn = initialize_db(&path, &Config::default()).unwrap();
+        insert_snapshot(
+            &mut conn,
+            &Snapshot {
+                host: HostSample {
+                    timestamp: 1,
+                    boot_id: "boot".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_private_database_files(&path);
+        assert!(!d.path().join("evidence.sqlite-wal").exists());
+        assert!(!d.path().join("evidence.sqlite-shm").exists());
     }
 
     #[test]
