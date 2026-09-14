@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -53,6 +54,9 @@ pub struct AiConfig {
     /// deliberately not stored in the configuration file.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Permit plaintext HTTP only for an explicitly trusted LAN or loopback IP endpoint.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     #[serde(default = "default_ai_timeout")]
     pub request_timeout_seconds: u64,
 }
@@ -66,6 +70,7 @@ impl Default for AiConfig {
             endpoint_url: None,
             model: None,
             api_key_env: None,
+            allow_insecure_http: false,
             request_timeout_seconds: default_ai_timeout(),
         }
     }
@@ -267,7 +272,7 @@ impl Config {
             return Err("ai.request_timeout_seconds must be between 5 and 120".into());
         }
         if let Some(endpoint) = ai.endpoint_url.as_deref() {
-            validate_ai_endpoint(endpoint)?;
+            validate_ai_endpoint(endpoint, ai.allow_insecure_http)?;
         }
         if let Some(model) = ai.model.as_deref()
             && (model.trim().is_empty() || model.len() > 200)
@@ -298,13 +303,21 @@ fn is_environment_variable_name(value: &str) -> bool {
         })
 }
 
-/// The chat client accepts a generic HTTPS OpenAI-compatible endpoint, but
-/// never embeds credentials in a URL where they could escape in diagnostics.
-pub fn validate_ai_endpoint(value: &str) -> Result<(), String> {
-    if value.len() > 2_048 || !value.starts_with("https://") {
-        return Err("ai.endpoint_url must be an HTTPS URL".into());
+/// The chat client accepts a generic HTTPS OpenAI-compatible endpoint. Plaintext
+/// HTTP is an explicit exception for a trusted LAN or loopback IP endpoint.
+/// Credentials never appear in a URL where they could escape in diagnostics.
+pub fn validate_ai_endpoint(value: &str, allow_insecure_http: bool) -> Result<(), String> {
+    if value.len() > 2_048 {
+        return Err("ai.endpoint_url is too long".into());
     }
-    let authority = value[8..].split('/').next().unwrap_or_default();
+    let (scheme, rest) = if let Some(rest) = value.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = value.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return Err("ai.endpoint_url must be an HTTPS URL".into());
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
     if authority.is_empty()
         || authority.contains('@')
         || authority.contains(char::is_whitespace)
@@ -312,7 +325,61 @@ pub fn validate_ai_endpoint(value: &str) -> Result<(), String> {
     {
         return Err("ai.endpoint_url must not contain embedded credentials or whitespace".into());
     }
+    if scheme == "http" {
+        if !allow_insecure_http {
+            return Err(
+                "ai.endpoint_url must be an HTTPS URL unless ai.allow_insecure_http is true".into(),
+            );
+        }
+        let address = endpoint_ip_address(authority)?;
+        if !is_trusted_lan_address(address) {
+            return Err("plaintext ai.endpoint_url must use a loopback, private, or link-local LAN IP address".into());
+        }
+    }
     Ok(())
+}
+
+fn endpoint_ip_address(authority: &str) -> Result<IpAddr, String> {
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, suffix) = bracketed
+            .split_once(']')
+            .ok_or("plaintext ai.endpoint_url must use a valid IP address")?;
+        if !suffix.is_empty() {
+            let port = suffix
+                .strip_prefix(':')
+                .ok_or("plaintext ai.endpoint_url must use a valid IP address")?;
+            port.parse::<u16>()
+                .map_err(|_| "plaintext ai.endpoint_url must use a valid IP address")?;
+        }
+        host
+    } else if let Ok(address) = authority.parse::<Ipv4Addr>() {
+        return Ok(IpAddr::V4(address));
+    } else if let Some((host, port)) = authority.split_once(':') {
+        port.parse::<u16>()
+            .map_err(|_| "plaintext ai.endpoint_url must use a valid IP address")?;
+        host
+    } else {
+        return Err("plaintext ai.endpoint_url must use an IP address, not a hostname".into());
+    };
+    host.parse::<IpAddr>()
+        .map_err(|_| "plaintext ai.endpoint_url must use a valid IP address".into())
+}
+
+fn is_trusted_lan_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, ..] = address.octets();
+            address.is_loopback()
+                || first == 10
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+                || (first == 169 && second == 254)
+        }
+        IpAddr::V6(address) => {
+            let first = address.segments()[0];
+            address.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 pub fn config_path() -> PathBuf {
@@ -2986,19 +3053,17 @@ fn bounded_chat_evidence(result: Result<Value, String>) -> Value {
 }
 
 fn redact_endpoint(endpoint: &str) -> String {
-    let authority = endpoint
-        .strip_prefix("https://")
-        .unwrap_or("configured endpoint")
-        .split('/')
-        .next()
-        .unwrap_or("configured endpoint");
-    format!("https://{authority}/…")
+    let (scheme, remainder) = endpoint
+        .split_once("://")
+        .unwrap_or(("https", "configured endpoint"));
+    let authority = remainder.split('/').next().unwrap_or("configured endpoint");
+    format!("{scheme}://{authority}/…")
 }
 
-fn ai_http_agent(timeout: u64) -> ureq::Agent {
+fn ai_http_agent(timeout: u64, allow_insecure_http: bool) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(StdDuration::from_secs(timeout)))
-        .https_only(true)
+        .https_only(!allow_insecure_http)
         .max_redirects(0)
         .build()
         .into()
@@ -3010,7 +3075,7 @@ fn send_chat_request(config: &AiConfig, request: &Value) -> Result<Value, String
         .as_deref()
         .ok_or("AI chat is enabled but no endpoint is configured")?;
     let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let agent = ai_http_agent(config.request_timeout_seconds);
+    let agent = ai_http_agent(config.request_timeout_seconds, config.allow_insecure_http);
     let mut builder = agent
         .post(endpoint)
         .header("content-type", "application/json")
@@ -3182,10 +3247,52 @@ mod tests {
     fn chat_is_default_disabled_and_rejects_unsafe_endpoint_configuration() {
         let config = Config::default();
         assert!(!config.ai.enabled);
+        assert!(!config.ai.allow_insecure_http);
         assert!(config.validate().is_ok());
-        assert!(validate_ai_endpoint("http://localhost/v1/chat/completions").is_err());
-        assert!(validate_ai_endpoint("https://token@example.test/v1/chat/completions").is_err());
-        assert!(validate_ai_endpoint("https://example.test/v1/chat/completions?key=x").is_err());
+        assert!(validate_ai_endpoint("http://127.0.0.1/v1/chat/completions", false).is_err());
+        assert!(
+            validate_ai_endpoint("https://token@example.test/v1/chat/completions", false).is_err()
+        );
+        assert!(
+            validate_ai_endpoint("https://example.test/v1/chat/completions?key=x", false).is_err()
+        );
+    }
+
+    #[test]
+    fn chat_allows_explicit_trusted_lan_http_endpoints_only() {
+        for endpoint in [
+            "http://127.0.0.1/v1/chat/completions",
+            "http://10.0.0.1/v1/chat/completions",
+            "http://172.16.0.1/v1/chat/completions",
+            "http://192.168.0.1/v1/chat/completions",
+            "http://169.254.1.1/v1/chat/completions",
+            "http://[::1]/v1/chat/completions",
+            "http://[fd00::1]:8080/v1/chat/completions",
+            "http://[fe80::1]/v1/chat/completions",
+        ] {
+            assert!(validate_ai_endpoint(endpoint, true).is_ok(), "{endpoint}");
+        }
+        for endpoint in [
+            "http://example.test/v1/chat/completions",
+            "http://8.8.8.8/v1/chat/completions",
+            "http://172.15.0.1/v1/chat/completions",
+            "http://172.32.0.1/v1/chat/completions",
+            "http://192.169.0.1/v1/chat/completions",
+            "http://[2001:db8::1]/v1/chat/completions",
+            "http://token@127.0.0.1/v1/chat/completions",
+            "http://127.0.0.1/v1/chat/completions?key=x",
+        ] {
+            assert!(validate_ai_endpoint(endpoint, true).is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn chat_config_requires_http_opt_in_before_accepting_a_lan_endpoint() {
+        let mut config = Config::default();
+        config.ai.endpoint_url = Some("http://127.0.0.1/v1/chat/completions".into());
+        assert!(config.validate().is_err());
+        config.ai.allow_insecure_http = true;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -3220,10 +3327,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_http_client_never_follows_or_downgrades_redirects() {
-        let agent = ai_http_agent(20);
-        assert!(agent.config().https_only());
-        assert_eq!(agent.config().max_redirects(), 0);
+    fn chat_http_client_requires_https_by_default_and_never_follows_redirects() {
+        let secure_agent = ai_http_agent(20, false);
+        assert!(secure_agent.config().https_only());
+        assert_eq!(secure_agent.config().max_redirects(), 0);
+        let trusted_lan_agent = ai_http_agent(20, true);
+        assert!(!trusted_lan_agent.config().https_only());
+        assert_eq!(trusted_lan_agent.config().max_redirects(), 0);
     }
 
     #[test]

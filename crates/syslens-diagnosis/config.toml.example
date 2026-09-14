@@ -9,6 +9,8 @@ database_budget_bytes = 17179869184
 # The endpoint client is opt-in. It never installs or starts a local model.
 enabled = false
 # endpoint_url = "https://ai.example.net/v1/chat/completions"
+# Plaintext HTTP is disabled by default. Set this only for a trusted LAN/loopback IP endpoint.
+allow_insecure_http = false
 # model = "your-compatible-model"
 # api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
 request_timeout_seconds = 20

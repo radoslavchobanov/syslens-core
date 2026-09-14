@@ -261,6 +261,8 @@ the owner-only diagnosis configuration created by `enable`:
 [ai]
 enabled = true
 endpoint_url = "https://ai.example.net/v1/chat/completions"
+# Default false. Set true only for a trusted LAN/loopback IP endpoint using HTTP.
+allow_insecure_http = false
 model = "your-compatible-model"
 # Optional: bearer token is read from this environment variable, never TOML.
 api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
@@ -270,6 +272,12 @@ request_timeout_seconds = 20
 [`crates/syslens-diagnosis/config.toml.example`](crates/syslens-diagnosis/config.toml.example)
 is a minimal equivalent example. Do not place this `[ai]` section in the Core
 MQTT configuration.
+
+HTTPS is required by default. A separately supplied lightweight model service on
+a trusted LAN or loopback address may use plaintext HTTP only after explicitly
+setting `allow_insecure_http = true`; HTTP hostnames and public IPs remain
+rejected. HTTP exposes prompts and responses to anyone able to observe that
+network, so use it only on a network you trust. Redirects remain disabled.
 
 `syslens-diagnosis chat "question"` sends the question and a fixed capability
 description first. The endpoint can then request only validated, read-only
