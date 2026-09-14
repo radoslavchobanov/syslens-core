@@ -82,6 +82,7 @@ fn main() -> ExitCode {
             {
                 Ok(()) => {
                     println!("syslens-diagnosis enabled; recording uses {}", db.display());
+                    warn_if_linger_disabled();
                     Ok(())
                 }
                 Err(e) => Err(format!(
@@ -129,6 +130,25 @@ fn main() -> ExitCode {
         }
     }
 }
+fn warn_if_linger_disabled() {
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let linger = Command::new("loginctl")
+        .args(["show-user", &uid, "-p", "Linger", "--value"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .to_ascii_lowercase()
+        });
+    if linger.as_deref() != Some("yes") {
+        let user = std::env::var("USER").unwrap_or_else(|_| "<your-user>".into());
+        eprintln!(
+            "Warning: systemd user services may stop after logout because lingering is not enabled. To keep diagnosis recording, run: loginctl enable-linger {user}"
+        );
+    }
+}
 fn status(config: PathBuf) -> Result<(), String> {
     if !config.exists() {
         println!(
@@ -162,12 +182,19 @@ fn status(config: PathBuf) -> Result<(), String> {
         .ok()
         .map(|x| String::from_utf8_lossy(&x.stdout).trim() == "active")
         .unwrap_or(false);
+    let paused = !diagnosis::budget_allows(&db, cfg.database_budget_bytes)
+        || !diagnosis::filesystem_has_reserve(&db);
     println!(
-        "syslens-diagnosis: service={}\nconfig={}\ndatabase={} ({} bytes)\ninterval={}s retention={}d budget={} bytes\nhost samples={} earliest={:?} latest={:?}",
+        "syslens-diagnosis: service={} recording={}\nconfig={}\ndatabase={} ({} bytes)\ninterval={}s retention={}d budget={} bytes\nhost samples={} earliest={:?} latest={:?}",
         if active {
             "active"
         } else {
             "inactive or unavailable"
+        },
+        if paused {
+            "paused: budget or filesystem reserve"
+        } else {
+            "ready"
         },
         config.display(),
         db.display(),
@@ -188,16 +215,16 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
     let mut conn = diagnosis::initialize_db(&db, &cfg)?;
     let collector = diagnosis::Collector::new(PathBuf::from("/proc"));
     loop {
+        let cutoff = diagnosis::unix_now() - i64::from(cfg.retention_days) * 86400;
+        if let Err(e) = diagnosis::housekeeping(&mut conn, cutoff, diagnosis::unix_now()) {
+            eprintln!("syslens-diagnosis: retention housekeeping failed: {e}")
+        }
         if diagnosis::budget_allows(&db, cfg.database_budget_bytes)
             && diagnosis::filesystem_has_reserve(&db)
         {
             let snap = collector.collect(diagnosis::unix_now());
             if let Err(e) = diagnosis::insert_snapshot(&mut conn, &snap) {
                 eprintln!("syslens-diagnosis: collection write failed: {e}")
-            }
-            let cutoff = diagnosis::unix_now() - i64::from(cfg.retention_days) * 86400;
-            if let Err(e) = diagnosis::cleanup(&mut conn, cutoff) {
-                eprintln!("syslens-diagnosis: retention cleanup failed: {e}")
             }
         } else {
             eprintln!(

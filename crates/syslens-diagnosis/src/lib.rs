@@ -245,6 +245,8 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if v == SCHEMA_VERSION {
         return Ok(());
     }
+    conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+        .map_err(|e| e.to_string())?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE host_samples (timestamp INTEGER PRIMARY KEY, boot_id TEXT NOT NULL, duration_ms INTEGER NOT NULL, status TEXT NOT NULL, mem_total INTEGER, mem_available INTEGER, mem_free INTEGER, buffers INTEGER, cached INTEGER, slab INTEGER, swap_total INTEGER, swap_free INTEGER, psi_some REAL, psi_full REAL);
@@ -357,14 +359,34 @@ fn insert_snapshot_tx(tx: &Transaction<'_>, s: &Snapshot) -> Result<(), String> 
     }
     Ok(())
 }
-pub fn cleanup(conn: &mut Connection, cutoff: i64) -> Result<usize, String> {
+pub fn housekeeping(conn: &mut Connection, cutoff: i64, now: i64) -> Result<usize, String> {
+    let next: i64 = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='next_housekeeping'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0);
+    if now < next {
+        return Ok(0);
+    }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let count = tx
-        .execute("DELETE FROM host_samples WHERE timestamp < ?", [cutoff])
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS expired_identity_ids(id INTEGER PRIMARY KEY); DELETE FROM expired_identity_ids;").map_err(|e|e.to_string())?;
+    tx.execute("INSERT OR IGNORE INTO expired_identity_ids SELECT DISTINCT identity_id FROM process_samples WHERE timestamp < ? LIMIT 10000",[cutoff]).map_err(|e|e.to_string())?;
+    let count=tx.execute("DELETE FROM host_samples WHERE timestamp IN (SELECT timestamp FROM host_samples WHERE timestamp < ? LIMIT 10000)", [cutoff])
         .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM process_identities WHERE NOT EXISTS (SELECT 1 FROM process_samples WHERE process_samples.identity_id=process_identities.id)", []).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM process_identities WHERE id IN (SELECT id FROM expired_identity_ids) AND NOT EXISTS (SELECT 1 FROM process_samples WHERE process_samples.identity_id=process_identities.id)", []).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO metadata(key,value) VALUES('next_housekeeping',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(now+3600).to_string()]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA incremental_vacuum(1000); PRAGMA wal_checkpoint(PASSIVE);")
+        .map_err(|e| e.to_string())?;
     Ok(count)
+}
+pub fn cleanup(conn: &mut Connection, cutoff: i64) -> Result<usize, String> {
+    housekeeping(conn, cutoff, i64::MAX / 2)
 }
 
 pub fn database_size(path: &Path) -> u64 {
@@ -621,8 +643,8 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
     if compare != "previous-week" {
         return Err("only --compare previous-week is supported".into());
     };
-    let cend = start - Duration::days(7);
-    let cstart = cend - duration;
+    let cstart = start - Duration::days(7);
+    let cend = end - Duration::days(7);
     let count = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
         conn.query_row(
             "SELECT count(*) FROM host_samples WHERE timestamp>=? AND timestamp<=? AND mem_total IS NOT NULL AND mem_available IS NOT NULL",
@@ -925,7 +947,7 @@ mod tests {
         let now = unix_now();
         for i in 0..12 {
             for (timestamp, rss) in [
-                (now - 7 * 86_400 - 3600 - i * 300 - 60, 11 * 1024 * 1024),
+                (now - 7 * 86_400 - 3600 + i * 300 + 60, 11 * 1024 * 1024),
                 (now - i * 300 - 60, 13 * 1024 * 1024),
             ] {
                 let snapshot = Snapshot {
@@ -1061,6 +1083,45 @@ mod tests {
     }
 
     #[test]
+    fn housekeeping_is_hourly_batched_and_removes_expired_identity() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let snapshot = Snapshot {
+            host: HostSample {
+                timestamp: 1,
+                boot_id: "b".into(),
+                ..Default::default()
+            },
+            processes: vec![ProcessSample {
+                pid: 1,
+                start_ticks: 1,
+                name: "old".into(),
+                executable: None,
+                uid: None,
+                cgroup_name: None,
+                rss_anon: None,
+                rss_file: None,
+                rss_shmem: None,
+                rss_total: None,
+                cpu_ticks: None,
+                read_bytes: None,
+                write_bytes: None,
+            }],
+            gaps: vec![],
+        };
+        insert_snapshot(&mut c, &snapshot).unwrap();
+        assert_eq!(housekeeping(&mut c, 2, 100).unwrap(), 1);
+        assert_eq!(housekeeping(&mut c, 2, 101).unwrap(), 0);
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM process_identities", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn sparse_history_is_insufficient_evidence() {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
@@ -1102,7 +1163,7 @@ mod tests {
         for i in 0..12 {
             for (timestamp, valid) in [
                 (now - i * 300 - 60, false),
-                (now - 7 * 86400 - 3600 - i * 300 - 60, true),
+                (now - 7 * 86400 - 3600 + i * 300 + 60, true),
             ] {
                 insert_snapshot(
                     &mut c,

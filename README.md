@@ -242,6 +242,10 @@ stored local intervals and names observed process growth; it clearly reports
 insufficient coverage below 80% in either interval and never claims RssAnon is USS/private memory. `chat`
 and `incidents` remain unavailable in this release.
 
+`enable` checks user-service lingering. If it reports that lingering is off,
+the collector will stop after logout; enable it explicitly with
+`loginctl enable-linger $USER` when continuous home-server recording is wanted.
+
 Core forwards `syslens diagnose ...`, `syslens chat`, and `syslens incidents
 ...` to the companion on the same host when installed. Core-only installations
 create no diagnosis state or background work.
