@@ -821,6 +821,15 @@ pub fn scan_directory(
     now: i64,
 ) -> ScanResult {
     let start = std::time::Instant::now();
+    scan_directory_with_elapsed(root, mount_id, cfg, now, || start.elapsed())
+}
+pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
+    root: &Path,
+    mount_id: Option<String>,
+    cfg: &StorageConfig,
+    now: i64,
+    elapsed: F,
+) -> ScanResult {
     let root_s = root.display().to_string();
     let root_meta = match fs::symlink_metadata(root) {
         Ok(x) => x,
@@ -870,7 +879,7 @@ pub fn scan_directory(
         dev: u64,
         depth: u8,
         cfg: &StorageConfig,
-        start: &std::time::Instant,
+        elapsed: &dyn Fn() -> StdDuration,
         seen: &mut HashSet<(u64, u64)>,
         entries: &mut u64,
         dirs: &mut BTreeMap<PathBuf, DirectorySample>,
@@ -879,7 +888,7 @@ pub fn scan_directory(
         if reason.is_some() {
             return;
         }
-        if start.elapsed().as_secs() >= cfg.max_duration_seconds {
+        if elapsed().as_secs() >= cfg.max_duration_seconds {
             *reason = Some("scan duration limit reached".into());
             return;
         }
@@ -898,7 +907,7 @@ pub fn scan_directory(
                 *reason = Some("scan entry limit reached".into());
                 break;
             }
-            if start.elapsed().as_secs() >= cfg.max_duration_seconds {
+            if elapsed().as_secs() >= cfg.max_duration_seconds {
                 *reason = Some("scan duration limit reached".into());
                 break;
             };
@@ -967,7 +976,7 @@ pub fn scan_directory(
                     dev,
                     depth + 1,
                     cfg,
-                    start,
+                    elapsed,
                     seen,
                     entries,
                     dirs,
@@ -981,13 +990,13 @@ pub fn scan_directory(
         root_dev,
         0,
         cfg,
-        &start,
+        &elapsed,
         &mut seen,
         &mut entries,
         &mut directories,
         &mut reason,
     );
-    let ended = now + start.elapsed().as_secs() as i64;
+    let ended = now + elapsed().as_secs() as i64;
     ScanResult {
         root: root_s,
         mount_id,
@@ -1544,6 +1553,35 @@ pub fn diagnose_storage(
             .parent()
             .is_some_and(|p| p == Path::new(&d.root))
     });
+    // Explicit roots may overlap.  Attribute only the broadest root for each
+    // mount; nested roots remain recorded for status but never contribute a
+    // second, overlapping directory total.
+    let mut roots_by_mount: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for d in &candidates {
+        roots_by_mount
+            .entry(d.mount_id.clone())
+            .or_default()
+            .push(PathBuf::from(&d.root));
+    }
+    for roots in roots_by_mount.values_mut() {
+        roots.sort_by_key(|p| p.components().count());
+        roots.dedup();
+        let mut selected = Vec::new();
+        for root in roots.iter() {
+            if !selected
+                .iter()
+                .any(|outer: &PathBuf| root.starts_with(outer))
+            {
+                selected.push(root.clone());
+            }
+        }
+        *roots = selected;
+    }
+    candidates.retain(|d| {
+        roots_by_mount
+            .get(&d.mount_id)
+            .is_some_and(|roots| roots.iter().any(|root| root == Path::new(&d.root)))
+    });
     candidates.sort_by_key(|b| std::cmp::Reverse(b.allocated_bytes_change));
     let directories: Vec<_> = candidates.into_iter().take(20).collect();
     for mount in &mut mounts {
@@ -1552,9 +1590,10 @@ pub fn diagnose_storage(
             .filter(|d| d.mount_id == mount.mount_id)
             .map(|d| d.allocated_bytes_change)
             .sum();
-        mount.unexplained_bytes = mount
-            .used_bytes_change
-            .saturating_sub(mount.attributable_bytes);
+        mount.unexplained_bytes = mount.used_bytes_change - mount.attributable_bytes;
+        if mount.used_bytes_change > 0 && mount.attributable_bytes > mount.used_bytes_change {
+            limits.push(format!("Directory allocation growth on {} exceeds mount used-byte growth; filesystem allocation accounting differs, so the negative unexplained value is reported without claiming a cause.", mount.mount_point));
+        }
     }
     if directories.is_empty() {
         limits.push("No pair of complete, comparable directory scans was retained; mount growth cannot yet be attributed to a path.".into())
@@ -2185,6 +2224,30 @@ mod tests {
     }
 
     #[test]
+    fn injected_elapsed_time_marks_a_real_tree_scan_partial() {
+        let d = tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), "x").unwrap();
+        let scan = scan_directory_with_elapsed(
+            &root,
+            Some("m".into()),
+            &StorageConfig {
+                max_duration_seconds: 5,
+                ..Default::default()
+            },
+            1,
+            || StdDuration::from_secs(5),
+        );
+        assert_eq!(scan.status, "partial");
+        assert!(scan.reason.as_deref().unwrap().contains("duration"));
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        insert_scan(&mut c, &scan).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM collection_gaps WHERE reason LIKE 'storage_scan:%:duration_limit'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
     fn storage_diagnosis_requires_complete_comparable_scans() {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
@@ -2307,6 +2370,98 @@ mod tests {
                 .status,
             "insufficient evidence"
         );
+    }
+
+    #[test]
+    fn storage_without_baseline_is_insufficient_evidence() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        insert_mounts(
+            &mut c,
+            &[MountSample {
+                timestamp: now - 60,
+                mount_id: "m".into(),
+                mount_point: "/data".into(),
+                fs_type: "ext4".into(),
+                total_bytes: Some(100),
+                free_bytes: Some(80),
+                used_bytes: Some(20),
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            diagnose_storage(&path, "1h", "previous-week")
+                .unwrap()
+                .status,
+            "insufficient evidence"
+        );
+    }
+
+    #[test]
+    fn overlapping_explicit_roots_do_not_double_count_and_unexplained_is_visible() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (time, used, base, child) in [
+            (now - 7 * 86400 - 60, 10_i64, 0_i64, 0_i64),
+            (now - 60, 20_i64, 8_i64, 5_i64),
+        ] {
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp: time,
+                    mount_id: "m".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100),
+                    free_bytes: Some(100 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+            for (root, dir, size) in [("/data", "/data/a", base), ("/data/a", "/data/a/x", child)] {
+                insert_scan(
+                    &mut c,
+                    &ScanResult {
+                        root: root.into(),
+                        mount_id: Some("m".into()),
+                        started_at: time,
+                        ended_at: time,
+                        status: "complete".into(),
+                        reason: None,
+                        entries_seen: 1,
+                        directories: vec![DirectorySample {
+                            path: dir.into(),
+                            allocated_bytes: size,
+                            apparent_bytes: size,
+                            entry_count: 1,
+                            file_count: 1,
+                        }],
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.directories.len(), 1);
+        assert_eq!(out.directories[0].path, "/data/a");
+        assert_eq!(out.mounts[0].attributable_bytes, 8);
+        assert_eq!(out.mounts[0].unexplained_bytes, 2);
+        let text = render_storage_diagnosis(&out);
+        assert!(text.contains("unexplained"));
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["mounts"][0]["unexplained_bytes"], 2);
     }
 
     #[test]
