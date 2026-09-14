@@ -1,6 +1,7 @@
 use std::io::BufRead;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use syslens_diagnosis::open_db;
+use syslens_diagnosis::{Config, open_db};
 use tempfile::tempdir;
 
 fn incident_database() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -11,6 +12,36 @@ fn incident_database() -> (tempfile::TempDir, std::path::PathBuf) {
     c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES('i','d','s','warning','open',1,1,'{}')", []).unwrap();
     c.execute("INSERT INTO notification_events(id,incident_id,kind,severity,created_at,detector_version,evidence_json) VALUES('e','i','opened','warning',1,'v1','{}')", []).unwrap();
     (dir, config)
+}
+
+#[test]
+fn status_reports_unsafe_evidence_permissions_without_repairing_files() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("diagnosis.toml");
+    std::fs::write(&config, toml::to_string_pretty(&Config::default()).unwrap()).unwrap();
+    let db = config.with_extension("sqlite");
+    let _conn = open_db(&db).unwrap();
+    let files = [
+        db.clone(),
+        db.with_extension("sqlite-wal"),
+        db.with_extension("sqlite-shm"),
+    ];
+    for file in &files {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .args(["status", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unsafe evidence permissions"));
+    for file in files {
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
 }
 
 #[test]

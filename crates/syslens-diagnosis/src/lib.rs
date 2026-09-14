@@ -2286,8 +2286,7 @@ pub struct ProcessFinding {
 }
 type MemoryAverages = (Option<f64>, Option<f64>, Option<f64>);
 pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagnosis, String> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("cannot open evidence database: {e}"))?;
+    let conn = open_readonly(path)?;
     let now = Utc::now();
     let (start, end) = parse_interval(since, now)?;
     let duration = end - start;
@@ -2493,8 +2492,7 @@ pub fn diagnose_storage(
     since: &str,
     compare: &str,
 ) -> Result<StorageDiagnosis, String> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("cannot open evidence database: {e}"))?;
+    let conn = open_readonly(path)?;
     let now = Utc::now();
     let (start, end) = parse_interval(since, now)?;
     if compare != "previous-week" {
@@ -2794,6 +2792,41 @@ mod tests {
         }
         let _conn = open_db(&path).unwrap();
         assert_private_database_files(&path);
+    }
+
+    #[test]
+    fn read_only_diagnoses_reject_unsafe_evidence_without_repairing_it() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let _conn = initialize_db(&path, &Config::default()).unwrap();
+        let files = [
+            path.to_path_buf(),
+            path.with_extension("sqlite-wal"),
+            path.with_extension("sqlite-shm"),
+        ];
+        for file in &files {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let memory_error = match diagnose_memory(&path, "today", "previous-week") {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe evidence unexpectedly produced a memory diagnosis"),
+        };
+        let storage_error = match diagnose_storage(&path, "today", "previous-week") {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe evidence unexpectedly produced a storage diagnosis"),
+        };
+        for error in [memory_error, storage_error] {
+            assert!(error.contains("unsafe evidence permissions"), "{error}");
+        }
+        for file in files {
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "read-only diagnosis must not repair {}",
+                file.display()
+            );
+        }
     }
 
     #[test]

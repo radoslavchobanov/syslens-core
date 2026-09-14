@@ -354,7 +354,10 @@ fn status(config: PathBuf) -> Result<(), String> {
         );
         return Ok(());
     }
-    let permission_warning = diagnosis::database_permissions_warning(&db);
+    if let Some(warning) = diagnosis::database_permissions_warning(&db) {
+        println!("syslens-diagnosis: warning: unsafe evidence permissions: {warning}");
+        return Ok(());
+    }
     let conn =
         rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| e.to_string())?;
@@ -405,9 +408,6 @@ fn status(config: PathBuf) -> Result<(), String> {
         event_count,
         last_detection
     );
-    if let Some(warning) = permission_warning {
-        println!("warning: unsafe evidence permissions: {warning}");
-    }
     Ok(())
 }
 fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
