@@ -231,6 +231,7 @@ syslens-diagnosis status
 syslens-diagnosis enable
 syslens-diagnosis disable
 syslens-diagnosis diagnose memory --since today --compare previous-week
+syslens-diagnosis diagnose storage --since 7d --compare previous-week
 syslens diagnose memory --since 7d
 ```
 
@@ -241,6 +242,19 @@ RssAnon/RSS and CPU/I/O counters every 30 seconds. `diagnose memory` compares
 stored local intervals and names observed process growth; it clearly reports
 insufficient coverage below 80% in either interval and never claims RssAnon is USS/private memory. `chat`
 and `incidents` remain unavailable in this release.
+
+The add-on also records local writable mount capacity and inode counters every
+collection interval. It scans eligible local mount roots at startup and then
+hourly by default, retaining directory summaries to four levels. Directory
+paths remain only in the host-local SQLite database. The unprivileged scanner
+does not follow symlinks or cross mount boundaries, applies configured time and
+entry budgets, and marks permission-limited or partial scans as incomplete.
+`diagnose storage` only attributes growth to a path when two complete scans are
+comparable; it can prove mount growth without guessing a path or process cause.
+The optional `[storage]` configuration accepts `scan_interval_seconds` (300 to
+86400), `max_depth` (1 to 8), `max_entries` (1000 to 10000000),
+`max_duration_seconds` (5 to 3600), and an explicit `roots` list that replaces
+the default eligible-mount selection.
 
 `enable` checks user-service lingering. If it reports that lingering is off,
 the collector will stop after logout; enable it explicitly with

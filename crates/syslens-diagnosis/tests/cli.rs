@@ -9,3 +9,13 @@ fn help_lists_local_memory_diagnosis() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("previous-week"));
 }
+
+#[test]
+fn help_lists_local_storage_diagnosis() {
+    let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .args(["diagnose", "storage", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("previous-week"));
+}

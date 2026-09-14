@@ -50,6 +50,14 @@ enum Diagnose {
         #[arg(long)]
         json: bool,
     },
+    Storage {
+        #[arg(long, default_value = "today")]
+        since: String,
+        #[arg(long, default_value = "previous-week")]
+        compare: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 fn service(args: &[&str]) -> Result<(), String> {
     let status = Command::new("systemctl")
@@ -119,6 +127,32 @@ fn main() -> ExitCode {
                 Err(e) => Err(e),
             }
         }
+        CommandLine::Diagnose {
+            config,
+            resource:
+                Diagnose::Storage {
+                    since,
+                    compare,
+                    json,
+                },
+        } => {
+            let config = config.unwrap_or_else(diagnosis::config_path);
+            match diagnosis::diagnose_storage(
+                &diagnosis::database_path_for_config(&config),
+                &since,
+                &compare,
+            ) {
+                Ok(d) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&d).unwrap())
+                    } else {
+                        print!("{}", diagnosis::render_storage_diagnosis(&d))
+                    };
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         CommandLine::Chat => Err("chat is not available yet; use `syslens diagnose memory`".into()),
         CommandLine::Incidents => Err("incidents are not available yet".into()),
     };
@@ -176,6 +210,7 @@ fn status(config: PathBuf) -> Result<(), String> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|e| e.to_string())?;
+    let (mount_count, scan_count, last_scan, partial_scans, unavailable_mounts): (i64, i64, Option<i64>, i64, i64) = conn.query_row("SELECT (SELECT count(DISTINCT mount_id) FROM mount_samples), (SELECT count(*) FROM storage_scans), (SELECT max(ended_at) FROM storage_scans), (SELECT count(*) FROM storage_scans WHERE status!='complete'), (SELECT count(*) FROM mount_samples WHERE timestamp=(SELECT max(timestamp) FROM mount_samples) AND capability='unavailable')", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e| e.to_string())?;
     let active = Command::new("systemctl")
         .args(["--user", "is-active", "syslens-diagnosis.service"])
         .output()
@@ -185,7 +220,7 @@ fn status(config: PathBuf) -> Result<(), String> {
     let paused = !diagnosis::budget_allows(&db, cfg.database_budget_bytes)
         || !diagnosis::filesystem_has_reserve(&db);
     println!(
-        "syslens-diagnosis: service={} recording={}\nconfig={}\ndatabase={} ({} bytes)\ninterval={}s retention={}d budget={} bytes\nhost samples={} earliest={:?} latest={:?}",
+        "syslens-diagnosis: service={} recording={}\nconfig={}\ndatabase={} ({} bytes)\ninterval={}s retention={}d budget={} bytes\nhost samples={} earliest={:?} latest={:?}\nmounts={} scans={} last_scan={:?} incomplete_scans={} unavailable_mounts={}",
         if active {
             "active"
         } else {
@@ -204,7 +239,12 @@ fn status(config: PathBuf) -> Result<(), String> {
         cfg.database_budget_bytes,
         count,
         first,
-        last
+        last,
+        mount_count,
+        scan_count,
+        last_scan,
+        partial_scans,
+        unavailable_mounts
     );
     Ok(())
 }
@@ -214,7 +254,15 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
     let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir())?;
     let mut conn = diagnosis::initialize_db(&db, &cfg)?;
     let collector = diagnosis::Collector::new(PathBuf::from("/proc"));
+    let mut scan_worker: Option<thread::JoinHandle<()>> = None;
     loop {
+        if scan_worker
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+            && let Some(worker) = scan_worker.take()
+        {
+            let _ = worker.join();
+        }
         let cutoff = diagnosis::unix_now() - i64::from(cfg.retention_days) * 86400;
         let now = diagnosis::unix_now();
         let deleted = match diagnosis::housekeeping(&mut conn, cutoff, now) {
@@ -243,6 +291,68 @@ fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
             let snap = collector.collect(diagnosis::unix_now());
             if let Err(e) = diagnosis::insert_snapshot(&mut conn, &snap) {
                 eprintln!("syslens-diagnosis: collection write failed: {e}")
+            }
+            let (mounts, mount_gaps) =
+                diagnosis::collect_mounts(&diagnosis::LinuxFilesystemReader, diagnosis::unix_now());
+            if let Err(e) = diagnosis::insert_mounts(&mut conn, &mounts) {
+                eprintln!("syslens-diagnosis: mount collection write failed: {e}")
+            }
+            if !mount_gaps.is_empty() {
+                eprintln!("syslens-diagnosis: {}", mount_gaps.join("; "));
+                if let Err(e) =
+                    diagnosis::insert_collection_gaps(&mut conn, diagnosis::unix_now(), &mount_gaps)
+                {
+                    eprintln!("syslens-diagnosis: mount gap write failed: {e}")
+                }
+            }
+            let next_scan: i64 = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='next_storage_scan'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if diagnosis::unix_now() >= next_scan && scan_worker.is_none() {
+                let roots = cfg.storage.roots.clone().unwrap_or_else(|| {
+                    mounts
+                        .iter()
+                        .filter(|m| m.capability == "available" && !m.read_only)
+                        .map(|m| PathBuf::from(&m.mount_point))
+                        .collect()
+                });
+                let planned: Vec<_> = roots
+                    .into_iter()
+                    .map(|root| {
+                        let mount_id = mounts
+                            .iter()
+                            .find(|m| std::path::Path::new(&m.mount_point) == root)
+                            .map(|m| m.mount_id.clone());
+                        (root, mount_id)
+                    })
+                    .collect();
+                let scan_db = db.clone();
+                let scan_config = cfg.storage.clone();
+                scan_worker = Some(thread::spawn(move || {
+                    for (root, mount_id) in planned {
+                        let scan = diagnosis::scan_directory(
+                            &root,
+                            mount_id,
+                            &scan_config,
+                            diagnosis::unix_now(),
+                        );
+                        match diagnosis::open_db(&scan_db)
+                            .and_then(|mut c| diagnosis::insert_scan(&mut c, &scan))
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                eprintln!("syslens-diagnosis: storage scan write failed: {e}")
+                            }
+                        }
+                    }
+                }));
+                let _=conn.execute("INSERT INTO metadata(key,value) VALUES('next_storage_scan',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(diagnosis::unix_now()+cfg.storage.scan_interval_seconds as i64).to_string()]);
             }
         } else {
             eprintln!(
