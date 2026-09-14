@@ -142,11 +142,11 @@ fn warn_if_linger_disabled() {
                 .trim()
                 .to_ascii_lowercase()
         });
-    if linger.as_deref() != Some("yes") {
-        let user = std::env::var("USER").unwrap_or_else(|_| "<your-user>".into());
-        eprintln!(
-            "Warning: systemd user services may stop after logout because lingering is not enabled. To keep diagnosis recording, run: loginctl enable-linger {user}"
-        );
+    let user = std::env::var("USER").unwrap_or_else(|_| "<your-user>".into());
+    if let Some(message) =
+        diagnosis::linger_warning_message(&user, linger.as_deref() == Some("yes"))
+    {
+        eprintln!("{message}");
     }
 }
 fn status(config: PathBuf) -> Result<(), String> {

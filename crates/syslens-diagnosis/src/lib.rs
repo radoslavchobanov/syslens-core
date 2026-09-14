@@ -100,6 +100,9 @@ pub fn install_user_service(
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
 }
+pub fn linger_warning_message(user: &str, linger_enabled: bool) -> Option<String> {
+    (!linger_enabled).then(|| format!("Warning: systemd user services may stop after logout because lingering is not enabled. To keep diagnosis recording, run: loginctl enable-linger {user}"))
+}
 pub fn state_dir() -> PathBuf {
     xdg_path("XDG_STATE_HOME", ".local/state").join("syslens-diagnosis")
 }
@@ -1080,6 +1083,17 @@ mod tests {
             Path::new("/tmp/custom.sqlite"),
         );
         assert!(unit.contains("--config /tmp/custom.toml --database /tmp/custom.sqlite"));
+    }
+    #[test]
+    fn package_service_and_linger_warning_are_truthful() {
+        let asset = include_str!("../../../packaging/debian/syslens-diagnosis.service");
+        assert!(asset.contains("daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
+        assert!(
+            linger_warning_message("alice", false)
+                .unwrap()
+                .contains("loginctl enable-linger alice")
+        );
+        assert!(linger_warning_message("alice", true).is_none());
     }
 
     #[test]
