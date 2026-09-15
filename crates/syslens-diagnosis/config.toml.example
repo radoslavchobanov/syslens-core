@@ -27,3 +27,10 @@ port = 9843
 max_request_bytes = 16384
 max_response_bytes = 262144
 max_query_millis = 2000
+# Accepted sockets must finish TLS before this deadline, and the cap includes
+# both handshakes and active HTTP requests. Excess sockets are closed.
+tls_handshake_timeout_millis = 5000
+max_in_flight_connections = 32
+# HTTP/1 has no keep-alive here. This deadline includes headers and body, so a
+# slow or incomplete request cannot retain an in-flight slot indefinitely.
+http_request_timeout_millis = 10000

@@ -79,6 +79,15 @@ pub struct ApiConfig {
     pub max_response_bytes: usize,
     #[serde(default = "default_api_query_ms")]
     pub max_query_millis: u64,
+    /// Maximum time to wait for a peer to complete its TLS ClientHello.
+    #[serde(default = "default_api_tls_handshake_ms")]
+    pub tls_handshake_timeout_millis: u64,
+    /// Maximum accepted TLS or HTTP connections being handled at once.
+    #[serde(default = "default_api_in_flight_connections")]
+    pub max_in_flight_connections: usize,
+    /// Deadline for a complete HTTP/1 request, including its headers and body.
+    #[serde(default = "default_api_http_request_ms")]
+    pub http_request_timeout_millis: u64,
 }
 fn default_api_bind() -> String {
     "127.0.0.1".into()
@@ -95,6 +104,15 @@ fn default_api_response_limit() -> usize {
 fn default_api_query_ms() -> u64 {
     2_000
 }
+fn default_api_tls_handshake_ms() -> u64 {
+    5_000
+}
+fn default_api_in_flight_connections() -> usize {
+    32
+}
+fn default_api_http_request_ms() -> u64 {
+    10_000
+}
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -107,6 +125,9 @@ impl Default for ApiConfig {
             max_request_bytes: default_api_body_limit(),
             max_response_bytes: default_api_response_limit(),
             max_query_millis: default_api_query_ms(),
+            tls_handshake_timeout_millis: default_api_tls_handshake_ms(),
+            max_in_flight_connections: default_api_in_flight_connections(),
+            http_request_timeout_millis: default_api_http_request_ms(),
         }
     }
 }
@@ -378,8 +399,11 @@ impl Config {
         if !(1024..=64 * 1024).contains(&api.max_request_bytes)
             || !(1024..=1024 * 1024).contains(&api.max_response_bytes)
             || !(50..=10_000).contains(&api.max_query_millis)
+            || !(100..=30_000).contains(&api.tls_handshake_timeout_millis)
+            || !(1..=128).contains(&api.max_in_flight_connections)
+            || !(100..=30_000).contains(&api.http_request_timeout_millis)
         {
-            return Err("api request, response, or query limit is outside allowed range".into());
+            return Err("API limit is outside allowed range".into());
         }
         if api.enabled {
             for p in [
@@ -1003,11 +1027,11 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         http::{HeaderMap, StatusCode},
         routing::{get, post},
     };
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::{RootCertStore, ServerConfig};
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::Semaphore};
     use tokio_rustls::TlsAcceptor;
     #[derive(Clone)]
     struct ApiState {
@@ -1668,12 +1692,25 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         .await
         .map_err(|_| "cannot bind API listener")?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
+    let connections = Arc::new(Semaphore::new(config.api.max_in_flight_connections));
+    let handshake_deadline = StdDuration::from_millis(config.api.tls_handshake_timeout_millis);
+    let request_deadline = StdDuration::from_millis(config.api.http_request_timeout_millis);
     loop {
         let (stream, _) = listener.accept().await.map_err(|_| "API listener failed")?;
+        // Do not queue accepted sockets: a full cap is immediate backpressure
+        // and closing the stream lets the peer retry without retaining memory.
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            if let Ok(tls) = acceptor.accept(stream).await {
+            // The permit covers both the TLS negotiation and HTTP connection,
+            // and is released on any handshake, request, or transport failure.
+            if let Ok(Ok(tls)) =
+                tokio::time::timeout(handshake_deadline, acceptor.accept(stream)).await
+            {
                 let service = hyper::service::service_fn(move |request| {
                     let app = app.clone();
                     async move {
@@ -1681,10 +1718,19 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                         app.oneshot(request).await
                     }
                 });
-                let _ = Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(tls), service)
-                    .await;
+                let mut builder = Builder::new(TokioExecutor::new());
+                builder
+                    .http1()
+                    .keep_alive(false)
+                    .header_read_timeout(request_deadline)
+                    .timer(TokioTimer::new());
+                let _ = tokio::time::timeout(
+                    request_deadline,
+                    builder.serve_connection(TokioIo::new(tls), service),
+                )
+                .await;
             }
+            drop(permit);
         });
     }
 }
@@ -4597,7 +4643,32 @@ mod tests {
             }
             .validate()
             .is_err()
-        )
+        );
+        for config in [
+            Config {
+                api: ApiConfig {
+                    tls_handshake_timeout_millis: 99,
+                    ..ApiConfig::default()
+                },
+                ..Config::default()
+            },
+            Config {
+                api: ApiConfig {
+                    max_in_flight_connections: 0,
+                    ..ApiConfig::default()
+                },
+                ..Config::default()
+            },
+            Config {
+                api: ApiConfig {
+                    http_request_timeout_millis: 30_001,
+                    ..ApiConfig::default()
+                },
+                ..Config::default()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
     }
     #[test]
     fn config_rejects_unknown_fields_and_boundaries() {
@@ -6356,6 +6427,9 @@ mod tests {
                 tls_cert_path: Some(cert),
                 tls_key_path: Some(key),
                 trusted_gateway_ca_path: Some(capath),
+                tls_handshake_timeout_millis: 150,
+                max_in_flight_connections: 2,
+                http_request_timeout_millis: 500,
                 ..ApiConfig::default()
             },
             ..Config::default()
@@ -6389,6 +6463,32 @@ mod tests {
                     .await
             }
         };
+        async fn socket_closes_within(stream: &mut tokio::net::TcpStream, deadline: StdDuration) {
+            let mut byte = [0];
+            match tokio::time::timeout(deadline, stream.read(&mut byte)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(n)) => panic!("peer sent unexpected {n} byte(s)"),
+                Err(_) => panic!("peer did not close within {deadline:?}"),
+            }
+        }
+
+        // Two stalled ClientHello peers consume the configured cap. A third
+        // peer is rejected immediately, then the timed-out handshakes release
+        // their permits so a trusted client can connect.
+        let mut stalled_one = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut stalled_two = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+        let mut excess = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        socket_closes_within(&mut excess, StdDuration::from_millis(250)).await;
+        socket_closes_within(&mut stalled_one, StdDuration::from_millis(250)).await;
+        socket_closes_within(&mut stalled_two, StdDuration::from_millis(250)).await;
+
         let mut no_client = connect(vec![], None).await.unwrap();
         let _ = no_client
             .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -6433,6 +6533,37 @@ mod tests {
         assert!(output.contains("\"version\":1"));
         assert!(output.contains("\"request_id\""));
         assert!(output.contains("\"recording\":\"no-evidence\""));
+
+        // Header and body reads share a bounded one-request connection. This
+        // authenticated peer sends no HTTP header and must not retain a slot.
+        let mut stalled_header = connect(
+            vec![trusted_client_cert.clone()],
+            Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                trusted_client_key.clone(),
+            ))),
+        )
+        .await
+        .unwrap();
+        let mut byte = [0];
+        match tokio::time::timeout(
+            StdDuration::from_millis(750),
+            stalled_header.read(&mut byte),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("server sent unexpected {n} byte(s)"),
+            Err(_) => panic!("server did not close a stalled HTTP request"),
+        }
+        let recovered_response = api_request(
+            port,
+            roots.clone(),
+            trusted_client_cert.clone(),
+            trusted_client_key.clone(),
+            b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(recovered_response.starts_with("HTTP/1.1 200"));
 
         let replacement = dir.path().join("replacement.sqlite");
         open_db(&replacement).unwrap();
