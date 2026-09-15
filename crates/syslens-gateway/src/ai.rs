@@ -197,6 +197,8 @@ pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub index: Option<u64>,
     pub function: Function,
 }
 #[derive(Debug, Deserialize)]
@@ -281,6 +283,20 @@ mod tests {
     fn rejects_duplicate_and_oversized_tool_calls() {
         let m = json!({"tool_calls":[{"id":"x","type":"function","function":{"name":"status","arguments":"{}"}},{"id":"x","type":"function","function":{"name":"status","arguments":"{}"}}]});
         assert!(calls(&m).is_err());
+    }
+    #[test]
+    fn accepts_optional_integer_tool_call_index() {
+        let m = json!({"tool_calls":[{"id":"x","type":"function","index":0,"function":{"name":"status","arguments":"{}"}}]});
+        assert!(calls(&m).is_ok());
+    }
+    #[test]
+    fn rejects_invalid_tool_call_index_and_unknown_fields() {
+        let non_integer = json!({"tool_calls":[{"id":"x","type":"function","index":0.5,"function":{"name":"status","arguments":"{}"}}]});
+        assert!(calls(&non_integer).is_err());
+        let non_number = json!({"tool_calls":[{"id":"x","type":"function","index":"0","function":{"name":"status","arguments":"{}"}}]});
+        assert!(calls(&non_number).is_err());
+        let unknown = json!({"tool_calls":[{"id":"x","type":"function","unexpected":true,"function":{"name":"status","arguments":"{}"}}]});
+        assert!(calls(&unknown).is_err());
     }
     #[test]
     fn disabled_model_has_no_transport() {
