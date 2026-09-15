@@ -201,16 +201,24 @@ class DeploymentAssets(unittest.TestCase):
             }
             base_environment.pop("OLLAMA_LAN_IP", None)
 
-            (deployment / ".env").write_text("OLLAMA_LAN_IP=192.168.0.144\n")
-            result = subprocess.run(
-                [str(deployment / "start.sh")],
-                env=base_environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(capture.read_text(), "compose up -d --wait ollama\n")
+            for contents in (
+                "OLLAMA_LAN_IP=192.168.0.144\n",
+                'OLLAMA_LAN_IP="192.168.0.144" # private bind\r\n',
+                "export OLLAMA_LAN_IP='192.168.0.144' # private bind\n",
+                "  OLLAMA_LAN_IP = 192.168.0.144\t# private bind\n",
+            ):
+                with self.subTest(contents=contents):
+                    capture.unlink(missing_ok=True)
+                    (deployment / ".env").write_text(contents, newline="")
+                    result = subprocess.run(
+                        [str(deployment / "start.sh")],
+                        env=base_environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(capture.read_text(), "compose up -d --wait ollama\n")
 
             capture.unlink()
             (deployment / ".env").write_text("OLLAMA_LAN_IP=0.0.0.0\n")
@@ -236,15 +244,31 @@ class DeploymentAssets(unittest.TestCase):
             self.assertEqual(capture.read_text(), "compose up -d --wait ollama\n")
 
     def test_dockerfile_build_and_runtime_boundary(self):
-        lines = [line for line in read("gateway/Dockerfile").splitlines() if line and not line.startswith("#")]
+        lines = []
+        pending = ""
+        for line in read("gateway/Dockerfile").splitlines():
+            if not line or (line.startswith("#") and not pending):
+                continue
+            pending = f"{pending} {line.lstrip()}".strip()
+            if pending.endswith("\\"):
+                pending = pending[:-1].rstrip()
+            else:
+                lines.append(pending)
+                pending = ""
+        self.assertFalse(pending, "Dockerfile must not end with a continuation")
         instructions = [line.split(" ", 1) for line in lines]
-        allowed = {"FROM", "RUN", "WORKDIR", "COPY", "USER", "ENTRYPOINT", "CMD", "HEALTHCHECK"}
+        allowed = {"FROM", "ARG", "RUN", "WORKDIR", "COPY", "USER", "ENTRYPOINT", "CMD", "HEALTHCHECK"}
         self.assertTrue(all(instruction in allowed and argument for instruction, argument in instructions))
         stages = [argument for instruction, argument in instructions if instruction == "FROM"]
         self.assertEqual(stages, [
             "rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder",
             "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime",
         ])
+        self.assertIn("ARG DEBIAN_SNAPSHOT=20250301T000000Z", lines)
+        builder_install = next(line for line in lines if "apt-get install" in line)
+        self.assertIn("snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}", builder_install)
+        self.assertIn("cmake=3.25.1-1", builder_install)
+        self.assertNotIn("deb.debian.org", builder_install)
         self.assertIn("RUN cargo build --locked --release --package syslens-gateway", lines)
         runtime_start = next(index for index, line in enumerate(lines) if line.startswith("FROM debian:bookworm-slim@"))
         runtime = lines[runtime_start + 1:]

@@ -47,7 +47,9 @@ wildcard default, but `docker compose up` bypasses this validation and **must
 not be used directly**. `start.sh` validates an externally supplied
 `OLLAMA_LAN_IP` when one is set; otherwise it safely reads only the single
 `OLLAMA_LAN_IP=...` entry from this deployment directory's `.env` before it
-calls Docker. Do not source `.env` in a shell.
+calls Docker. It accepts ordinary Compose forms including `export
+OLLAMA_LAN_IP=...`, quoted values, inline comments, and CRLF endings; it never
+sources or evaluates `.env`.
 
 Before starting, configure a persistent host firewall policy that allows TCP
 11434 from Orange Pi's LAN address (`192.168.0.108` in this example) and drops

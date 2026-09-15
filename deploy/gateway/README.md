@@ -13,9 +13,10 @@ validation with Python's standard library.
 
 The gateway Dockerfile pins its official Rust builder and Debian runtime to OCI
 multi-architecture index digests; the tag is retained only as a human-readable
-label. This makes a rebuild use the reviewed inputs rather than a later mutable
-tag. Before changing either pin, verify the official manifest and its arm64 and
-amd64 entries, then compare the reported index digest with the `FROM` line:
+label. This fixes the base OS and Rust toolchain inputs, rather than following a
+later mutable tag. Before changing either pin, verify the official manifest and
+its arm64 and amd64 entries, then compare the reported index digest with the
+`FROM` line:
 
 ```sh
 docker buildx imagetools inspect rust:1.95.0-bookworm
@@ -25,7 +26,12 @@ docker buildx imagetools inspect debian:bookworm-slim
 Record the verified digest and review date in the Dockerfile comment. The
 runtime performs no package installation: its CA bundle is copied from the
 pinned builder, and Debian's required base runtime libraries come from the
-pinned Debian image.
+pinned Debian image. The builder's locked `aws-lc-sys` dependency requires
+`cmake`, which the official Rust image does not include. Its install is pinned
+to the immutable Debian snapshot timestamp and exact package version recorded
+in the Dockerfile, rather than a live APT index. When changing either value,
+verify that the snapshot still contains the named package and inspect its
+recorded dependencies for both arm64 and amd64 before accepting the build.
 
 ## Prepare the dedicated host directory
 

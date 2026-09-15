@@ -1,7 +1,13 @@
 # Build natively on arm64 or amd64, or select either with Docker Buildx.
 # rust:1.95.0-bookworm OCI index digest, verified 2026-09-15.
 FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
+# aws-lc-sys needs CMake. Keep its APT input frozen rather than following a live index.
+ARG DEBIAN_SNAPSHOT=20250301T000000Z
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" > /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install -y --no-install-recommends cmake=3.25.1-1 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
