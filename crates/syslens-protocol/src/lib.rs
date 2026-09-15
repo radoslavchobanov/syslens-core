@@ -152,8 +152,14 @@ pub struct Status {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncidentPage {
     pub incidents: Vec<serde_json::Value>,
-    pub next_cursor: Option<i64>,
+    pub next_cursor: Option<IncidentCursor>,
     pub has_more: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentCursor {
+    pub updated_at: i64,
+    pub id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventPage {

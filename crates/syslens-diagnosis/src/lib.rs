@@ -934,7 +934,9 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     #[serde(deny_unknown_fields)]
     struct IncidentsQuery {
         #[serde(default)]
-        before: Option<i64>,
+        before_updated_at: Option<i64>,
+        #[serde(default)]
+        before_id: Option<String>,
         #[serde(default)]
         limit: Option<usize>,
     }
@@ -958,6 +960,14 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                     message: message.into(),
                 },
             }),
+        )
+    }
+    async fn unknown_route() -> (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>) {
+        err(
+            Uuid::new_v4().to_string(),
+            StatusCode::NOT_FOUND,
+            syslens_protocol::ErrorCode::NotFound,
+            "endpoint not found",
         )
     }
     #[allow(clippy::result_large_err)]
@@ -1004,36 +1014,56 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
-        let conn = open_readonly(&s.database).map_err(|_| {
+        let database = s.database.clone();
+        let deadline = s.max_query;
+        let (first, last) = tokio::time::timeout(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                with_api_query_deadline(deadline, || {
+                    let conn = open_readonly(&database)?;
+                    conn.query_row(
+                        "SELECT min(timestamp),max(timestamp) FROM host_samples",
+                        [],
+                        |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+            }),
+        )
+        .await
+        .map_err(|_| {
             err(
                 id.clone(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                syslens_protocol::ErrorCode::EvidenceUnavailable,
-                "evidence is unavailable",
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
             )
-        })?;
-        let (first, last): (Option<i64>, Option<i64>) = conn
-            .query_row(
-                "SELECT min(timestamp),max(timestamp) FROM host_samples",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+        })?
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
             )
-            .map_err(|e| {
-                if e.to_string().contains("interrupted") {
-                    return err(
-                        id.clone(),
-                        StatusCode::GATEWAY_TIMEOUT,
-                        syslens_protocol::ErrorCode::QueryTimeout,
-                        "evidence query timed out",
-                    );
-                }
+        })?
+        .map_err(|e| {
+            if e.contains("interrupted") {
+                err(
+                    id.clone(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    syslens_protocol::ErrorCode::QueryTimeout,
+                    "evidence query timed out",
+                )
+            } else {
                 err(
                     id.clone(),
                     StatusCode::SERVICE_UNAVAILABLE,
                     syslens_protocol::ErrorCode::EvidenceUnavailable,
                     "evidence is unavailable",
                 )
-            })?;
+            }
+        })?;
         let ts = |x: Option<i64>| x.and_then(|v| Utc.timestamp_opt(v, 0).single());
         envelope(
             &s,
@@ -1054,36 +1084,56 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
-        let conn = open_readonly(&s.database).map_err(|_| {
+        let database = s.database.clone();
+        let deadline = s.max_query;
+        let (count, last) = tokio::time::timeout(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                with_api_query_deadline(deadline, || {
+                    let conn = open_readonly(&database)?;
+                    conn.query_row(
+                        "SELECT count(*),max(timestamp) FROM host_samples",
+                        [],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+            }),
+        )
+        .await
+        .map_err(|_| {
             err(
                 id.clone(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                syslens_protocol::ErrorCode::EvidenceUnavailable,
-                "evidence is unavailable",
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
             )
-        })?;
-        let (count, last): (i64, Option<i64>) = conn
-            .query_row(
-                "SELECT count(*),max(timestamp) FROM host_samples",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+        })?
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
             )
-            .map_err(|e| {
-                if e.to_string().contains("interrupted") {
-                    return err(
-                        id.clone(),
-                        StatusCode::GATEWAY_TIMEOUT,
-                        syslens_protocol::ErrorCode::QueryTimeout,
-                        "evidence query timed out",
-                    );
-                }
+        })?
+        .map_err(|e| {
+            if e.contains("interrupted") {
+                err(
+                    id.clone(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    syslens_protocol::ErrorCode::QueryTimeout,
+                    "evidence query timed out",
+                )
+            } else {
                 err(
                     id.clone(),
                     StatusCode::SERVICE_UNAVAILABLE,
                     syslens_protocol::ErrorCode::EvidenceUnavailable,
                     "evidence is unavailable",
                 )
-            })?;
+            }
+        })?;
         envelope(
             &s,
             id,
@@ -1130,12 +1180,23 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     }
     async fn memory(
         State(s): State<ApiState>,
-        Json(r): Json<syslens_protocol::EvidenceRequest>,
+        payload: Result<
+            Json<syslens_protocol::EvidenceRequest>,
+            axum::extract::rejection::JsonRejection,
+        >,
     ) -> Result<
         Json<syslens_protocol::Envelope<Value>>,
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
+        let Json(r) = payload.map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "invalid JSON request",
+            )
+        })?;
         r.window
             .validate(s.retention)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
@@ -1189,12 +1250,23 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     }
     async fn storage(
         State(s): State<ApiState>,
-        Json(r): Json<syslens_protocol::EvidenceRequest>,
+        payload: Result<
+            Json<syslens_protocol::EvidenceRequest>,
+            axum::extract::rejection::JsonRejection,
+        >,
     ) -> Result<
         Json<syslens_protocol::Envelope<Value>>,
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
+        let Json(r) = payload.map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "invalid JSON request",
+            )
+        })?;
         r.window
             .validate(s.retention)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
@@ -1255,7 +1327,23 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     > {
         let id = Uuid::new_v4().to_string();
         let limit = q.limit.unwrap_or(100);
-        if !(1..=256).contains(&limit) || q.before.is_some_and(|x| x < 0) {
+        let before = match (q.before_updated_at, q.before_id) {
+            (None, None) => None,
+            (Some(updated_at), Some(id))
+                if updated_at >= 0 && !id.is_empty() && id.len() <= 128 =>
+            {
+                Some(syslens_protocol::IncidentCursor { updated_at, id })
+            }
+            _ => {
+                return Err(err(
+                    id,
+                    StatusCode::BAD_REQUEST,
+                    syslens_protocol::ErrorCode::InvalidRequest,
+                    "invalid pagination",
+                ));
+            }
+        };
+        if !(1..=256).contains(&limit) {
             return Err(err(
                 id,
                 StatusCode::BAD_REQUEST,
@@ -1263,15 +1351,48 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "invalid pagination",
             ));
         }
-        let (incidents, next_cursor, has_more) = list_incidents_page(&s.database, q.before, limit)
-            .map_err(|_| {
+        let database = s.database.clone();
+        let deadline = s.max_query;
+        let (incidents, next_cursor, has_more) = tokio::time::timeout(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                with_api_query_deadline(deadline, || list_incidents_page(&database, before, limit))
+            }),
+        )
+        .await
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|e| {
+            if e.contains("interrupted") {
+                err(
+                    id.clone(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    syslens_protocol::ErrorCode::QueryTimeout,
+                    "evidence query timed out",
+                )
+            } else {
                 err(
                     id.clone(),
                     StatusCode::SERVICE_UNAVAILABLE,
                     syslens_protocol::ErrorCode::EvidenceUnavailable,
                     "evidence is unavailable",
                 )
-            })?;
+            }
+        })?;
         envelope(
             &s,
             id,
@@ -1303,13 +1424,48 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "invalid pagination",
             ));
         }
-        let d = list_events(&s.database, q.after.unwrap_or(0), limit).map_err(|_| {
+        let database = s.database.clone();
+        let deadline = s.max_query;
+        let after = q.after.unwrap_or(0);
+        let d = tokio::time::timeout(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                with_api_query_deadline(deadline, || list_events(&database, after, limit))
+            }),
+        )
+        .await
+        .map_err(|_| {
             err(
                 id.clone(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                syslens_protocol::ErrorCode::EvidenceUnavailable,
-                "evidence is unavailable",
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
             )
+        })?
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|e| {
+            if e.contains("interrupted") {
+                err(
+                    id.clone(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    syslens_protocol::ErrorCode::QueryTimeout,
+                    "evidence query timed out",
+                )
+            } else {
+                err(
+                    id.clone(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    syslens_protocol::ErrorCode::EvidenceUnavailable,
+                    "evidence is unavailable",
+                )
+            }
         })?;
         envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
     }
@@ -1326,6 +1482,15 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         .route("/v1/evidence/storage", post(storage))
         .route("/v1/incidents", get(incidents))
         .route("/v1/events", get(events))
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(|| async {
+            err(
+                Uuid::new_v4().to_string(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                syslens_protocol::ErrorCode::NotFound,
+                "method is not allowed",
+            )
+        })
         .layer(axum::extract::DefaultBodyLimit::max(
             config.api.max_request_bytes,
         ))
@@ -2395,16 +2560,25 @@ pub fn list_incidents(path: &Path) -> Result<Vec<Incident>, String> {
 }
 pub fn list_incidents_page(
     path: &Path,
-    before: Option<i64>,
+    before: Option<syslens_protocol::IncidentCursor>,
     limit: usize,
-) -> Result<(Vec<Incident>, Option<i64>, bool), String> {
+) -> Result<
+    (
+        Vec<Incident>,
+        Option<syslens_protocol::IncidentCursor>,
+        bool,
+    ),
+    String,
+> {
     if !(1..=256).contains(&limit) {
         return Err("incident limit must be between 1 and 256".into());
     }
     let c = open_readonly(path)?;
-    let mut s = c.prepare("SELECT id,detector,subject,severity,status,opened_at,updated_at,recovered_at,acknowledged_at,evidence_json FROM incidents WHERE (?1 IS NULL OR updated_at < ?1) ORDER BY updated_at DESC, id DESC LIMIT ?2").map_err(|e| e.to_string())?;
+    let timestamp = before.as_ref().map(|x| x.updated_at);
+    let cursor_id = before.as_ref().map(|x| x.id.as_str());
+    let mut s = c.prepare("SELECT id,detector,subject,severity,status,opened_at,updated_at,recovered_at,acknowledged_at,evidence_json FROM incidents WHERE (?1 IS NULL OR updated_at < ?1 OR (updated_at = ?1 AND id < ?2)) ORDER BY updated_at DESC, id DESC LIMIT ?3").map_err(|e| e.to_string())?;
     let rows = s
-        .query_map(params![before, (limit + 1) as i64], |r| {
+        .query_map(params![timestamp, cursor_id, (limit + 1) as i64], |r| {
             Ok(Incident {
                 id: r.get(0)?,
                 detector: r.get(1)?,
@@ -2424,7 +2598,12 @@ pub fn list_incidents_page(
     let has_more = incidents.len() > limit;
     incidents.truncate(limit);
     let next = has_more
-        .then(|| incidents.last().map(|x| x.updated_at))
+        .then(|| {
+            incidents.last().map(|x| syslens_protocol::IncidentCursor {
+                updated_at: x.updated_at,
+                id: x.id.clone(),
+            })
+        })
         .flatten();
     Ok((incidents, next, has_more))
 }
@@ -5852,5 +6031,27 @@ mod tests {
             (start - Duration::days(7)).to_rfc3339()
         );
         assert_eq!(baseline.comparison.end_utc, start.to_rfc3339());
+    }
+
+    #[test]
+    fn incident_page_cursor_keeps_same_timestamp_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        let c = open_db(&path).unwrap();
+        for id in ["a", "b", "c"] {
+            c.execute("INSERT INTO incidents(id,detector,subject,severity,status,opened_at,updated_at,evidence_json) VALUES(?,'d',?,'warning','open',9,10,'{}')", params![id,id]).unwrap();
+        }
+        let (first, cursor, more) = list_incidents_page(&path, None, 2).unwrap();
+        assert!(more);
+        assert_eq!(first.len(), 2);
+        let (second, _, more) = list_incidents_page(&path, cursor, 2).unwrap();
+        assert!(!more);
+        assert_eq!(second.len(), 1);
+        let ids = first
+            .into_iter()
+            .chain(second)
+            .map(|x| x.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 3);
     }
 }
