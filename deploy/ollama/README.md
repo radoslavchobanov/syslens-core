@@ -21,6 +21,8 @@ install -d -m 0700 backups
 sudo install -d -o 0 -g 0 -m 0700 data
 install -m 0600 "$SYSLENS_SOURCE/deploy/ollama/compose.yaml" compose.yaml
 install -m 0600 "$SYSLENS_SOURCE/deploy/ollama/.env.example" .env
+install -m 0700 "$SYSLENS_SOURCE/deploy/ollama/preflight.sh" preflight.sh
+install -m 0700 "$SYSLENS_SOURCE/deploy/ollama/start.sh" start.sh
 ```
 
 The official image runs as root with all capabilities dropped, so its `data/`
@@ -36,6 +38,13 @@ currently illustrated as `192.168.0.144`. Never use `0.0.0.0`, `::`, a public
 address, a public reverse proxy, router port forwarding, or a public tunnel.
 `OLLAMA_HOST=0.0.0.0:11434` is only the listener *inside the container*; the
 published host port binds only `OLLAMA_LAN_IP:11434`.
+
+`./start.sh` is the required and only supported startup command. It runs
+`./preflight.sh` before Docker and accepts only a literal RFC1918 IPv4 address:
+`10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16`. It rejects an unset,
+wildcard, loopback, public, malformed, or IPv6 value. The Compose file has no
+wildcard default, but `docker compose up` bypasses this validation and **must
+not be used directly**.
 
 Before starting, configure a persistent host firewall policy that allows TCP
 11434 from Orange Pi's LAN address (`192.168.0.108` in this example) and drops
@@ -57,7 +66,7 @@ place. Gateway-to-diagnosis traffic continues to use mTLS.
 ```sh
 docker compose config --quiet
 docker compose pull ollama
-docker compose up -d --wait ollama
+./start.sh
 docker compose logs --tail=50 ollama
 docker compose exec ollama ollama pull qwen3:4b
 docker compose exec -T ollama ollama list
@@ -114,16 +123,16 @@ docker compose start ollama
 ```
 
 Preserve the prior image tag/digest and full model digest. Edit `.env` to a new
-verified official image, then `docker compose pull ollama` and
-`docker compose up -d --wait ollama`. Check logs, `/api/tags`, and a gateway
+verified official image, then `docker compose pull ollama` and `./start.sh`.
+Check logs, `/api/tags`, and a gateway
 inference. Model updates require a separate explicit `ollama pull`; restarting
 the service never downloads a model automatically.
 
-For image rollback, restore the previous `OLLAMA_IMAGE` and run
-`docker compose up -d --wait ollama`. For model-store rollback, stop Ollama,
+For image rollback, restore the previous `OLLAMA_IMAGE` and run `./start.sh`.
+For model-store rollback, stop Ollama,
 move the current `data/` to a protected recovery location, restore the matching
 backup using `sudo tar -xzf backups/CHOSEN_BACKUP.tar.gz`, and start with
-`docker compose up -d --wait ollama`. Retain old images and backups until the
+`./start.sh`. Retain old images and backups until the
 pilot is accepted. Protect backups: the store can also contain server keys.
 
 References: [official CPU Docker setup](https://docs.ollama.com/docker),

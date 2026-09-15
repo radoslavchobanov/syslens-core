@@ -11,6 +11,22 @@ and amd64 builds. No images are published automatically by the Debian release
 workflow. The Compose file uses JSON syntax (a YAML subset), allowing offline
 validation with Python's standard library.
 
+The gateway Dockerfile pins its official Rust builder and Debian runtime to OCI
+multi-architecture index digests; the tag is retained only as a human-readable
+label. This makes a rebuild use the reviewed inputs rather than a later mutable
+tag. Before changing either pin, verify the official manifest and its arm64 and
+amd64 entries, then compare the reported index digest with the `FROM` line:
+
+```sh
+docker buildx imagetools inspect rust:1.95.0-bookworm
+docker buildx imagetools inspect debian:bookworm-slim
+```
+
+Record the verified digest and review date in the Dockerfile comment. The
+runtime performs no package installation: its CA bundle is copied from the
+pinned builder, and Debian's required base runtime libraries come from the
+pinned Debian image.
+
 ## Prepare the dedicated host directory
 
 Run as `orangepi`. Set `SYSLENS_SOURCE` to an existing clean checkout of the

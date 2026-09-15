@@ -9,8 +9,10 @@ specification; also run `docker compose config --quiet` on the deployment host.
 
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import tomllib
 import unittest
 
@@ -142,17 +144,58 @@ class DeploymentAssets(unittest.TestCase):
         self.assertNotIn("command", ollama)
         self.assertNotIn("entrypoint", ollama)
 
+    def test_ollama_preflight_accepts_only_rfc1918_ipv4(self):
+        preflight = ROOT / "ollama/preflight.sh"
+        self.assertTrue(preflight.is_file())
+        self.assertIn("./preflight.sh", read("ollama/start.sh"))
+        self.assertIn("docker compose up", read("ollama/start.sh"))
+
+        for address in ("10.0.0.1", "172.16.0.1", "172.31.255.254", "192.168.0.144"):
+            with self.subTest(address=address):
+                result = subprocess.run(
+                    ["sh", str(preflight)],
+                    env={**os.environ, "OLLAMA_LAN_IP": address},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        for address in (None, "0.0.0.0", "127.0.0.1", "172.15.255.255", "172.016.0.1", "172.32.0.1", "192.167.1.1", "8.8.8.8", "::1", "192.168.0.1:11434", "192.168.0", "300.168.0.1"):
+            with self.subTest(address=address):
+                environment = dict(os.environ)
+                if address is None:
+                    environment.pop("OLLAMA_LAN_IP", None)
+                else:
+                    environment["OLLAMA_LAN_IP"] = address
+                result = subprocess.run(
+                    ["sh", str(preflight)],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 64)
+
     def test_dockerfile_build_and_runtime_boundary(self):
         lines = [line for line in read("gateway/Dockerfile").splitlines() if line and not line.startswith("#")]
         instructions = [line.split(" ", 1) for line in lines]
         allowed = {"FROM", "RUN", "WORKDIR", "COPY", "USER", "ENTRYPOINT", "CMD", "HEALTHCHECK"}
         self.assertTrue(all(instruction in allowed and argument for instruction, argument in instructions))
         stages = [argument for instruction, argument in instructions if instruction == "FROM"]
-        self.assertEqual(stages, ["rust:1.95.0-bookworm AS builder", "debian:bookworm-slim AS runtime"])
+        self.assertEqual(stages, [
+            "rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder",
+            "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime",
+        ])
         self.assertIn("RUN cargo build --locked --release --package syslens-gateway", lines)
-        runtime = lines[lines.index("FROM debian:bookworm-slim AS runtime") + 1:]
+        runtime_start = next(index for index, line in enumerate(lines) if line.startswith("FROM debian:bookworm-slim@"))
+        runtime = lines[runtime_start + 1:]
         copies = [line for line in runtime if line.startswith("COPY ")]
-        self.assertEqual(copies, ["COPY --from=builder /build/target/release/syslens-gateway /usr/local/bin/syslens-gateway"])
+        self.assertEqual(copies, [
+            "COPY --from=builder /build/target/release/syslens-gateway /usr/local/bin/syslens-gateway",
+            "COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt",
+        ])
+        self.assertFalse(any("apt-get" in line for line in runtime), "runtime must not fetch packages")
         self.assertIn("USER 1000:1000", runtime)
         for instruction, argument in instructions:
             if instruction in {"ENTRYPOINT", "CMD"}:
