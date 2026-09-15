@@ -72,6 +72,14 @@ impl EvidenceWindow {
             {
                 return Err(ProtocolError::invalid("window exceeds retained evidence"));
             }
+            let now = Utc::now();
+            if start < now - chrono::Duration::days(i64::from(retention_days))
+                || end > now + chrono::Duration::minutes(5)
+            {
+                return Err(ProtocolError::invalid(
+                    "window is outside retained evidence",
+                ));
+            }
         } else if absolute {
             return Err(ProtocolError::invalid(
                 "absolute window requires start and end",
@@ -144,7 +152,8 @@ pub struct Status {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncidentPage {
     pub incidents: Vec<serde_json::Value>,
-    pub limit: u16,
+    pub next_cursor: Option<i64>,
+    pub has_more: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventPage {

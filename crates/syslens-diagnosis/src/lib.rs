@@ -15,8 +15,21 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+thread_local! { static API_QUERY_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
+fn with_api_query_deadline<T>(
+    limit: StdDuration,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    API_QUERY_DEADLINE.with(|cell| {
+        let old = cell.replace(Some(Instant::now() + limit));
+        let result = work();
+        cell.set(old);
+        result
+    })
+}
 
 pub const SCHEMA_VERSION: i64 = 4;
 pub const MIN_SQLITE: (i32, i32, i32) = (3, 51, 3);
@@ -907,12 +920,21 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         database: PathBuf,
         retention: u32,
         max_response: usize,
+        max_query: StdDuration,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct EventsQuery {
         #[serde(default)]
         after: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct IncidentsQuery {
+        #[serde(default)]
+        before: Option<i64>,
         #[serde(default)]
         limit: Option<usize>,
     }
@@ -996,7 +1018,15 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .map_err(|_| {
+            .map_err(|e| {
+                if e.to_string().contains("interrupted") {
+                    return err(
+                        id.clone(),
+                        StatusCode::GATEWAY_TIMEOUT,
+                        syslens_protocol::ErrorCode::QueryTimeout,
+                        "evidence query timed out",
+                    );
+                }
                 err(
                     id.clone(),
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1038,7 +1068,15 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .map_err(|_| {
+            .map_err(|e| {
+                if e.to_string().contains("interrupted") {
+                    return err(
+                        id.clone(),
+                        StatusCode::GATEWAY_TIMEOUT,
+                        syslens_protocol::ErrorCode::QueryTimeout,
+                        "evidence query timed out",
+                    );
+                }
                 err(
                     id.clone(),
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1057,18 +1095,37 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             },
         )
     }
-    fn since(
+    fn resolve_window(
         w: &syslens_protocol::EvidenceWindow,
-    ) -> Result<String, syslens_protocol::ProtocolError> {
-        match w.relative.as_ref() {
-            Some(r) => Ok(match r.unit {
-                syslens_protocol::RelativeUnit::Hours => format!("{}h", r.value),
-                syslens_protocol::RelativeUnit::Days => format!("{}d", r.value),
-                syslens_protocol::RelativeUnit::Today => "today".into(),
-            }),
-            None => Err(syslens_protocol::ProtocolError::invalid(
-                "absolute windows are not available on this host version",
-            )),
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>), syslens_protocol::ProtocolError> {
+        if let (Some(start), Some(end)) = (w.start, w.end) {
+            return Ok((start, end));
+        }
+        let now = Utc::now();
+        let r = w
+            .relative
+            .as_ref()
+            .ok_or_else(|| syslens_protocol::ProtocolError::invalid("window is required"))?;
+        match r.unit {
+            syslens_protocol::RelativeUnit::Hours => {
+                Ok((now - Duration::hours(i64::from(r.value)), now))
+            }
+            syslens_protocol::RelativeUnit::Days => {
+                Ok((now - Duration::days(i64::from(r.value)), now))
+            }
+            syslens_protocol::RelativeUnit::Today => {
+                let local = now.with_timezone(&Local);
+                let start = Local
+                    .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
+                    .single()
+                    .ok_or_else(|| {
+                        syslens_protocol::ProtocolError::invalid(
+                            "cannot resolve target-local midnight",
+                        )
+                    })?
+                    .with_timezone(&Utc);
+                Ok((start, now))
+            }
         }
     }
     async fn memory(
@@ -1082,20 +1139,45 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         r.window
             .validate(s.retention)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
-        if !matches!(
-            r.window.comparison,
-            syslens_protocol::ComparisonMode::PreviousWeek
-        ) {
-            return Err(err(
-                id,
-                StatusCode::BAD_REQUEST,
-                syslens_protocol::ErrorCode::InvalidRequest,
-                "comparison mode is unavailable on this host version",
-            ));
-        }
-        let x = since(&r.window)
+        let (start, end) = resolve_window(&r.window)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
-        let d = diagnose_memory(&s.database, &x, "previous-week").map_err(|_| {
+        let database = s.database.clone();
+        let mode = r.window.comparison;
+        let deadline = s.max_query;
+        let d = tokio::time::timeout(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                with_api_query_deadline(deadline, || {
+                    diagnose_memory_window(&database, start, end, mode)
+                })
+            }),
+        )
+        .await
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|e| {
+            if e.contains("interrupted") {
+                return err(
+                    id.clone(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    syslens_protocol::ErrorCode::QueryTimeout,
+                    "evidence query timed out",
+                );
+            }
             err(
                 id.clone(),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1116,20 +1198,45 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         r.window
             .validate(s.retention)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
-        if !matches!(
-            r.window.comparison,
-            syslens_protocol::ComparisonMode::PreviousWeek
-        ) {
-            return Err(err(
-                id,
-                StatusCode::BAD_REQUEST,
-                syslens_protocol::ErrorCode::InvalidRequest,
-                "comparison mode is unavailable on this host version",
-            ));
-        }
-        let x = since(&r.window)
+        let (start, end) = resolve_window(&r.window)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
-        let d = diagnose_storage(&s.database, &x, "previous-week").map_err(|_| {
+        let database = s.database.clone();
+        let mode = r.window.comparison;
+        let deadline = s.max_query;
+        let d = tokio::time::timeout(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                with_api_query_deadline(deadline, || {
+                    diagnose_storage_window(&database, start, end, mode)
+                })
+            }),
+        )
+        .await
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::GATEWAY_TIMEOUT,
+                syslens_protocol::ErrorCode::QueryTimeout,
+                "evidence query timed out",
+            )
+        })?
+        .map_err(|e| {
+            if e.contains("interrupted") {
+                return err(
+                    id.clone(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    syslens_protocol::ErrorCode::QueryTimeout,
+                    "evidence query timed out",
+                );
+            }
             err(
                 id.clone(),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1141,20 +1248,43 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     }
     async fn incidents(
         State(s): State<ApiState>,
+        Query(q): Query<IncidentsQuery>,
     ) -> Result<
-        Json<syslens_protocol::Envelope<Value>>,
+        Json<syslens_protocol::Envelope<syslens_protocol::IncidentPage>>,
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
-        let d = list_incidents(&s.database).map_err(|_| {
-            err(
-                id.clone(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                syslens_protocol::ErrorCode::EvidenceUnavailable,
-                "evidence is unavailable",
-            )
-        })?;
-        envelope(&s, id, Utc::now(), serde_json::json!({"incidents":d}))
+        let limit = q.limit.unwrap_or(100);
+        if !(1..=256).contains(&limit) || q.before.is_some_and(|x| x < 0) {
+            return Err(err(
+                id,
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "invalid pagination",
+            ));
+        }
+        let (incidents, next_cursor, has_more) = list_incidents_page(&s.database, q.before, limit)
+            .map_err(|_| {
+                err(
+                    id.clone(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    syslens_protocol::ErrorCode::EvidenceUnavailable,
+                    "evidence is unavailable",
+                )
+            })?;
+        envelope(
+            &s,
+            id,
+            Utc::now(),
+            syslens_protocol::IncidentPage {
+                incidents: incidents
+                    .into_iter()
+                    .map(|x| serde_json::to_value(x).unwrap())
+                    .collect(),
+                next_cursor,
+                has_more,
+            },
+        )
     }
     async fn events(
         State(s): State<ApiState>,
@@ -1187,6 +1317,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         database,
         retention: config.retention_days,
         max_response: config.api.max_response_bytes,
+        max_query: StdDuration::from_millis(config.api.max_query_millis),
     };
     let app = Router::new()
         .route("/v1/capabilities", get(capabilities))
@@ -2262,6 +2393,41 @@ pub fn run_detection(
 pub fn list_incidents(path: &Path) -> Result<Vec<Incident>, String> {
     list_incidents_bounded(path, -1)
 }
+pub fn list_incidents_page(
+    path: &Path,
+    before: Option<i64>,
+    limit: usize,
+) -> Result<(Vec<Incident>, Option<i64>, bool), String> {
+    if !(1..=256).contains(&limit) {
+        return Err("incident limit must be between 1 and 256".into());
+    }
+    let c = open_readonly(path)?;
+    let mut s = c.prepare("SELECT id,detector,subject,severity,status,opened_at,updated_at,recovered_at,acknowledged_at,evidence_json FROM incidents WHERE (?1 IS NULL OR updated_at < ?1) ORDER BY updated_at DESC, id DESC LIMIT ?2").map_err(|e| e.to_string())?;
+    let rows = s
+        .query_map(params![before, (limit + 1) as i64], |r| {
+            Ok(Incident {
+                id: r.get(0)?,
+                detector: r.get(1)?,
+                subject: r.get(2)?,
+                severity: r.get(3)?,
+                status: r.get(4)?,
+                opened_at: r.get(5)?,
+                updated_at: r.get(6)?,
+                recovered_at: r.get(7)?,
+                acknowledged_at: r.get(8)?,
+                evidence: serde_json::from_str::<Value>(&r.get::<_, String>(9)?)
+                    .unwrap_or_default(),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut incidents = rows.filter_map(Result::ok).collect::<Vec<_>>();
+    let has_more = incidents.len() > limit;
+    incidents.truncate(limit);
+    let next = has_more
+        .then(|| incidents.last().map(|x| x.updated_at))
+        .flatten();
+    Ok((incidents, next, has_more))
+}
 pub fn list_recent_incidents(path: &Path, limit: usize) -> Result<Vec<Incident>, String> {
     if !(1..=CHAT_MAX_INCIDENTS).contains(&limit) {
         return Err(format!(
@@ -2302,6 +2468,11 @@ fn open_readonly(path: &Path) -> Result<Connection, String> {
     // Read-only API work must not wait indefinitely behind a checkpoint or writer.
     conn.busy_timeout(StdDuration::from_secs(1))
         .map_err(|e| e.to_string())?;
+    API_QUERY_DEADLINE.with(|cell| {
+        if let Some(deadline) = cell.get() {
+            let _ = conn.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+        }
+    });
     Ok(conn)
 }
 pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), String> {
@@ -2993,15 +3164,40 @@ pub struct ProcessFinding {
 }
 type MemoryAverages = (Option<f64>, Option<f64>, Option<f64>);
 pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagnosis, String> {
-    let conn = open_readonly(path)?;
     let now = Utc::now();
     let (start, end) = parse_interval(since, now)?;
-    let duration = end - start;
     if compare != "previous-week" {
         return Err("only --compare previous-week is supported".into());
+    }
+    diagnose_memory_window(
+        path,
+        start,
+        end,
+        syslens_protocol::ComparisonMode::PreviousWeek,
+    )
+}
+
+/// Deterministic memory evidence for an API-selected absolute or relative interval.
+pub fn diagnose_memory_window(
+    path: &Path,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    comparison_mode: syslens_protocol::ComparisonMode,
+) -> Result<Diagnosis, String> {
+    if end <= start {
+        return Err("evidence interval must end after it starts".into());
+    }
+    let conn = open_readonly(path)?;
+    let duration = end - start;
+    let (cstart, cend) = match comparison_mode {
+        syslens_protocol::ComparisonMode::PreviousWeek => {
+            (start - Duration::days(7), end - Duration::days(7))
+        }
+        // Baseline is the complete seven days immediately before the current interval.
+        syslens_protocol::ComparisonMode::PrecedingWeekAverage => {
+            (start - Duration::days(7), start)
+        }
     };
-    let cstart = start - Duration::days(7);
-    let cend = end - Duration::days(7);
     let count = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
         conn.query_row(
             "SELECT count(*) FROM host_samples WHERE timestamp>=? AND timestamp<=? AND mem_total IS NOT NULL AND mem_available IS NOT NULL",
@@ -3023,6 +3219,8 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
     let expected = ((duration.num_seconds() + interval_seconds - 1) / interval_seconds).max(1);
+    let comparison_expected =
+        (((cend - cstart).num_seconds() + interval_seconds - 1) / interval_seconds).max(1);
     let gaps = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
         conn.query_row(
             "SELECT count(*) FROM collection_gaps WHERE timestamp>=? AND timestamp<=?",
@@ -3043,7 +3241,7 @@ pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagno
         comparison_samples: cn,
         expected_samples: expected,
         current_ratio: n as f64 / expected as f64,
-        comparison_ratio: cn as f64 / expected as f64,
+        comparison_ratio: cn as f64 / comparison_expected as f64,
         current_gaps,
         comparison_gaps,
     };
@@ -3199,13 +3397,38 @@ pub fn diagnose_storage(
     since: &str,
     compare: &str,
 ) -> Result<StorageDiagnosis, String> {
-    let conn = open_readonly(path)?;
     let now = Utc::now();
     let (start, end) = parse_interval(since, now)?;
     if compare != "previous-week" {
         return Err("only --compare previous-week is supported".into());
+    }
+    diagnose_storage_window(
+        path,
+        start,
+        end,
+        syslens_protocol::ComparisonMode::PreviousWeek,
+    )
+}
+
+/// Deterministic storage evidence for a selected API window.
+pub fn diagnose_storage_window(
+    path: &Path,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    comparison_mode: syslens_protocol::ComparisonMode,
+) -> Result<StorageDiagnosis, String> {
+    if end <= start {
+        return Err("evidence interval must end after it starts".into());
+    }
+    let conn = open_readonly(path)?;
+    let (cs, ce) = match comparison_mode {
+        syslens_protocol::ComparisonMode::PreviousWeek => {
+            (start - Duration::days(7), end - Duration::days(7))
+        }
+        syslens_protocol::ComparisonMode::PrecedingWeekAverage => {
+            (start - Duration::days(7), start)
+        }
     };
-    let (cs, ce) = (start - Duration::days(7), end - Duration::days(7));
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
     let mut limits=vec!["Directory evidence is unprivileged and local. It does not attribute storage use to a process.".into()];
     let mut stmt=conn.prepare("SELECT a.mount_id,a.mount_point,a.fs_type,a.used_bytes,b.used_bytes FROM mount_samples a JOIN mount_samples b ON a.mount_id=b.mount_id WHERE a.timestamp=(SELECT max(timestamp) FROM mount_samples x WHERE x.mount_id=a.mount_id AND x.timestamp>=?1 AND x.timestamp<=?2 AND x.used_bytes IS NOT NULL) AND b.timestamp=(SELECT max(timestamp) FROM mount_samples y WHERE y.mount_id=b.mount_id AND y.timestamp>=?3 AND y.timestamp<=?4 AND y.used_bytes IS NOT NULL)").map_err(|e|e.to_string())?;
@@ -5593,5 +5816,41 @@ mod tests {
         let mut enabled = config;
         enabled.api.enabled = true;
         assert!(enabled.validate().is_err());
+    }
+
+    #[test]
+    fn api_window_comparison_uses_the_expected_absolute_baseline() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        open_db(&path).unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let end = start + Duration::hours(2);
+        let previous = diagnose_memory_window(
+            &path,
+            start,
+            end,
+            syslens_protocol::ComparisonMode::PreviousWeek,
+        )
+        .unwrap();
+        assert_eq!(
+            previous.comparison.start_utc,
+            (start - Duration::days(7)).to_rfc3339()
+        );
+        assert_eq!(
+            previous.comparison.end_utc,
+            (end - Duration::days(7)).to_rfc3339()
+        );
+        let baseline = diagnose_memory_window(
+            &path,
+            start,
+            end,
+            syslens_protocol::ComparisonMode::PrecedingWeekAverage,
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.comparison.start_utc,
+            (start - Duration::days(7)).to_rfc3339()
+        );
+        assert_eq!(baseline.comparison.end_utc, start.to_rfc3339());
     }
 }
