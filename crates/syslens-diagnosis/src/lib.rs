@@ -4206,6 +4206,58 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    async fn api_request(
+        port: u16,
+        roots: rustls::RootCertStore,
+        client_cert: rustls::pki_types::CertificateDer<'static>,
+        client_key: Vec<u8>,
+        request: &[u8],
+    ) -> String {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![client_cert],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key)),
+            )
+            .unwrap();
+        let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                ServerName::try_from("localhost").unwrap(),
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn assert_api_error(response: &str, status: &str, code: &str) {
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with(status), "{headers}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{headers}"
+        );
+        let envelope: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(envelope["version"], syslens_protocol::V1);
+        assert_eq!(envelope["error"]["code"], code);
+        assert!(
+            envelope["request_id"]
+                .as_str()
+                .is_some_and(|id| Uuid::parse_str(id).is_ok()),
+            "{envelope}"
+        );
+    }
+
     fn assert_private_database_files(path: &Path) {
         for file in std::iter::once(path.to_path_buf()).chain(database_sidecar_paths(path)) {
             assert!(file.exists(), "{} should exist", file.display());
@@ -6125,10 +6177,13 @@ mod tests {
             },
             ..Config::default()
         };
+        let body_limit = cfg.api.max_request_bytes;
         let task = tokio::spawn(serve_api_async(cfg, db));
         tokio::time::sleep(StdDuration::from_millis(80)).await;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+        let trusted_client_cert = CertificateDer::from(client.der().to_vec());
+        let trusted_client_key = client_key.serialize_der();
         let connect = |certs: Vec<CertificateDer<'static>>, key: Option<PrivateKeyDer<'static>>| {
             let roots = roots.clone();
             async move {
@@ -6177,9 +6232,9 @@ mod tests {
             assert!(!String::from_utf8_lossy(&body).contains("200"));
         }
         let mut stream = connect(
-            vec![CertificateDer::from(client.der().to_vec())],
+            vec![trusted_client_cert.clone()],
             Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                client_key.serialize_der(),
+                trusted_client_key.clone(),
             ))),
         )
         .await
@@ -6195,6 +6250,63 @@ mod tests {
         assert!(output.contains("\"version\":1"));
         assert!(output.contains("\"request_id\""));
         assert!(output.contains("\"recording\":\"no-evidence\""));
+
+        let oversized_body = "x".repeat(body_limit + 1);
+        let oversized_request = format!(
+            "POST /v1/evidence/memory HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{oversized_body}",
+            oversized_body.len()
+        );
+        let oversized_response = api_request(
+            port,
+            roots.clone(),
+            trusted_client_cert.clone(),
+            trusted_client_key.clone(),
+            oversized_request.as_bytes(),
+        )
+        .await;
+        assert_api_error(&oversized_response, "HTTP/1.1 4", "invalid_request");
+
+        for path in [
+            "/v1/incidents?limit=nope",
+            "/v1/incidents?unexpected=1",
+            "/v1/incidents?before_updated_at=1",
+            "/v1/events?limit=nope",
+            "/v1/events?unexpected=1",
+            "/v1/events?after=-1",
+        ] {
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let response = api_request(
+                port,
+                roots.clone(),
+                trusted_client_cert.clone(),
+                trusted_client_key.clone(),
+                request.as_bytes(),
+            )
+            .await;
+            assert_api_error(&response, "HTTP/1.1 400", "invalid_request");
+        }
+
+        for (request, status) in [
+            (
+                "GET /v1/unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 404",
+            ),
+            (
+                "DELETE /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 405",
+            ),
+        ] {
+            let response = api_request(
+                port,
+                roots.clone(),
+                trusted_client_cert.clone(),
+                trusted_client_key.clone(),
+                request.as_bytes(),
+            )
+            .await;
+            assert_api_error(&response, status, "not_found");
+        }
         task.abort();
     }
 }
