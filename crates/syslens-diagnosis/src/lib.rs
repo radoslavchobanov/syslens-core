@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
@@ -871,6 +871,100 @@ pub fn evidence_identities(path: &Path) -> Result<(String, String), String> {
     Ok((get("host_id")?, get("evidence_store_id")?))
 }
 
+#[derive(Clone, Debug)]
+struct ApiIdentities {
+    host_id: String,
+    evidence_store_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvidenceStoreFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn evidence_store_file_identity(path: &Path) -> Result<EvidenceStoreFileIdentity, String> {
+    let metadata =
+        fs::metadata(path).map_err(|_| "evidence identity is unavailable".to_string())?;
+    Ok(EvidenceStoreFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn api_identity_snapshot(
+    database: &Path,
+) -> Result<(ApiIdentities, EvidenceStoreFileIdentity), String> {
+    let before = evidence_store_file_identity(database)?;
+    let (host_id, evidence_store_id) = evidence_identities(database)?;
+    let after = evidence_store_file_identity(database)?;
+    if before != after {
+        return Err("evidence identity changed during startup".into());
+    }
+    Ok((
+        ApiIdentities {
+            host_id,
+            evidence_store_id,
+        },
+        after,
+    ))
+}
+
+/// Resolve the database identity before the API accepts requests.  This keeps
+/// response construction free of synchronous SQLite work while preserving the
+/// identity assigned by schema migration or a replacement evidence store.
+async fn load_api_identities(
+    database: PathBuf,
+    deadline: StdDuration,
+) -> Result<(ApiIdentities, EvidenceStoreFileIdentity), String> {
+    tokio::time::timeout(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            with_api_query_deadline(deadline, || api_identity_snapshot(&database))
+        }),
+    )
+    .await
+    .map_err(|_| "cannot load evidence identity before API startup".to_string())?
+    .map_err(|_| "cannot load evidence identity before API startup".to_string())?
+    .map_err(|_| "cannot load evidence identity before API startup".to_string())
+}
+
+async fn evidence_store_is_current(
+    database: PathBuf,
+    expected: EvidenceStoreFileIdentity,
+    deadline: StdDuration,
+) -> Result<(), String> {
+    tokio::time::timeout(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            (evidence_store_file_identity(&database)? == expected)
+                .then_some(())
+                .ok_or_else(|| "evidence store was replaced".to_string())
+        }),
+    )
+    .await
+    .map_err(|_| "cannot verify evidence identity".to_string())?
+    .map_err(|_| "cannot verify evidence identity".to_string())?
+    .map_err(|_| "cannot verify evidence identity".to_string())
+}
+
+fn response_envelope<T: Serialize>(
+    identities: &ApiIdentities,
+    request_id: String,
+    observed_at: chrono::DateTime<Utc>,
+    data: T,
+) -> syslens_protocol::Envelope<T> {
+    syslens_protocol::Envelope {
+        version: syslens_protocol::V1,
+        request_id,
+        host_id: identities.host_id.clone(),
+        evidence_store_id: identities.evidence_store_id.clone(),
+        observed_at,
+        responded_at: Utc::now(),
+        data,
+    }
+}
+
 /// Serve the narrow, deterministic evidence interface. It is deliberately a
 /// separate process from the recorder: if it is stopped, collection continues.
 pub fn serve_api(config_path: &Path, database: &Path) -> Result<(), String> {
@@ -918,6 +1012,8 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     #[derive(Clone)]
     struct ApiState {
         database: PathBuf,
+        identities: ApiIdentities,
+        evidence_store: EvidenceStoreFileIdentity,
         retention: u32,
         interval: u64,
         max_response: usize,
@@ -971,6 +1067,25 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             "endpoint not found",
         )
     }
+    async fn guard_evidence_store(
+        state: &ApiState,
+        request_id: &str,
+    ) -> Result<(), (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>)> {
+        evidence_store_is_current(
+            state.database.clone(),
+            state.evidence_store,
+            state.max_query,
+        )
+        .await
+        .map_err(|_| {
+            err(
+                request_id.into(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })
+    }
     #[allow(clippy::result_large_err)]
     fn envelope<T: Serialize>(
         state: &ApiState,
@@ -981,23 +1096,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         Json<syslens_protocol::Envelope<T>>,
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
-        let (host_id, evidence_store_id) = evidence_identities(&state.database).map_err(|_| {
-            err(
-                request_id.clone(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                syslens_protocol::ErrorCode::EvidenceUnavailable,
-                "evidence is unavailable",
-            )
-        })?;
-        let result = syslens_protocol::Envelope {
-            version: syslens_protocol::V1,
-            request_id,
-            host_id,
-            evidence_store_id,
-            observed_at: observed,
-            responded_at: Utc::now(),
-            data,
-        };
+        let result = response_envelope(&state.identities, request_id, observed, data);
         if serde_json::to_vec(&result).map_or(true, |x| x.len() > state.max_response) {
             return Err(err(
                 result.request_id.clone(),
@@ -1015,6 +1114,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
+        guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
         let deadline = s.max_query;
         let (first, last) = tokio::time::timeout(
@@ -1065,6 +1165,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 )
             }
         })?;
+        guard_evidence_store(&s, &id).await?;
         let ts = |x: Option<i64>| x.and_then(|v| Utc.timestamp_opt(v, 0).single());
         envelope(
             &s,
@@ -1085,6 +1186,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
+        guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
         let deadline = s.max_query;
         let (count, last) = tokio::time::timeout(
@@ -1135,6 +1237,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 )
             }
         })?;
+        guard_evidence_store(&s, &id).await?;
         let latest = last.and_then(|x| Utc.timestamp_opt(x, 0).single());
         let freshness = latest.map(|x| (Utc::now() - x).num_seconds().max(0));
         // Three expected collection periods allows one ordinary delayed sample.
@@ -1212,6 +1315,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
         let (start, end) = resolve_window(&r.window)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
         let mode = r.window.comparison;
         let deadline = s.max_query;
@@ -1256,6 +1360,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "evidence is unavailable",
             )
         })?;
+        guard_evidence_store(&s, &id).await?;
         envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
     }
     async fn storage(
@@ -1282,6 +1387,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
         let (start, end) = resolve_window(&r.window)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
         let mode = r.window.comparison;
         let deadline = s.max_query;
@@ -1326,6 +1432,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "evidence is unavailable",
             )
         })?;
+        guard_evidence_store(&s, &id).await?;
         envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
     }
     async fn incidents(
@@ -1369,6 +1476,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "invalid pagination",
             ));
         }
+        guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
         let deadline = s.max_query;
         let (incidents, next_cursor, has_more) = tokio::time::timeout(
@@ -1411,6 +1519,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 )
             }
         })?;
+        guard_evidence_store(&s, &id).await?;
         envelope(
             &s,
             id,
@@ -1450,6 +1559,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "invalid pagination",
             ));
         }
+        guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
         let deadline = s.max_query;
         let after = q.after.unwrap_or(0);
@@ -1493,14 +1603,19 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 )
             }
         })?;
+        guard_evidence_store(&s, &id).await?;
         envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
     }
+    let max_query = StdDuration::from_millis(config.api.max_query_millis);
+    let (identities, evidence_store) = load_api_identities(database.clone(), max_query).await?;
     let state = ApiState {
         database,
+        identities,
+        evidence_store,
         retention: config.retention_days,
         interval: config.interval_seconds,
         max_response: config.api.max_response_bytes,
-        max_query: StdDuration::from_millis(config.api.max_query_millis),
+        max_query,
     };
     let app = Router::new()
         .route("/v1/capabilities", get(capabilities))
@@ -2672,8 +2787,14 @@ fn open_readonly(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| e.to_string())?;
     // Read-only API work must not wait indefinitely behind a checkpoint or writer.
-    conn.busy_timeout(StdDuration::from_secs(1))
-        .map_err(|e| e.to_string())?;
+    let busy_timeout = API_QUERY_DEADLINE.with(|cell| {
+        cell.get().map_or(StdDuration::from_secs(1), |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(StdDuration::from_secs(1))
+        })
+    });
+    conn.busy_timeout(busy_timeout).map_err(|e| e.to_string())?;
     API_QUERY_DEADLINE.with(|cell| {
         if let Some(deadline) = cell.get() {
             let _ = conn.progress_handler(1_000, Some(move || Instant::now() >= deadline));
@@ -4699,6 +4820,10 @@ mod tests {
         let repo_asset = include_str!("../../../systemd/syslens-diagnosis.service");
         assert!(repo_asset.contains("Type=simple"));
         assert!(repo_asset.contains("daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
+        let api_asset = include_str!("../../../packaging/debian/syslens-diagnosis-api.service");
+        assert!(api_asset.contains("ExecStart=/usr/bin/syslens-diagnosis serve --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
+        let repo_api_asset = include_str!("../../../systemd/syslens-diagnosis-api.service");
+        assert!(repo_api_asset.contains("ExecStart=%h/.local/bin/syslens-diagnosis serve --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
         assert!(
             service_unit(Path::new("/bin/d"), Path::new("/c"), Path::new("/d"))
                 .contains("Type=simple")
@@ -6067,6 +6192,63 @@ mod tests {
     }
 
     #[test]
+    fn response_envelope_uses_cached_identity_while_database_is_locked() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        open_db(&path).unwrap();
+        let (host_id, evidence_store_id) = evidence_identities(&path).unwrap();
+        let identities = ApiIdentities {
+            host_id: host_id.clone(),
+            evidence_store_id: evidence_store_id.clone(),
+        };
+        let lock = Connection::open(&path).unwrap();
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        let started = Instant::now();
+        let envelope = response_envelope(&identities, "request".into(), Utc::now(), json!({}));
+        assert!(started.elapsed() < StdDuration::from_millis(100));
+        assert_eq!(envelope.host_id, host_id);
+        assert_eq!(envelope.evidence_store_id, evidence_store_id);
+    }
+
+    #[tokio::test]
+    async fn api_identity_startup_load_has_a_bounded_locked_database_failure() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        open_db(&path).unwrap();
+        let lock = Connection::open(&path).unwrap();
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        let started = Instant::now();
+        let error = load_api_identities(path, StdDuration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "cannot load evidence identity before API startup");
+        assert!(started.elapsed() < StdDuration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn api_identity_startup_uses_the_replacement_evidence_store() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        open_db(&path).unwrap();
+        let replaced = d.path().join("replaced.sqlite");
+        fs::rename(&path, &replaced).unwrap();
+        open_db(&path).unwrap();
+        let (host_id, evidence_store_id) = evidence_identities(&path).unwrap();
+
+        let (identities, file_identity) =
+            load_api_identities(path.clone(), StdDuration::from_millis(50))
+                .await
+                .unwrap();
+        assert_eq!(identities.host_id, host_id);
+        assert_eq!(identities.evidence_store_id, evidence_store_id);
+        assert_eq!(file_identity, evidence_store_file_identity(&path).unwrap());
+    }
+
+    #[test]
     fn api_is_disabled_and_requires_all_mtls_material_when_enabled() {
         let config = Config::default();
         assert!(!config.api.enabled);
@@ -6143,6 +6325,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("evidence.sqlite");
         open_db(&db).unwrap();
+        let original_identities = evidence_identities(&db).unwrap();
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -6178,7 +6361,7 @@ mod tests {
             ..Config::default()
         };
         let body_limit = cfg.api.max_request_bytes;
-        let task = tokio::spawn(serve_api_async(cfg, db));
+        let task = tokio::spawn(serve_api_async(cfg, db.clone()));
         tokio::time::sleep(StdDuration::from_millis(80)).await;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
@@ -6250,6 +6433,24 @@ mod tests {
         assert!(output.contains("\"version\":1"));
         assert!(output.contains("\"request_id\""));
         assert!(output.contains("\"recording\":\"no-evidence\""));
+
+        let replacement = dir.path().join("replacement.sqlite");
+        open_db(&replacement).unwrap();
+        assert_ne!(
+            evidence_identities(&replacement).unwrap(),
+            original_identities
+        );
+        fs::rename(&replacement, &db).unwrap();
+        let replaced_response = api_request(
+            port,
+            roots.clone(),
+            trusted_client_cert.clone(),
+            trusted_client_key.clone(),
+            b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_api_error(&replaced_response, "HTTP/1.1 503", "evidence_unavailable");
+        assert!(!replaced_response.contains(&original_identities.0));
 
         let oversized_body = "x".repeat(body_limit + 1);
         let oversized_request = format!(
