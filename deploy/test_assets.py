@@ -12,7 +12,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -177,6 +179,62 @@ class DeploymentAssets(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 64)
 
+    def test_ollama_start_preflights_the_deployment_env_before_docker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deployment = Path(directory) / "ollama"
+            deployment.mkdir()
+            for script in ("preflight.sh", "start.sh"):
+                source = ROOT / "ollama" / script
+                destination = deployment / script
+                shutil.copy2(source, destination)
+                destination.chmod(0o755)
+            bin_directory = Path(directory) / "bin"
+            bin_directory.mkdir()
+            capture = Path(directory) / "docker.args"
+            docker = bin_directory / "docker"
+            docker.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$DOCKER_CAPTURE"\n')
+            docker.chmod(0o755)
+            base_environment = {
+                **os.environ,
+                "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
+                "DOCKER_CAPTURE": str(capture),
+            }
+            base_environment.pop("OLLAMA_LAN_IP", None)
+
+            (deployment / ".env").write_text("OLLAMA_LAN_IP=192.168.0.144\n")
+            result = subprocess.run(
+                [str(deployment / "start.sh")],
+                env=base_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(capture.read_text(), "compose up -d --wait ollama\n")
+
+            capture.unlink()
+            (deployment / ".env").write_text("OLLAMA_LAN_IP=0.0.0.0\n")
+            result = subprocess.run(
+                [str(deployment / "start.sh")],
+                env=base_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 64)
+            self.assertFalse(capture.exists(), "invalid .env must fail before Docker")
+
+            override_environment = {**base_environment, "OLLAMA_LAN_IP": "10.0.0.1"}
+            result = subprocess.run(
+                [str(deployment / "start.sh")],
+                env=override_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(capture.read_text(), "compose up -d --wait ollama\n")
+
     def test_dockerfile_build_and_runtime_boundary(self):
         lines = [line for line in read("gateway/Dockerfile").splitlines() if line and not line.startswith("#")]
         instructions = [line.split(" ", 1) for line in lines]
@@ -230,6 +288,7 @@ class DeploymentAssets(unittest.TestCase):
             for operation in ("docker compose pull", "docker compose up", "docker compose stop", "tar -", "rollback"):
                 self.assertIn(operation, text)
         self.assertIn("docker compose exec ollama ollama pull qwen3:4b", ollama)
+        self.assertNotIn("docker compose start ollama", ollama)
         self.assertIn("/api/tags", ollama)
         self.assertIn("DOCKER-USER", ollama)
         self.assertIn("sudo install -d -o 0 -g 0 -m 0700 data", ollama)

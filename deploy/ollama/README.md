@@ -44,7 +44,10 @@ published host port binds only `OLLAMA_LAN_IP:11434`.
 `10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16`. It rejects an unset,
 wildcard, loopback, public, malformed, or IPv6 value. The Compose file has no
 wildcard default, but `docker compose up` bypasses this validation and **must
-not be used directly**.
+not be used directly**. `start.sh` validates an externally supplied
+`OLLAMA_LAN_IP` when one is set; otherwise it safely reads only the single
+`OLLAMA_LAN_IP=...` entry from this deployment directory's `.env` before it
+calls Docker. Do not source `.env` in a shell.
 
 Before starting, configure a persistent host firewall policy that allows TCP
 11434 from Orange Pi's LAN address (`192.168.0.108` in this example) and drops
@@ -119,7 +122,7 @@ umask 077
 docker compose images
 docker compose stop ollama
 sudo tar -czf - compose.yaml .env data > "backups/ollama-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-docker compose start ollama
+./start.sh
 ```
 
 Preserve the prior image tag/digest and full model digest. Edit `.env` to a new
