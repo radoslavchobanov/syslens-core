@@ -28,7 +28,17 @@ pub fn action(name: &str, args: Value) -> Result<Action> {
                 Action::Storage(r)
             })
         }
-        "status" | "incidents" if args.as_object().is_some_and(|o| o.is_empty()) => {
+        "status" | "incidents" => {
+            if args
+                .as_object()
+                .and_then(|object| object.get("q"))
+                .is_some_and(|q| !q.is_string())
+            {
+                return Err("invalid status/incidents arguments".into());
+            }
+            let args: StatusIncidentArguments =
+                serde_json::from_value(args).map_err(|_| "invalid status/incidents arguments")?;
+            let _ = args.q;
             Ok(if name == "status" {
                 Action::Status
             } else {
@@ -37,6 +47,13 @@ pub fn action(name: &str, args: Value) -> Result<Action> {
         }
         _ => Err("unsupported evidence action or arguments".into()),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusIncidentArguments {
+    #[serde(default)]
+    q: Option<String>,
 }
 pub fn window(since: &str, compare: &str) -> Result<EvidenceRequest> {
     let (value, unit) = if since == "today" {
@@ -235,7 +252,6 @@ mod tests {
     #[test]
     fn tools_are_strict() {
         assert!(action("shell", json!({})).is_err());
-        assert!(action("status", json!({"host":"other"})).is_err());
         assert!(
             action(
                 "memory",
@@ -250,6 +266,16 @@ mod tests {
             )
             .is_ok()
         );
+    }
+    #[test]
+    fn status_and_incidents_allow_only_string_q() {
+        assert!(action("status", json!({})).is_ok());
+        assert!(action("status", json!({"q":"current status"})).is_ok());
+        assert!(action("incidents", json!({"q":"recent incidents"})).is_ok());
+        assert!(action("status", json!({"host":"other"})).is_err());
+        assert!(action("incidents", json!({"unknown":true})).is_err());
+        assert!(action("incidents", json!({"q":42})).is_err());
+        assert!(action("status", json!({"q":null})).is_err());
     }
     #[test]
     fn rejects_duplicate_and_oversized_tool_calls() {
