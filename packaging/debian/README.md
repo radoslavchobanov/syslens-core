@@ -68,6 +68,18 @@ After installation, run `syslens-gateway init`, configure the owner-only
 `~/.config/syslens-gateway/config.toml`, then run `syslens-gateway enable`.
 The package never starts the service or creates state during installation.
 
+### Optional split Docker deployment
+
+Core and diagnosis remain native Debian/systemd services on each monitored
+host. The gateway may instead use the [Orange Pi Docker project](../../deploy/gateway/README.md)
+with a separate [Acemagic Ollama project](../../deploy/ollama/README.md).
+These templates do not modify the native gateway package or unit and do not
+deploy automatically during package installation. They include independent
+image/model update and rollback procedures. CI and the release verification
+job run `python3 deploy/test_assets.py` to parse the Compose YAML subset and
+statically check Dockerfile and deployment security conventions without a
+Docker daemon, third-party Python packages, or network requests.
+
 ## APT repository policy
 
 Release artifacts are suitable for direct `apt install ./file.deb`. Final

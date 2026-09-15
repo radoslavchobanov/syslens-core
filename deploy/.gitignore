@@ -1,0 +1,8 @@
+.env
+config/
+state/
+run/
+data/
+backups/
+*.key
+*.pem

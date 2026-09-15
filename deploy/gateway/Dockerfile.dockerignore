@@ -1,0 +1,11 @@
+# Allow only the workspace inputs; never send host configs, keys or build state.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**/
+!src/**/*.rs
+!crates/
+!crates/**/
+!crates/**/Cargo.toml
+!crates/**/*.rs

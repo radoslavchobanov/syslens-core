@@ -21,6 +21,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Check Docker deployment assets (offline)
+        run: python3 deploy/test_assets.py
+
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

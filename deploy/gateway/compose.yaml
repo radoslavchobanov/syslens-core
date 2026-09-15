@@ -1,0 +1,28 @@
+{
+  "name": "syslens-gateway",
+  "services": {
+    "gateway": {
+      "image": "${SYSLENS_GATEWAY_IMAGE:?Set a commit-tagged gateway image in .env}",
+      "user": "${GATEWAY_UID:-1000}:${GATEWAY_GID:-1000}",
+      "read_only": true,
+      "security_opt": ["no-new-privileges:true"],
+      "cap_drop": ["ALL"],
+      "tmpfs": ["/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777"],
+      "cpus": 1,
+      "mem_limit": "512m",
+      "pids_limit": 128,
+      "restart": "unless-stopped",
+      "stop_grace_period": "30s",
+      "volumes": [
+        {"type": "bind", "source": "./config", "target": "/etc/syslens-gateway", "read_only": true, "bind": {"create_host_path": false}},
+        {"type": "bind", "source": "./state", "target": "/var/lib/syslens-gateway", "bind": {"create_host_path": false}},
+        {"type": "bind", "source": "./run", "target": "/run", "bind": {"create_host_path": false}}
+      ],
+      "healthcheck": {
+        "test": ["CMD", "syslens-gateway", "--config", "/etc/syslens-gateway/config.toml", "health"],
+        "interval": "30s", "timeout": "5s", "start_period": "15s", "retries": 3
+      },
+      "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
+    }
+  }
+}

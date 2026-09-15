@@ -275,7 +275,8 @@ body, response, query, and pagination limits.
 
 ### Optional gateway and AI chat
 
-`syslens-gateway` is a separate, disabled-by-default native user service. It
+`syslens-gateway` is a separate, disabled-by-default service with native and
+optional Docker deployment paths. It
 is the only SysLens component allowed to contact an OpenAI-compatible endpoint;
 the collector and every `syslens-diagnosis` target remain deterministic and
 never install, run, or contact a model. It connects to each configured host
@@ -297,7 +298,17 @@ as the configuration reference. Its `[ai]` section is disabled by default.
 HTTPS is required for model endpoints and redirects/proxies are disabled. Plain
 HTTP is accepted only after an explicit owner configuration opt-in and only for
 a loopback or private-IP endpoint. The gateway exposes its daemon API solely on
-an owner-only Unix socket; no Docker service or network listener is created.
+an owner-only Unix socket. Native installation creates no Docker service or
+network listener.
+
+For a split deployment, keep Core and diagnosis native on each monitored host,
+run the [gateway Docker project on Orange Pi](deploy/gateway/README.md), and
+run the [dedicated Ollama Docker project on Acemagic](deploy/ollama/README.md).
+These are explicit optional setups with persistent data and bounded resources;
+the gateway publishes no TCP port and Ollama binds only the configured LAN
+address. The guides cover owner-only mounts, firewall restrictions, model
+selection, backups, updates, and rollback. Native gateway Debian/systemd
+packaging remains available.
 
 `syslens chat` forwards to the sibling `syslens-gateway` client. Conversations
 are named-host sessions and follow-ups cannot change targets. The bounded tool

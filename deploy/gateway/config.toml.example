@@ -1,0 +1,26 @@
+# Host: /home/orangepi/syslens-gateway/config/config.toml (0600).
+# Its directory and certs directory must be 0700, owned by GATEWAY_UID.
+# Explicitly set enabled = true when ready to start the Docker daemon.
+enabled = false
+socket = "/run/syslens-gateway.sock"
+database = "/var/lib/syslens-gateway/gateway.sqlite"
+
+[ai]
+enabled = false
+allow_insecure_http = false
+request_timeout_seconds = 120
+max_rounds = 3
+max_calls = 4
+# After securing the Acemagic LAN endpoint, enable AI and explicitly opt in:
+# endpoint_url = "http://192.168.0.144:11434/v1/chat/completions"
+# model = "qwen3:4b"
+# allow_insecure_http = true  # replace the false value above; do not duplicate
+
+# Configure each native diagnosis evidence API with its own mTLS identity.
+# [hosts.acemagic]
+# url = "https://192.168.0.144:9843"
+# ca = "/etc/syslens-gateway/certs/acemagic-ca.pem"
+# client_cert = "/etc/syslens-gateway/certs/gateway-client.pem"
+# client_key = "/etc/syslens-gateway/certs/gateway-client.key"
+# host_id = "replace-with-host-api-host-id"
+# evidence_store_id = "replace-with-host-api-evidence-store-id"
