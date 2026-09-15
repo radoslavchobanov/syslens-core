@@ -1,0 +1,16 @@
+[Unit]
+Description=SysLens evidence gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/syslens-gateway --config %h/.config/syslens-gateway/config.toml daemon
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

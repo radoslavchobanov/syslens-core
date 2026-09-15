@@ -1,0 +1,32 @@
+# Copy to ~/.config/syslens-gateway/config.toml and keep the file and parent
+# directory owner-only (0600 and 0700). `syslens-gateway init` creates the
+# disabled equivalent safely.
+enabled = false
+# socket = "/home/you/.local/state/syslens-gateway/run/gateway.sock"
+# database = "/home/you/.local/state/syslens-gateway/gateway.sqlite"
+
+# The gateway alone may contact an OpenAI-compatible endpoint. Targets expose
+# deterministic evidence only and never need a model configuration.
+[ai]
+enabled = false
+# endpoint_url = "https://ai.example.net/v1/chat/completions"
+# model = "your-compatible-model"
+# api_key_env = "SYSLENS_GATEWAY_AI_API_KEY"
+# HTTP is rejected unless this is true and the endpoint is a loopback/private IP.
+allow_insecure_http = false
+request_timeout_seconds = 120
+max_rounds = 3
+max_calls = 4
+
+# Give every remote evidence host a name. The TLS CA, client certificate, and
+# private key must be absolute owner-only paths. Pinning host_id and
+# evidence_store_id is recommended; a changed identity requires explicit
+# `syslens-gateway hosts enroll NAME` and invalidates old conversations.
+#
+# [hosts.acemagic]
+# url = "https://192.168.0.144:9843"
+# ca = "/home/you/.config/syslens-gateway/certs/acemagic-ca.pem"
+# client_cert = "/home/you/.config/syslens-gateway/certs/gateway-client.pem"
+# client_key = "/home/you/.config/syslens-gateway/certs/gateway-client.key"
+# host_id = "replace-with-host-api-host-id"
+# evidence_store_id = "replace-with-host-api-evidence-store-id"

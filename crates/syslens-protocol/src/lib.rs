@@ -110,6 +110,9 @@ pub struct ErrorEnvelope {
     pub version: u16,
     pub request_id: String,
     pub error: ProtocolError,
+    /// Old event cursors can recover at this floor after recording a history gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_floor: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProtocolError {
@@ -124,6 +127,7 @@ pub enum ErrorCode {
     Unauthorized,
     NotFound,
     EvidenceUnavailable,
+    HistoryGap,
     QueryTimeout,
     Internal,
 }

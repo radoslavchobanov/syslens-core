@@ -5,15 +5,9 @@ interval_seconds = 30
 retention_days = 185
 database_budget_bytes = 17179869184
 
-[ai]
-# The endpoint client is opt-in. It never installs or starts a local model.
-enabled = false
-# endpoint_url = "https://ai.example.net/v1/chat/completions"
-# Plaintext HTTP is disabled by default. Set this only for a trusted LAN/loopback IP endpoint.
-allow_insecure_http = false
-# model = "your-compatible-model"
-# api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
-request_timeout_seconds = 20
+# Legacy `[ai]` settings are ignored here: targets never contact or run a
+# model. Move a prior section to the owner-only gateway config with
+# `syslens-gateway migrate-ai --from ~/.config/syslens-diagnosis/config.toml`.
 
 # The host evidence API is a separate, disabled-by-default mTLS service for a
 # future SysLens Gateway. It never enables the recorder or AI chat itself.

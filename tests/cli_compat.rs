@@ -242,7 +242,37 @@ fn diagnosis_commands_delegate_to_a_sibling_addon_without_a_shell() {
 
 #[cfg(unix)]
 #[test]
-fn diagnosis_commands_explain_when_the_addon_is_not_installed() {
+fn chat_delegates_to_a_sibling_gateway_without_a_shell() {
+    let fixture = Fixture::new();
+    let bin_directory = fixture.root.join("bin");
+    fs::create_dir(&bin_directory).unwrap();
+    let core = bin_directory.join("syslens");
+    fs::copy(env!("CARGO_BIN_EXE_syslens"), &core).unwrap();
+
+    let capture = fixture.root.join("arguments");
+    let gateway = bin_directory.join("syslens-gateway");
+    fs::write(
+        &gateway,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SYSLENS_TEST_CAPTURE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gateway, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(&core)
+        .env("SYSLENS_TEST_CAPTURE", &capture)
+        .args(["chat", "--host", "pi", "why?"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(capture).unwrap(),
+        "chat\n--host\npi\nwhy?\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_explains_when_the_gateway_is_not_installed() {
     let fixture = Fixture::new();
     let bin_directory = fixture.root.join("bin");
     fs::create_dir(&bin_directory).unwrap();
@@ -256,7 +286,7 @@ fn diagnosis_commands_explain_when_the_addon_is_not_installed() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("install syslens-diagnosis"),
+        String::from_utf8_lossy(&output.stderr).contains("install the optional syslens-gateway"),
         "missing installation advice: {}",
         String::from_utf8_lossy(&output.stderr)
     );

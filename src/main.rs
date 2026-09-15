@@ -3278,7 +3278,7 @@ fn main() -> ExitCode {
             InventoryCommand::Status => run_inventory_status(),
         },
         Some(Command::Diagnose { arguments }) => run_diagnosis_addon("diagnose", arguments),
-        Some(Command::Chat { arguments }) => run_diagnosis_addon("chat", arguments),
+        Some(Command::Chat { arguments }) => run_gateway_chat(arguments),
         Some(Command::Incidents { arguments }) => run_diagnosis_addon("incidents", arguments),
         None if cli.setup => run_setup(cli.setup_config.unwrap_or_else(default_config_path)),
         None if cli.validate_config => match cli.config.as_deref() {
@@ -3320,6 +3320,26 @@ fn diagnosis_addon_command() -> ProcessCommand {
     match sibling.filter(|path| is_executable_file(path)) {
         Some(path) => ProcessCommand::new(path),
         None => ProcessCommand::new("syslens-diagnosis"),
+    }
+}
+
+fn run_gateway_chat(arguments: Vec<OsString>) -> Result<(), String> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("syslens-gateway")));
+    let mut command = sibling
+        .filter(|p| is_executable_file(p))
+        .map(ProcessCommand::new)
+        .unwrap_or_else(|| ProcessCommand::new("syslens-gateway"));
+    let status = command
+        .arg("chat")
+        .args(arguments)
+        .status()
+        .map_err(|_| "install the optional syslens-gateway client to use chat".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("syslens-gateway chat exited with {status}"))
     }
 }
 

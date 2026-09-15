@@ -1,0 +1,265 @@
+use axum::{
+    Json, Router,
+    extract::Query,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+};
+use syslens_gateway::{
+    ai::ChatRequest,
+    client::HostClient,
+    config::{self, Config, Host},
+    daemon::App,
+};
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    host: Host,
+    gap_floor: Arc<AtomicI64>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+async fn fixture() -> Fixture {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ca_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = params.self_signed(&ca_key).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let server = CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .signed_by(&key, &ca, &ca_key)
+        .unwrap();
+    let client_key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec!["gateway".into()])
+        .unwrap()
+        .signed_by(&client_key, &ca, &ca_key)
+        .unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    let cert_path = dir.path().join("client.pem");
+    let key_path = dir.path().join("client.key");
+    config::write_new(&ca_path, ca.pem().as_bytes()).unwrap();
+    config::write_new(&cert_path, cert.pem().as_bytes()).unwrap();
+    config::write_new(&key_path, client_key.serialize_pem().as_bytes()).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .unwrap();
+    let tls = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![server.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let gap_floor = Arc::new(AtomicI64::new(0));
+    let events_floor = gap_floor.clone();
+    let router=Router::new().route("/v1/capabilities",get(||async{Json(envelope(json!({"timezone":"UTC","resources":["memory","storage"],"earliest_observation":null,"latest_observation":null})))}))
+        .route("/v1/status",get(||async{Json(envelope(json!({"recording":"active","samples":10,"latest_observation":null,"freshness_seconds":0})))}))
+        .route("/v1/events",get(move|Query(query):Query<BTreeMap<String,String>>|{let floor=events_floor.clone();async move{let after=query.get("after").and_then(|v|v.parse::<i64>().ok()).unwrap_or(0);let replay=floor.load(Ordering::Relaxed);if replay>after{(StatusCode::CONFLICT,Json(json!({"version":1,"request_id":"request","error":{"code":"history_gap","message":"notification history gap"},"replay_floor":replay}))).into_response()}else{Json(envelope(json!({"events":[],"next_cursor":after,"has_more":false}))).into_response()}}}))
+        .route("/v1/evidence/memory",post(|Json(body):Json<Value>|async move{assert!(body["window"].is_object());Json(envelope(json!({"status":"insufficient evidence","limitations":["No comparison history yet"]})))}));
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let app = router.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let service = hyper_util::service::TowerToHyperService::new(app);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                }
+            });
+        }
+    });
+    Fixture {
+        dir,
+        host: Host {
+            url: format!("https://localhost:{port}"),
+            ca: ca_path,
+            client_cert: cert_path,
+            client_key: key_path,
+            host_id: Some("host".into()),
+            evidence_store_id: Some("store".into()),
+        },
+        gap_floor,
+        task,
+    }
+}
+fn envelope(data: Value) -> Value {
+    json!({"version":1,"request_id":"request","host_id":"host","evidence_store_id":"store","observed_at":chrono::Utc::now(),"responded_at":chrono::Utc::now(),"data":data})
+}
+fn app_config(f: &Fixture) -> Config {
+    let mut c = Config {
+        enabled: true,
+        database: f.dir.path().join("state/gateway.db"),
+        socket: f.dir.path().join("run/gateway.sock"),
+        ..Config::default()
+    };
+    c.hosts.insert("pi".into(), f.host.clone());
+    c
+}
+
+#[tokio::test]
+async fn mtls_enforces_client_trust_and_host_identity() {
+    let f = fixture().await;
+    let client = HostClient::new(&f.host, 2).unwrap();
+    let status = client
+        .request::<syslens_protocol::Status>("/v1/status", None)
+        .await
+        .unwrap();
+    assert_eq!(status.data.samples, 10);
+    let mut wrong = f.host.clone();
+    wrong.host_id = Some("another-host".into());
+    assert!(
+        HostClient::new(&wrong, 2)
+            .unwrap()
+            .request::<Value>("/v1/status", None)
+            .await
+            .unwrap_err()
+            .contains("identity mismatch")
+    );
+    let public = syslens_gateway::client::tls_client(Some(&f.host.ca), None, None, 2).unwrap();
+    assert!(
+        public
+            .get(format!("{}/v1/status", f.host.url))
+            .send()
+            .await
+            .is_err()
+    );
+    let other = fixture().await;
+    let mut untrusted = f.host.clone();
+    untrusted.ca = other.host.ca.clone();
+    let error = HostClient::new(&untrusted, 2)
+        .unwrap()
+        .request::<Value>("/v1/status", None)
+        .await
+        .unwrap_err();
+    assert_eq!(error, "host connection failed");
+    assert!(!error.contains("localhost"));
+}
+#[tokio::test]
+async fn tool_loop_uses_selected_host_and_sessions_resume() {
+    let f = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router=Router::new().route("/v1/chat/completions",post(|Json(body):Json<Value>|async move{
+        let messages=body["messages"].as_array().unwrap();assert_eq!(body["model"],"test-model");
+        let tool=messages.last().unwrap()["role"]=="tool";
+        if tool {assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("insufficient evidence"));Json(json!({"choices":[{"message":{"role":"assistant","content":"There is insufficient comparison history."}}]}))}
+        else {Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"memory","arguments":"{\"window\":{\"relative\":{\"value\":1,\"unit\":\"today\"}}}"}}]}}]}))}
+    }));
+    let model = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut config = app_config(&f);
+    config.ai.enabled = true;
+    config.ai.allow_insecure_http = true;
+    config.ai.endpoint_url = format!("http://{address}/v1/chat/completions");
+    config.ai.model = "test-model".into();
+    let app = App::new(config).unwrap();
+    let result = app
+        .chat(ChatRequest {
+            question: "Why is memory higher?".into(),
+            host: Some("pi".into()),
+            session: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["target"], "pi");
+    assert_eq!(result["evidence_refs"].as_array().unwrap().len(), 1);
+    let id = result["session"].as_str().unwrap().to_string();
+    let followup = app
+        .chat(ChatRequest {
+            question: "What is missing?".into(),
+            host: None,
+            session: Some(id.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(followup["session"], id);
+    model.abort();
+    let failed = app
+        .chat(ChatRequest {
+            question: "why?".into(),
+            host: None,
+            session: Some(id),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(failed, "AI endpoint is unavailable");
+    assert_eq!(
+        app.operation("host-status", json!({"host":"pi"}))
+            .await
+            .unwrap()["data"]["samples"],
+        10
+    );
+    app.poll_host("pi").await.unwrap();
+}
+#[tokio::test]
+async fn event_poll_recovers_from_a_host_replay_floor() {
+    let f = fixture().await;
+    f.gap_floor.store(5, Ordering::Relaxed);
+    let app = App::new(app_config(&f)).unwrap();
+    app.poll_host("pi").await.unwrap();
+    let store = app.store.lock().unwrap();
+    assert_eq!(store.cursor("pi").unwrap(), 5);
+    let events = store.events(0).unwrap();
+    assert_eq!(events["events"].as_array().unwrap().len(), 1);
+    assert_eq!(events["events"][0]["event"]["kind"], "history_gap");
+}
+#[tokio::test]
+async fn unix_socket_client_and_api_are_independent_of_ha() {
+    let f = fixture().await;
+    let c = app_config(&f);
+    let socket = c.socket.clone();
+    let server = tokio::spawn(syslens_gateway::daemon::run(c));
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let hosts = syslens_gateway::daemon::request(&socket, "hosts", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(hosts["hosts"][0]["name"], "pi");
+    let status = syslens_gateway::daemon::request(&socket, "host-status", json!({"host":"pi"}))
+        .await
+        .unwrap();
+    assert_eq!(status["data"]["samples"], 10);
+    let metadata = fs::metadata(&socket).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let failed = syslens_gateway::daemon::request(
+        &socket,
+        "chat",
+        json!({"question":"why?","host":"pi","session":null}),
+    )
+    .await
+    .unwrap_err();
+    assert!(failed.contains("AI is disabled"));
+    server.abort();
+    let _ = server.await;
+}

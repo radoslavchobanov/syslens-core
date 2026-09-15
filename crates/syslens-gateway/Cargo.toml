@@ -1,0 +1,29 @@
+[package]
+name = "syslens-gateway"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Independent SysLens evidence gateway and local AI client"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syslens-protocol = { path = "../syslens-protocol" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync", "signal"] }
+toml = "0.8"
+uuid = { version = "1.12", features = ["v4"] }
+hyper = { version = "1", features = ["server", "http1", "client"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tempfile = "3.14"
+rcgen = "0.13"
+tokio-rustls = "0.26"
+rustls = "0.23"

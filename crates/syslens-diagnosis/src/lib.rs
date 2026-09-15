@@ -51,7 +51,9 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub detection: DetectionConfig,
-    /// Optional, outbound-only OpenAI-compatible chat endpoint.
+    /// Legacy target-side AI settings. They are retained only so the gateway
+    /// migration command can read existing owner configuration; inference no
+    /// longer runs on a target host.
     #[serde(default)]
     pub ai: AiConfig,
     /// Disabled-by-default mutually-authenticated host evidence API.
@@ -358,31 +360,10 @@ impl Config {
         {
             return Err("invalid storage forecast or cooldown setting".into());
         }
-        let ai = &self.ai;
-        if !(5..=120).contains(&ai.request_timeout_seconds) {
-            return Err("ai.request_timeout_seconds must be between 5 and 120".into());
-        }
-        if let Some(endpoint) = ai.endpoint_url.as_deref() {
-            validate_ai_endpoint(endpoint, ai.allow_insecure_http)?;
-        }
-        if let Some(model) = ai.model.as_deref()
-            && (model.trim().is_empty() || model.len() > 200)
-        {
-            return Err("ai.model must be between 1 and 200 characters".into());
-        }
-        if let Some(name) = ai.api_key_env.as_deref()
-            && (!is_environment_variable_name(name) || name.len() > 128)
-        {
-            return Err("ai.api_key_env must be a valid environment variable name".into());
-        }
-        if ai.enabled {
-            ai.endpoint_url
-                .as_deref()
-                .ok_or("ai.endpoint_url is required when ai.enabled is true")?;
-            ai.model
-                .as_deref()
-                .ok_or("ai.model is required when ai.enabled is true")?;
-        }
+        // `[ai]` is intentionally not validated here.  It is a compatibility
+        // payload for `syslens-gateway migrate-ai`, never a target-side
+        // network client.  An obsolete or incomplete legacy section must not
+        // stop deterministic recording or host evidence serving.
         let api = &self.api;
         let bind: IpAddr = api
             .bind_address
@@ -424,13 +405,6 @@ impl Config {
         }
         Ok(())
     }
-}
-
-fn is_environment_variable_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
-        })
 }
 
 /// The chat client accepts a generic HTTPS OpenAI-compatible endpoint. Plaintext
@@ -590,6 +564,11 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     let config: Config =
         toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
     config.validate()?;
+    if config.ai.enabled {
+        eprintln!(
+            "Legacy diagnosis AI settings are deprecated and ignored; configure syslens-gateway instead"
+        );
+    }
     Ok(config)
 }
 pub fn ensure_config(path: &Path) -> Result<Config, String> {
@@ -1074,6 +1053,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             status,
             h,
             Json(syslens_protocol::ErrorEnvelope {
+                replay_floor: None,
                 version: syslens_protocol::V1,
                 request_id: id,
                 error: syslens_protocol::ProtocolError {
@@ -1618,6 +1598,19 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                     syslens_protocol::ErrorCode::QueryTimeout,
                     "evidence query timed out",
                 )
+            } else if let Some(floor) = e
+                .strip_prefix("notification history gap: cursor ")
+                .and_then(|s| s.split_once(" predates deleted cursor "))
+                .and_then(|(_, floor)| floor.parse::<i64>().ok())
+            {
+                let mut result = err(
+                    id.clone(),
+                    StatusCode::CONFLICT,
+                    syslens_protocol::ErrorCode::HistoryGap,
+                    "notification history gap",
+                );
+                result.2.0.replay_floor = Some(floor);
+                result
             } else {
                 err(
                     id.clone(),
@@ -4032,10 +4025,8 @@ pub fn render_diagnosis(d: &Diagnosis) -> String {
     s
 }
 
-const CHAT_MAX_QUESTION_BYTES: usize = 4_000;
-const CHAT_MAX_RESPONSE_BYTES: u64 = 256 * 1024;
+#[cfg(test)]
 const CHAT_MAX_EVIDENCE_BYTES: usize = 32 * 1024;
-const CHAT_MAX_ROUNDS: usize = 3;
 const CHAT_MAX_INCIDENTS: usize = 20;
 
 /// The only local evidence operations a remote chat endpoint can request.
@@ -4127,6 +4118,8 @@ fn validate_chat_since(since: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn chat_tools() -> Value {
     json!([
         {"type":"function","function":{"name":"memory_diagnosis","description":"Read the bounded local memory diagnosis and its evidence limitations.","parameters":{"type":"object","additionalProperties":false,"required":["since"],"properties":{"since":{"type":"string","description":"today, 1h..720h, or 1d..30d"}}}}},
@@ -4178,6 +4171,7 @@ pub fn execute_chat_action(action: &ChatAction, database: &Path) -> Result<Value
     }
 }
 
+#[cfg(test)]
 fn bounded_chat_evidence(result: Result<Value, String>) -> Value {
     match result {
         Ok(evidence) => match serde_json::to_vec(&evidence) {
@@ -4193,171 +4187,10 @@ fn bounded_chat_evidence(result: Result<Value, String>) -> Value {
     }
 }
 
-fn redact_endpoint(endpoint: &str) -> String {
-    let (scheme, remainder) = endpoint
-        .split_once("://")
-        .unwrap_or(("https", "configured endpoint"));
-    let authority = remainder.split('/').next().unwrap_or("configured endpoint");
-    format!("{scheme}://{authority}/…")
-}
-
-fn ai_http_agent(timeout: u64, allow_insecure_http: bool) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(StdDuration::from_secs(timeout)))
-        .https_only(!allow_insecure_http)
-        .max_redirects(0)
-        .build()
-        .into()
-}
-
-fn send_chat_request(config: &AiConfig, request: &Value) -> Result<Value, String> {
-    let endpoint = config
-        .endpoint_url
-        .as_deref()
-        .ok_or("AI chat is enabled but no endpoint is configured")?;
-    validate_ai_endpoint(endpoint, config.allow_insecure_http)?;
-    let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let agent = ai_http_agent(config.request_timeout_seconds, config.allow_insecure_http);
-    let mut builder = agent
-        .post(endpoint)
-        .header("content-type", "application/json")
-        .header("accept", "application/json");
-    if let Some(variable) = config.api_key_env.as_deref() {
-        let token = std::env::var(variable).map_err(|_| {
-            format!("AI chat credential environment variable {variable} is not set")
-        })?;
-        if token.is_empty() {
-            return Err(format!(
-                "AI chat credential environment variable {variable} is empty"
-            ));
-        }
-        builder = builder.header("authorization", format!("Bearer {token}"));
-    }
-    let response = builder.send(&payload).map_err(|error| {
-        format!(
-            "AI chat endpoint {} is unreachable or rejected the request: {}",
-            redact_endpoint(endpoint),
-            error
-        )
-    })?;
-    let body = response
-        .into_body()
-        .into_with_config()
-        .limit(CHAT_MAX_RESPONSE_BYTES)
-        .read_to_string()
-        .map_err(|error| {
-            format!(
-                "AI chat endpoint {} returned an unreadable response: {error}",
-                redact_endpoint(endpoint)
-            )
-        })?;
-    serde_json::from_str(&body).map_err(|_| {
-        format!(
-            "AI chat endpoint {} returned malformed JSON",
-            redact_endpoint(endpoint)
-        )
-    })
-}
-
-fn assistant_message(response: &Value) -> Result<Value, String> {
-    response
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .cloned()
-        .filter(Value::is_object)
-        .ok_or_else(|| "AI chat endpoint response has no assistant message".to_string())
-}
-
-fn response_text(message: &Value) -> Result<Option<String>, String> {
-    match message.get("content") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) if text.len() <= CHAT_MAX_RESPONSE_BYTES as usize => {
-            Ok(Some(text.clone()))
-        }
-        Some(Value::String(_)) => Err("AI chat answer exceeds the response size limit".into()),
-        _ => Err("AI chat endpoint returned a malformed assistant answer".into()),
-    }
-}
-
-/// Runs a bounded OpenAI-compatible tool loop.  The endpoint receives the
-/// question and capability description first; local evidence is released only
-/// after each requested action has passed strict validation.
-pub fn run_chat(config: &Config, database: &Path, question: &str) -> Result<String, String> {
+/// Compatibility entry point: inference now belongs to the gateway.
+pub fn run_chat(config: &Config, _database: &Path, _question: &str) -> Result<String, String> {
     config.validate()?;
-    if !config.ai.enabled {
-        return Err("AI chat is disabled. Set [ai].enabled = true and configure its HTTPS endpoint and model in the owner-only diagnosis config.".into());
-    }
-    if question.trim().is_empty() || question.len() > CHAT_MAX_QUESTION_BYTES {
-        return Err(format!(
-            "chat question must contain 1 to {CHAT_MAX_QUESTION_BYTES} bytes"
-        ));
-    }
-    let model = config
-        .ai
-        .model
-        .as_deref()
-        .ok_or("AI chat is enabled but no model is configured")?;
-    let mut messages = vec![
-        json!({"role":"system","content":chat_capability_message()}),
-        json!({"role":"user","content":question}),
-    ];
-    let mut evidence_actions = 0;
-    for round in 0..=CHAT_MAX_ROUNDS {
-        let request = json!({"model":model,"messages":messages,"tools":chat_tools(),"tool_choice":"auto","temperature":0});
-        let assistant = assistant_message(&send_chat_request(&config.ai, &request)?)?;
-        let calls = assistant
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if calls.is_empty() {
-            let answer = response_text(&assistant)?
-                .ok_or("AI chat endpoint returned neither an answer nor an evidence action".into());
-            return if evidence_actions == 0 {
-                answer.map(|text| {
-                    format!("No local evidence was requested by the endpoint.\n\n{text}")
-                })
-            } else {
-                answer
-            };
-        }
-        if round == CHAT_MAX_ROUNDS || calls.len() > 4 {
-            return Err("AI chat requested too many evidence-action rounds".into());
-        }
-        messages.push(assistant);
-        for call in calls {
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("AI chat endpoint returned a tool call without an id")?;
-            let function = call
-                .get("function")
-                .and_then(Value::as_object)
-                .ok_or("AI chat endpoint returned a malformed tool call")?;
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or("AI chat endpoint returned a tool call without a name")?;
-            let raw = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .ok_or("AI chat endpoint returned tool arguments in an invalid format")?;
-            if raw.len() > 8_192 {
-                return Err("AI chat endpoint requested oversized tool arguments".into());
-            }
-            let arguments: Value = serde_json::from_str(raw)
-                .map_err(|_| "AI chat endpoint returned malformed tool arguments")?;
-            let evidence = bounded_chat_evidence(
-                parse_chat_action(name, &arguments)
-                    .and_then(|action| execute_chat_action(&action, database)),
-            );
-            evidence_actions += 1;
-            messages.push(json!({"role":"tool","tool_call_id":id,"content":serde_json::to_string(&evidence).map_err(|error| error.to_string())?}));
-        }
-    }
-    Err("AI chat exhausted its evidence-action budget".into())
+    Err("AI chat moved to syslens-gateway; migrate legacy settings with syslens-gateway migrate-ai and select a target host".into())
 }
 
 pub fn unix_now() -> i64 {
@@ -4485,23 +4318,23 @@ mod tests {
     }
 
     #[test]
-    fn chat_config_requires_http_opt_in_before_accepting_a_lan_endpoint() {
+    fn legacy_ai_config_is_ignored_by_target_validation() {
         let mut config = Config::default();
         config.ai.endpoint_url = Some("http://127.0.0.1/v1/chat/completions".into());
-        assert!(config.validate().is_err());
-        config.ai.allow_insecure_http = true;
+        assert!(config.validate().is_ok());
+        config.ai.request_timeout_seconds = 0;
         assert!(config.validate().is_ok());
     }
 
     #[test]
-    fn public_chat_entrypoint_rejects_public_http_before_a_request() {
+    fn legacy_chat_entrypoint_does_not_contact_a_model() {
         let mut config = Config::default();
         config.ai.enabled = true;
         config.ai.allow_insecure_http = true;
         config.ai.endpoint_url = Some("http://8.8.8.8/v1/chat/completions".into());
         config.ai.model = Some("test-model".into());
         let error = run_chat(&config, Path::new("/not-used.sqlite"), "test question").unwrap_err();
-        assert!(error.contains("loopback, private, or link-local"));
+        assert!(error.contains("moved to syslens-gateway"));
     }
 
     #[test]
@@ -4536,13 +4369,9 @@ mod tests {
     }
 
     #[test]
-    fn chat_http_client_requires_https_by_default_and_never_follows_redirects() {
-        let secure_agent = ai_http_agent(20, false);
-        assert!(secure_agent.config().https_only());
-        assert_eq!(secure_agent.config().max_redirects(), 0);
-        let trusted_lan_agent = ai_http_agent(20, true);
-        assert!(!trusted_lan_agent.config().https_only());
-        assert_eq!(trusted_lan_agent.config().max_redirects(), 0);
+    fn legacy_chat_never_contacts_a_model() {
+        let error = run_chat(&Config::default(), Path::new("/unused"), "why?").unwrap_err();
+        assert!(error.contains("moved to syslens-gateway"));
     }
 
     #[test]
@@ -6392,7 +6221,7 @@ mod tests {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("evidence.sqlite");
         open_db(&db).unwrap();

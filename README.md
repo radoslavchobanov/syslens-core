@@ -233,7 +233,7 @@ syslens-diagnosis disable
 syslens-diagnosis diagnose memory --since today --compare previous-week
 syslens-diagnosis diagnose storage --since 7d --compare previous-week
 syslens diagnose memory --since 7d
-syslens-diagnosis chat "What local evidence explains the recent RAM increase?"
+syslens chat --host acemagic "What local evidence explains the recent RAM increase?"
 ```
 
 `enable` creates `~/.config/syslens-diagnosis/config.toml` (owner-only),
@@ -273,42 +273,43 @@ network API. The default bind is `127.0.0.1:9843`; only loopback, private, and
 link-local IP addresses are accepted. The API is JSON-only and has bounded
 body, response, query, and pagination limits.
 
-### Optional AI chat
+### Optional gateway and AI chat
 
-The add-on's outbound OpenAI-compatible `/v1/chat/completions` client is
-disabled by default. It neither installs nor runs a model. Enable it only in
-the owner-only diagnosis configuration created by `enable`:
+`syslens-gateway` is a separate, disabled-by-default native user service. It
+is the only SysLens component allowed to contact an OpenAI-compatible endpoint;
+the collector and every `syslens-diagnosis` target remain deterministic and
+never install, run, or contact a model. It connects to each configured host
+evidence API with mTLS, validates the host/evidence-store identity,
+independently polls bounded events, and retains owner-only session and replay
+state.
 
-```toml
-[ai]
-enabled = true
-endpoint_url = "https://ai.example.net/v1/chat/completions"
-# Default false. Set true only for a trusted LAN/loopback IP endpoint using HTTP.
-allow_insecure_http = false
-model = "your-compatible-model"
-# Optional: bearer token is read from this environment variable, never TOML.
-api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
-request_timeout_seconds = 20
+```bash
+syslens-gateway init
+# edit ~/.config/syslens-gateway/config.toml (0600; parent directory 0700)
+syslens-gateway enable
+syslens-gateway hosts list
+syslens chat --host acemagic "What local evidence explains the RAM increase?"
+syslens-gateway diagnose --host acemagic memory --since 7d
 ```
 
-[`crates/syslens-diagnosis/config.toml.example`](crates/syslens-diagnosis/config.toml.example)
-is a minimal equivalent example. Do not place this `[ai]` section in the Core
-MQTT configuration.
+Use [`crates/syslens-gateway/config.toml.example`](crates/syslens-gateway/config.toml.example)
+as the configuration reference. Its `[ai]` section is disabled by default.
+HTTPS is required for model endpoints and redirects/proxies are disabled. Plain
+HTTP is accepted only after an explicit owner configuration opt-in and only for
+a loopback or private-IP endpoint. The gateway exposes its daemon API solely on
+an owner-only Unix socket; no Docker service or network listener is created.
 
-HTTPS is required by default. A separately supplied lightweight model service on
-a trusted LAN or loopback address may use plaintext HTTP only after explicitly
-setting `allow_insecure_http = true`; HTTP hostnames and public IPs remain
-rejected. HTTP exposes prompts and responses to anyone able to observe that
-network, so use it only on a network you trust. Redirects remain disabled.
+`syslens chat` forwards to the sibling `syslens-gateway` client. Conversations
+are named-host sessions and follow-ups cannot change targets. The bounded tool
+loop can request only that selected host's memory/storage evidence, status, or
+recent incidents—never shell, SQL, filesystem, arbitrary network, or arbitrary
+tool access. Model failure never stops deterministic host status, diagnosis,
+event replay, or recording; chat reports a safe bounded error instead.
 
-`syslens-diagnosis chat "question"` sends the question and a fixed capability
-description first. The endpoint can then request only validated, read-only
-memory or storage diagnoses (up to 30 days), current evidence status, or up to
-20 recent incidents. It cannot invoke a shell, SQL, filesystem, network, or
-arbitrary tools. The client limits action rounds, results, response size, and
-HTTP time, and reports disabled, unreachable, or malformed endpoints without
-printing endpoint credentials. A plain answer is permitted, but it must not be
-treated as local evidence unless the endpoint requested and received it.
+Existing `[ai]` settings in a diagnosis config are ignored by targets. To move
+them without overwriting configuration, run `syslens-gateway migrate-ai --from
+~/.config/syslens-diagnosis/config.toml` before creating the gateway config;
+then add mTLS host entries and enable the gateway explicitly.
 
 Every `incidents ... --json` response uses a version `1` envelope. `watch`
 emits one notification-event envelope per event, while `list`, `show`, and
@@ -340,9 +341,10 @@ the default eligible-mount selection.
 the collector will stop after logout; enable it explicitly with
 `loginctl enable-linger $USER` when continuous home-server recording is wanted.
 
-Core forwards `syslens diagnose ...`, `syslens chat`, and `syslens incidents
-...` to the companion on the same host when installed. Core-only installations
-create no diagnosis state or background work.
+Core forwards `syslens diagnose ...` and `syslens incidents ...` to the local
+diagnosis companion when installed, and `syslens chat` to the optional gateway
+client. Core-only installations create no diagnosis/gateway state or background
+work.
 See [`packaging/debian`](packaging/debian/README.md) for the independent
 package build.
 

@@ -47,6 +47,27 @@ packaging/debian/build-diagnosis-deb.sh \
 The package installs a disabled systemd user-service template. Package
 installation never starts it. Enable it explicitly after installation.
 
+## Optional gateway
+
+`syslens-gateway` is an independent owner-owned evidence gateway and terminal
+client. It polls configured mTLS host APIs, keeps bounded event/session state,
+and is the only package that can optionally contact an OpenAI-compatible
+endpoint. It neither bundles nor starts a model. Build and package it
+independently:
+
+```bash
+cargo build --locked --release --package syslens-gateway
+packaging/debian/build-gateway-deb.sh \
+  target/release/syslens-gateway \
+  0.2.0 \
+  amd64 \
+  dist
+```
+
+After installation, run `syslens-gateway init`, configure the owner-only
+`~/.config/syslens-gateway/config.toml`, then run `syslens-gateway enable`.
+The package never starts the service or creates state during installation.
+
 ## APT repository policy
 
 Release artifacts are suitable for direct `apt install ./file.deb`. Final
