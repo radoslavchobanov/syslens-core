@@ -5,6 +5,8 @@ use syslens_protocol::{
     ComparisonMode, EvidenceRequest, EvidenceWindow, RelativeRange, RelativeUnit,
 };
 
+const MAX_COMPLETION_TOKENS: u64 = 512;
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Memory(EvidenceRequest),
@@ -98,6 +100,22 @@ impl Model {
             config: c.clone(),
         })
     }
+    fn completion_payload(model: &str, messages: &[Value]) -> Value {
+        // Ollama's OpenAI-compatible API uses `think: false` to disable the
+        // private reasoning trace for thinking models such as Qwen3. Keep the
+        // output-token cap as a second bound for compatible endpoints that do
+        // not implement that extension.
+        json!({
+            "model": model,
+            "messages": messages,
+            "tools": tools(),
+            "tool_choice": "auto",
+            "temperature": 0,
+            "stream": false,
+            "max_tokens": MAX_COMPLETION_TOKENS,
+            "think": false,
+        })
+    }
     fn authenticated(&self, r: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         if let Some(env) = &self.config.api_key_env {
             let token = std::env::var(env).map_err(|_| "AI credential is unavailable")?;
@@ -110,7 +128,7 @@ impl Model {
         }
     }
     pub async fn completion(&self, model: &str, messages: &[Value]) -> Result<Value> {
-        let payload = json!({"model":model,"messages":messages,"tools":tools(),"tool_choice":"auto","temperature":0,"stream":false});
+        let payload = Self::completion_payload(model, messages);
         if payload.to_string().len() > 131_072 {
             return Err("model context limit reached".into());
         }
@@ -241,5 +259,11 @@ mod tests {
     #[test]
     fn disabled_model_has_no_transport() {
         assert!(Model::new(&Ai::default()).is_err());
+    }
+    #[test]
+    fn completion_payload_bounds_output_and_disables_thinking() {
+        let payload = Model::completion_payload("qwen3:4b", &[]);
+        assert_eq!(payload["max_tokens"], MAX_COMPLETION_TOKENS);
+        assert_eq!(payload["think"], false);
     }
 }

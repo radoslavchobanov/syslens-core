@@ -167,6 +167,8 @@ async fn tool_loop_uses_selected_host_and_sessions_resume() {
     let address = listener.local_addr().unwrap();
     let router=Router::new().route("/v1/chat/completions",post(|Json(body):Json<Value>|async move{
         let messages=body["messages"].as_array().unwrap();assert_eq!(body["model"],"test-model");
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["think"], false);
         let tool=messages.last().unwrap()["role"]=="tool";
         if tool {assert!(messages.last().unwrap()["content"].as_str().unwrap().contains("insufficient evidence"));Json(json!({"choices":[{"message":{"role":"assistant","content":"There is insufficient comparison history."}}]}))}
         else {Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"memory","arguments":"{\"window\":{\"relative\":{\"value\":1,\"unit\":\"today\"}}}"}}]}}]}))}
