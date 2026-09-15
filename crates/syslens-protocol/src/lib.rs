@@ -148,6 +148,7 @@ pub struct Status {
     pub recording: String,
     pub samples: u64,
     pub latest_observation: Option<DateTime<Utc>>,
+    pub freshness_seconds: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncidentPage {

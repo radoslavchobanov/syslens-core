@@ -919,6 +919,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     struct ApiState {
         database: PathBuf,
         retention: u32,
+        interval: u64,
         max_response: usize,
         max_query: StdDuration,
     }
@@ -1134,14 +1135,23 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 )
             }
         })?;
+        let latest = last.and_then(|x| Utc.timestamp_opt(x, 0).single());
+        let freshness = latest.map(|x| (Utc::now() - x).num_seconds().max(0));
+        // Three expected collection periods allows one ordinary delayed sample.
+        let recording = match freshness {
+            None => "no-evidence",
+            Some(seconds) if seconds <= (s.interval as i64 * 3) => "healthy",
+            Some(_) => "stale",
+        };
         envelope(
             &s,
             id,
             Utc::now(),
             syslens_protocol::Status {
-                recording: "unknown".into(),
+                recording: recording.into(),
                 samples: count as u64,
-                latest_observation: last.and_then(|x| Utc.timestamp_opt(x, 0).single()),
+                latest_observation: latest,
+                freshness_seconds: freshness,
             },
         )
     }
@@ -1320,12 +1330,20 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     }
     async fn incidents(
         State(s): State<ApiState>,
-        Query(q): Query<IncidentsQuery>,
+        query: Result<Query<IncidentsQuery>, axum::extract::rejection::QueryRejection>,
     ) -> Result<
         Json<syslens_protocol::Envelope<syslens_protocol::IncidentPage>>,
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
+        let Query(q) = query.map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "invalid query",
+            )
+        })?;
         let limit = q.limit.unwrap_or(100);
         let before = match (q.before_updated_at, q.before_id) {
             (None, None) => None,
@@ -1409,12 +1427,20 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     }
     async fn events(
         State(s): State<ApiState>,
-        Query(q): Query<EventsQuery>,
+        query: Result<Query<EventsQuery>, axum::extract::rejection::QueryRejection>,
     ) -> Result<
         Json<syslens_protocol::Envelope<Value>>,
         (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
     > {
         let id = Uuid::new_v4().to_string();
+        let Query(q) = query.map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "invalid query",
+            )
+        })?;
         let limit = q.limit.unwrap_or(100);
         if !(1..=256).contains(&limit) || q.after.unwrap_or(0) < 0 {
             return Err(err(
@@ -1472,6 +1498,7 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
     let state = ApiState {
         database,
         retention: config.retention_days,
+        interval: config.interval_seconds,
         max_response: config.api.max_response_bytes,
         max_query: StdDuration::from_millis(config.api.max_query_millis),
     };
@@ -6053,5 +6080,121 @@ mod tests {
             .map(|x| x.id)
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(ids.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn evidence_api_requires_mtls_and_trusted_client_reaches_status() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("evidence.sqlite");
+        open_db(&db).unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let client_params = CertificateParams::new(vec!["gateway".into()]).unwrap();
+        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+        let cert = dir.path().join("server.pem");
+        let key = dir.path().join("server.key");
+        let capath = dir.path().join("ca.pem");
+        std::fs::write(&cert, server.pem()).unwrap();
+        std::fs::write(&key, server_key.serialize_pem()).unwrap();
+        std::fs::write(&capath, ca.pem()).unwrap();
+        for p in [&cert, &key, &capath] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let cfg = Config {
+            api: ApiConfig {
+                enabled: true,
+                bind_address: "127.0.0.1".into(),
+                port,
+                tls_cert_path: Some(cert),
+                tls_key_path: Some(key),
+                trusted_gateway_ca_path: Some(capath),
+                ..ApiConfig::default()
+            },
+            ..Config::default()
+        };
+        let task = tokio::spawn(serve_api_async(cfg, db));
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+        let connect = |certs: Vec<CertificateDer<'static>>, key: Option<PrivateKeyDer<'static>>| {
+            let roots = roots.clone();
+            async move {
+                let config = match key {
+                    Some(key) => rustls::ClientConfig::builder()
+                        .with_root_certificates(roots.clone())
+                        .with_client_auth_cert(certs, key)
+                        .unwrap(),
+                    None => rustls::ClientConfig::builder()
+                        .with_root_certificates(roots.clone())
+                        .with_no_client_auth(),
+                };
+                tokio_rustls::TlsConnector::from(Arc::new(config))
+                    .connect(
+                        ServerName::try_from("localhost").unwrap(),
+                        tokio::net::TcpStream::connect(("127.0.0.1", port))
+                            .await
+                            .unwrap(),
+                    )
+                    .await
+            }
+        };
+        let mut no_client = connect(vec![], None).await.unwrap();
+        let _ = no_client
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let mut no_client_body = Vec::new();
+        let _ = no_client.read_to_end(&mut no_client_body).await;
+        assert!(!String::from_utf8_lossy(&no_client_body).contains("200"));
+        let bad_key = KeyPair::generate().unwrap();
+        let bad_params = CertificateParams::new(vec!["bad".into()]).unwrap();
+        let bad = bad_params.self_signed(&bad_key).unwrap();
+        let bad_result = connect(
+            vec![CertificateDer::from(bad.der().to_vec())],
+            Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                bad_key.serialize_der(),
+            ))),
+        )
+        .await;
+        if let Ok(mut bad_stream) = bad_result {
+            let _ = bad_stream
+                .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await;
+            let mut body = Vec::new();
+            let _ = bad_stream.read_to_end(&mut body).await;
+            assert!(!String::from_utf8_lossy(&body).contains("200"));
+        }
+        let mut stream = connect(
+            vec![CertificateDer::from(client.der().to_vec())],
+            Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                client_key.serialize_der(),
+            ))),
+        )
+        .await
+        .unwrap();
+        stream
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await.unwrap();
+        let output = String::from_utf8(body).unwrap();
+        assert!(output.starts_with("HTTP/1.1 200"));
+        assert!(output.contains("\"version\":1"));
+        assert!(output.contains("\"request_id\""));
+        assert!(output.contains("\"recording\":\"no-evidence\""));
+        task.abort();
     }
 }
