@@ -14,10 +14,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const MIN_SQLITE: (i32, i32, i32) = (3, 51, 3);
 pub const GIB: u64 = 1024 * 1024 * 1024;
 const CONTROL_HEADROOM: u64 = 64 * 1024 * 1024;
@@ -40,6 +41,61 @@ pub struct Config {
     /// Optional, outbound-only OpenAI-compatible chat endpoint.
     #[serde(default)]
     pub ai: AiConfig,
+    /// Disabled-by-default mutually-authenticated host evidence API.
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_api_bind")]
+    pub bind_address: String,
+    #[serde(default = "default_api_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub tls_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub trusted_gateway_ca_path: Option<PathBuf>,
+    #[serde(default = "default_api_body_limit")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_api_response_limit")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_api_query_ms")]
+    pub max_query_millis: u64,
+}
+fn default_api_bind() -> String {
+    "127.0.0.1".into()
+}
+fn default_api_port() -> u16 {
+    9843
+}
+fn default_api_body_limit() -> usize {
+    16 * 1024
+}
+fn default_api_response_limit() -> usize {
+    256 * 1024
+}
+fn default_api_query_ms() -> u64 {
+    2_000
+}
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: default_api_bind(),
+            port: default_api_port(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            trusted_gateway_ca_path: None,
+            max_request_bytes: default_api_body_limit(),
+            max_response_bytes: default_api_response_limit(),
+            max_query_millis: default_api_query_ms(),
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -205,6 +261,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             detection: DetectionConfig::default(),
             ai: AiConfig::default(),
+            api: ApiConfig::default(),
         }
     }
 }
@@ -291,6 +348,42 @@ impl Config {
             ai.model
                 .as_deref()
                 .ok_or("ai.model is required when ai.enabled is true")?;
+        }
+        let api = &self.api;
+        let bind: IpAddr = api
+            .bind_address
+            .parse()
+            .map_err(|_| "api.bind_address must be an IP address")?;
+        if !is_trusted_lan_address(bind) {
+            return Err(
+                "api.bind_address must be a loopback, private, or link-local LAN IP address".into(),
+            );
+        }
+        if !(1024..=65535).contains(&api.port) {
+            return Err("api.port must be between 1024 and 65535".into());
+        }
+        if !(1024..=64 * 1024).contains(&api.max_request_bytes)
+            || !(1024..=1024 * 1024).contains(&api.max_response_bytes)
+            || !(50..=10_000).contains(&api.max_query_millis)
+        {
+            return Err("api request, response, or query limit is outside allowed range".into());
+        }
+        if api.enabled {
+            for p in [
+                &api.tls_cert_path,
+                &api.tls_key_path,
+                &api.trusted_gateway_ca_path,
+            ] {
+                let Some(p) = p else {
+                    return Err(
+                        "enabled API requires TLS certificate, key, and trusted gateway CA paths"
+                            .into(),
+                    );
+                };
+                if !p.is_absolute() {
+                    return Err("API TLS paths must be absolute".into());
+                }
+            }
         }
         Ok(())
     }
@@ -387,6 +480,29 @@ pub fn config_path() -> PathBuf {
 }
 pub fn user_service_path() -> PathBuf {
     xdg_path("XDG_CONFIG_HOME", ".config").join("systemd/user/syslens-diagnosis.service")
+}
+pub fn api_service_path() -> PathBuf {
+    xdg_path("XDG_CONFIG_HOME", ".config").join("systemd/user/syslens-diagnosis-api.service")
+}
+pub fn api_service_unit(binary: &Path, config: &Path, database: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=SysLens diagnosis evidence API\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} serve --config {} --database {}\nNoNewPrivileges=yes\nPrivateTmp=yes\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        binary.display(),
+        config.display(),
+        database.display()
+    )
+}
+pub fn install_api_user_service(
+    binary: &Path,
+    config: &Path,
+    database: &Path,
+) -> Result<PathBuf, String> {
+    let path = api_service_path();
+    let parent = path.parent().ok_or("service path has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    fs::write(&path, api_service_unit(binary, config, database))
+        .map_err(|_| "cannot write API service unit")?;
+    Ok(path)
 }
 pub fn service_unit(binary: &Path, config: &Path, database: &Path) -> String {
     format!(
@@ -708,7 +824,431 @@ CREATE INDEX notification_events_created ON notification_events(created_at);
 CREATE TABLE notification_consumers (name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
 PRAGMA user_version=3; COMMIT;").map_err(|e|e.to_string())?;
     }
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if v == 3 {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO metadata(key,value) VALUES('host_id',?)",
+            [Uuid::new_v4().to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO metadata(key,value) VALUES('evidence_store_id',?)",
+            [Uuid::new_v4().to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute_batch("PRAGMA user_version=4;")
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Stable IDs make a wrongly-routed request or replacement evidence database visible to a gateway.
+pub fn evidence_identities(path: &Path) -> Result<(String, String), String> {
+    let conn = open_readonly(path)?;
+    let get = |key: &str| {
+        conn.query_row("SELECT value FROM metadata WHERE key=?", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(|_| "evidence identity is unavailable".to_string())
+    };
+    Ok((get("host_id")?, get("evidence_store_id")?))
+}
+
+/// Serve the narrow, deterministic evidence interface. It is deliberately a
+/// separate process from the recorder: if it is stopped, collection continues.
+pub fn serve_api(config_path: &Path, database: &Path) -> Result<(), String> {
+    secure_config(config_path)?;
+    let config = load_config(config_path)?;
+    if !config.api.enabled {
+        return Err("API is disabled; set [api].enabled = true and configure mTLS paths".into());
+    }
+    secure_api_material(&config.api)?;
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|_| "cannot start API runtime".to_string())?;
+    runtime.block_on(serve_api_async(config, database.to_path_buf()))
+}
+fn secure_api_material(api: &ApiConfig) -> Result<(), String> {
+    for path in [
+        &api.tls_cert_path,
+        &api.tls_key_path,
+        &api.trusted_gateway_ca_path,
+    ] {
+        let p = path.as_ref().ok_or("enabled API requires TLS material")?;
+        let mode = fs::metadata(p)
+            .map_err(|_| "cannot access API TLS material")?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err("API TLS material must be owner-only".into());
+        }
+    }
+    Ok(())
+}
+async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String> {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
+    };
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::{RootCertStore, ServerConfig};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+    #[derive(Clone)]
+    struct ApiState {
+        database: PathBuf,
+        retention: u32,
+        max_response: usize,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EventsQuery {
+        #[serde(default)]
+        after: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+    fn err(
+        id: String,
+        status: StatusCode,
+        code: syslens_protocol::ErrorCode,
+        message: &str,
+    ) -> (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>) {
+        let mut h = HeaderMap::new();
+        h.insert("content-type", "application/json".parse().unwrap());
+        h.insert("x-content-type-options", "nosniff".parse().unwrap());
+        (
+            status,
+            h,
+            Json(syslens_protocol::ErrorEnvelope {
+                version: syslens_protocol::V1,
+                request_id: id,
+                error: syslens_protocol::ProtocolError {
+                    code,
+                    message: message.into(),
+                },
+            }),
+        )
+    }
+    #[allow(clippy::result_large_err)]
+    fn envelope<T: Serialize>(
+        state: &ApiState,
+        request_id: String,
+        observed: chrono::DateTime<Utc>,
+        data: T,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<T>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let (host_id, evidence_store_id) = evidence_identities(&state.database).map_err(|_| {
+            err(
+                request_id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        let result = syslens_protocol::Envelope {
+            version: syslens_protocol::V1,
+            request_id,
+            host_id,
+            evidence_store_id,
+            observed_at: observed,
+            responded_at: Utc::now(),
+            data,
+        };
+        if serde_json::to_vec(&result).map_or(true, |x| x.len() > state.max_response) {
+            return Err(err(
+                result.request_id.clone(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "response exceeds configured bound",
+            ));
+        }
+        Ok(Json(result))
+    }
+    async fn capabilities(
+        State(s): State<ApiState>,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<syslens_protocol::Capabilities>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let id = Uuid::new_v4().to_string();
+        let conn = open_readonly(&s.database).map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        let (first, last): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT min(timestamp),max(timestamp) FROM host_samples",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| {
+                err(
+                    id.clone(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    syslens_protocol::ErrorCode::EvidenceUnavailable,
+                    "evidence is unavailable",
+                )
+            })?;
+        let ts = |x: Option<i64>| x.and_then(|v| Utc.timestamp_opt(v, 0).single());
+        envelope(
+            &s,
+            id,
+            Utc::now(),
+            syslens_protocol::Capabilities {
+                timezone: Local::now().offset().to_string(),
+                resources: vec!["memory".into(), "storage".into(), "incidents".into()],
+                earliest_observation: ts(first),
+                latest_observation: ts(last),
+            },
+        )
+    }
+    async fn status(
+        State(s): State<ApiState>,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<syslens_protocol::Status>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let id = Uuid::new_v4().to_string();
+        let conn = open_readonly(&s.database).map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        let (count, last): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT count(*),max(timestamp) FROM host_samples",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| {
+                err(
+                    id.clone(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    syslens_protocol::ErrorCode::EvidenceUnavailable,
+                    "evidence is unavailable",
+                )
+            })?;
+        envelope(
+            &s,
+            id,
+            Utc::now(),
+            syslens_protocol::Status {
+                recording: "unknown".into(),
+                samples: count as u64,
+                latest_observation: last.and_then(|x| Utc.timestamp_opt(x, 0).single()),
+            },
+        )
+    }
+    fn since(
+        w: &syslens_protocol::EvidenceWindow,
+    ) -> Result<String, syslens_protocol::ProtocolError> {
+        match w.relative.as_ref() {
+            Some(r) => Ok(match r.unit {
+                syslens_protocol::RelativeUnit::Hours => format!("{}h", r.value),
+                syslens_protocol::RelativeUnit::Days => format!("{}d", r.value),
+                syslens_protocol::RelativeUnit::Today => "today".into(),
+            }),
+            None => Err(syslens_protocol::ProtocolError::invalid(
+                "absolute windows are not available on this host version",
+            )),
+        }
+    }
+    async fn memory(
+        State(s): State<ApiState>,
+        Json(r): Json<syslens_protocol::EvidenceRequest>,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<Value>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let id = Uuid::new_v4().to_string();
+        r.window
+            .validate(s.retention)
+            .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        if !matches!(
+            r.window.comparison,
+            syslens_protocol::ComparisonMode::PreviousWeek
+        ) {
+            return Err(err(
+                id,
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "comparison mode is unavailable on this host version",
+            ));
+        }
+        let x = since(&r.window)
+            .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        let d = diagnose_memory(&s.database, &x, "previous-week").map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
+    }
+    async fn storage(
+        State(s): State<ApiState>,
+        Json(r): Json<syslens_protocol::EvidenceRequest>,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<Value>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let id = Uuid::new_v4().to_string();
+        r.window
+            .validate(s.retention)
+            .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        if !matches!(
+            r.window.comparison,
+            syslens_protocol::ComparisonMode::PreviousWeek
+        ) {
+            return Err(err(
+                id,
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "comparison mode is unavailable on this host version",
+            ));
+        }
+        let x = since(&r.window)
+            .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        let d = diagnose_storage(&s.database, &x, "previous-week").map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
+    }
+    async fn incidents(
+        State(s): State<ApiState>,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<Value>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let id = Uuid::new_v4().to_string();
+        let d = list_incidents(&s.database).map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        envelope(&s, id, Utc::now(), serde_json::json!({"incidents":d}))
+    }
+    async fn events(
+        State(s): State<ApiState>,
+        Query(q): Query<EventsQuery>,
+    ) -> Result<
+        Json<syslens_protocol::Envelope<Value>>,
+        (StatusCode, HeaderMap, Json<syslens_protocol::ErrorEnvelope>),
+    > {
+        let id = Uuid::new_v4().to_string();
+        let limit = q.limit.unwrap_or(100);
+        if !(1..=256).contains(&limit) || q.after.unwrap_or(0) < 0 {
+            return Err(err(
+                id,
+                StatusCode::BAD_REQUEST,
+                syslens_protocol::ErrorCode::InvalidRequest,
+                "invalid pagination",
+            ));
+        }
+        let d = list_events(&s.database, q.after.unwrap_or(0), limit).map_err(|_| {
+            err(
+                id.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                syslens_protocol::ErrorCode::EvidenceUnavailable,
+                "evidence is unavailable",
+            )
+        })?;
+        envelope(&s, id, Utc::now(), serde_json::to_value(d).unwrap())
+    }
+    let state = ApiState {
+        database,
+        retention: config.retention_days,
+        max_response: config.api.max_response_bytes,
+    };
+    let app = Router::new()
+        .route("/v1/capabilities", get(capabilities))
+        .route("/v1/status", get(status))
+        .route("/v1/evidence/memory", post(memory))
+        .route("/v1/evidence/storage", post(storage))
+        .route("/v1/incidents", get(incidents))
+        .route("/v1/events", get(events))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            config.api.max_request_bytes,
+        ))
+        .with_state(state);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        File::open(config.api.tls_cert_path.unwrap())
+            .map_err(|_| "cannot load API TLS material")?,
+    ))
+    .collect::<Result<_, _>>()
+    .map_err(|_| "cannot load API TLS material")?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        File::open(config.api.tls_key_path.unwrap()).map_err(|_| "cannot load API TLS material")?,
+    ))
+    .map_err(|_| "cannot load API TLS material")?
+    .ok_or("cannot load API TLS material")?;
+    let mut roots = RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut std::io::BufReader::new(
+        File::open(config.api.trusted_gateway_ca_path.unwrap())
+            .map_err(|_| "cannot load API TLS material")?,
+    )) {
+        roots
+            .add(c.map_err(|_| "cannot load API TLS material")?)
+            .map_err(|_| "cannot load API TLS material")?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|_| "cannot configure API client authentication")?;
+    let tls = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|_| "cannot configure API TLS")?;
+    let listener = TcpListener::bind((config.api.bind_address.as_str(), config.api.port))
+        .await
+        .map_err(|_| "cannot bind API listener")?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
+    loop {
+        let (stream, _) = listener.accept().await.map_err(|_| "API listener failed")?;
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Ok(tls) = acceptor.accept(stream).await {
+                let service = hyper::service::service_fn(move |request| {
+                    let app = app.clone();
+                    async move {
+                        use tower::ServiceExt;
+                        app.oneshot(request).await
+                    }
+                });
+                let _ = Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), service)
+                    .await;
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1757,7 +2297,12 @@ fn open_readonly(path: &Path) -> Result<Connection, String> {
     if let Some(warning) = database_permissions_warning(path) {
         return Err(format!("unsafe evidence permissions: {warning}"));
     }
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())?;
+    // Read-only API work must not wait indefinitely behind a checkpoint or writer.
+    conn.busy_timeout(StdDuration::from_secs(1))
+        .map_err(|e| e.to_string())?;
+    Ok(conn)
 }
 pub fn acknowledge_incident(path: &Path, id: &str, now: i64) -> Result<(), String> {
     let c = open_db(path)?;
@@ -3805,8 +4350,9 @@ mod tests {
         assert_eq!(
             c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
+        assert!(evidence_identities(&path).is_ok());
     }
 
     #[test]
@@ -5026,5 +5572,26 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "recovered" && event.incident_id == id)
         );
+    }
+
+    #[test]
+    fn evidence_ids_are_created_once_and_persist() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        open_db(&path).unwrap();
+        let first = evidence_identities(&path).unwrap();
+        assert_eq!(first, evidence_identities(&path).unwrap());
+        assert!(Uuid::parse_str(&first.0).is_ok());
+        assert!(Uuid::parse_str(&first.1).is_ok());
+    }
+
+    #[test]
+    fn api_is_disabled_and_requires_all_mtls_material_when_enabled() {
+        let config = Config::default();
+        assert!(!config.api.enabled);
+        assert!(config.validate().is_ok());
+        let mut enabled = config;
+        enabled.api.enabled = true;
+        assert!(enabled.validate().is_err());
     }
 }

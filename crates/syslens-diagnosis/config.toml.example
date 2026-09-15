@@ -14,3 +14,16 @@ allow_insecure_http = false
 # model = "your-compatible-model"
 # api_key_env = "SYSLENS_DIAGNOSIS_AI_API_KEY"
 request_timeout_seconds = 20
+
+# The host evidence API is a separate, disabled-by-default mTLS service for a
+# future SysLens Gateway. It never enables the recorder or AI chat itself.
+[api]
+enabled = false
+bind_address = "127.0.0.1"
+port = 9843
+# tls_cert_path = "/home/you/.config/syslens-diagnosis/certs/host.crt"
+# tls_key_path = "/home/you/.config/syslens-diagnosis/certs/host.key"
+# trusted_gateway_ca_path = "/home/you/.config/syslens-diagnosis/certs/gateway-ca.crt"
+max_request_bytes = 16384
+max_response_bytes = 262144
+max_query_millis = 2000

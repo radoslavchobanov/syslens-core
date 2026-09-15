@@ -251,6 +251,28 @@ replay events with `syslens-diagnosis incidents list`, `events --after CURSOR`,
 The strict `[detection]` configuration defaults to a 24-hour warm baseline and
 80% coverage before a memory-baseline alert can open.
 
+### Optional gateway evidence API
+
+`syslens-diagnosis serve` is a separate, disabled-by-default native service for
+a future SysLens Gateway. It exposes only versioned deterministic memory,
+storage, status, incident, and event evidence. It never exposes SQLite, shell
+commands, arbitrary paths, or the scanner. Collection continues if this API is
+stopped.
+
+Set `[api].enabled = true` and provide absolute, owner-only certificate, key,
+and gateway-CA paths in the diagnosis configuration. The listener requires a
+trusted client certificate for every request, including loopback requests.
+Then run `syslens-diagnosis enable-api`; this installs and starts the distinct
+`syslens-diagnosis-api.service`. `enable` never starts the API service.
+
+Generate a private CA and per-host/client certificates with your established
+PKI process. The host certificate must identify the configured host address;
+the gateway client certificate must chain to `trusted_gateway_ca_path`.
+Certificate/key paths and database errors are deliberately not returned by the
+network API. The default bind is `127.0.0.1:9843`; only loopback, private, and
+link-local IP addresses are accepted. The API is JSON-only and has bounded
+body, response, query, and pagination limits.
+
 ### Optional AI chat
 
 The add-on's outbound OpenAI-compatible `/v1/chat/completions` client is

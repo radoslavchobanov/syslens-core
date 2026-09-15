@@ -1,0 +1,14 @@
+[Unit]
+Description=SysLens diagnosis evidence API
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/syslens-diagnosis serve --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite
+NoNewPrivileges=yes
+PrivateTmp=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

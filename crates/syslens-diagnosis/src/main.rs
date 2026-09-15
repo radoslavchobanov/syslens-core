@@ -21,11 +21,23 @@ enum CommandLine {
         config: Option<PathBuf>,
     },
     Disable,
+    EnableApi {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    DisableApi,
     Status {
         #[arg(long)]
         config: Option<PathBuf>,
     },
     Daemon {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Run the opt-in mutually authenticated evidence API.
+    Serve {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -143,8 +155,32 @@ fn main() -> ExitCode {
             }
         }
         CommandLine::Disable => service(&["disable", "--now", "syslens-diagnosis.service"]),
+        CommandLine::EnableApi { config } => {
+            let p = config.unwrap_or_else(diagnosis::config_path);
+            let db = diagnosis::database_path_for_config(&p);
+            diagnosis::secure_config(&p)
+                .and_then(|_| diagnosis::load_config(&p))
+                .and_then(|c| {
+                    if !c.api.enabled {
+                        return Err(
+                            "API is disabled; configure [api] with mTLS paths before enabling"
+                                .into(),
+                        );
+                    }
+                    std::env::current_exe()
+                        .map_err(|e| e.to_string())
+                        .and_then(|b| diagnosis::install_api_user_service(&b, &p, &db).map(|_| ()))
+                })
+                .and_then(|_| service(&["daemon-reload"]))
+                .and_then(|_| service(&["enable", "--now", "syslens-diagnosis-api.service"]))
+        }
+        CommandLine::DisableApi => service(&["disable", "--now", "syslens-diagnosis-api.service"]),
         CommandLine::Status { config } => status(config.unwrap_or_else(diagnosis::config_path)),
         CommandLine::Daemon { config, database } => daemon(config, database),
+        CommandLine::Serve { config, database } => {
+            let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
+            diagnosis::serve_api(&config, &db)
+        }
         CommandLine::Diagnose {
             config,
             resource:

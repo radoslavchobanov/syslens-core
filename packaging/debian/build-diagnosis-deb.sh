@@ -41,6 +41,8 @@ mkdir -p \
 install -m 0755 "${BINARY}" "${STAGING_DIRECTORY}/usr/bin/syslens-diagnosis"
 install -m 0644 "${ROOT_DIRECTORY}/packaging/debian/syslens-diagnosis.service" \
   "${STAGING_DIRECTORY}/usr/lib/systemd/user/syslens-diagnosis.service"
+install -m 0644 "${ROOT_DIRECTORY}/packaging/debian/syslens-diagnosis-api.service" \
+  "${STAGING_DIRECTORY}/usr/lib/systemd/user/syslens-diagnosis-api.service"
 install -m 0644 "${ROOT_DIRECTORY}/LICENSE" \
   "${STAGING_DIRECTORY}/usr/share/doc/syslens-diagnosis/copyright"
 install -m 0644 "${ROOT_DIRECTORY}/README.md" \
