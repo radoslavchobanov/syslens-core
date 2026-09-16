@@ -3872,8 +3872,42 @@ pub fn diagnose_storage_windows(
     }
     let conn = open_readonly(path)?;
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
-    let mut limits=vec!["Directory evidence is unprivileged and local. It does not attribute storage use to a process.".into()];
-    let mut stmt=conn.prepare("SELECT a.mount_id,a.mount_point,a.fs_type,a.used_bytes,b.used_bytes FROM mount_samples a JOIN mount_samples b ON a.mount_id=b.mount_id WHERE a.timestamp=(SELECT max(timestamp) FROM mount_samples x WHERE x.mount_id=a.mount_id AND x.timestamp>=?1 AND x.timestamp<=?2 AND x.used_bytes IS NOT NULL) AND b.timestamp=(SELECT max(timestamp) FROM mount_samples y WHERE y.mount_id=b.mount_id AND y.timestamp>=?3 AND y.timestamp<=?4 AND y.used_bytes IS NOT NULL)").map_err(|e|e.to_string())?;
+    let mut limits = vec![
+        "Directory evidence is unprivileged and local. It does not attribute storage use to a process."
+            .into(),
+    ];
+    // Select one latest usable row per mount and interval before joining the
+    // two intervals.  The old correlated-max query joined every pair of rows
+    // for a mount and then evaluated two max subqueries for each pair.  That
+    // becomes prohibitively expensive with a normal 30-second history.
+    let mut stmt = conn
+        .prepare(
+            "WITH current_latest AS (
+                 SELECT mount_id, MAX(timestamp) AS timestamp
+                 FROM mount_samples
+                 WHERE timestamp >= ?1 AND timestamp <= ?2
+                   AND capability = 'available' AND used_bytes IS NOT NULL
+                 GROUP BY mount_id
+             ), comparison_latest AS (
+                 SELECT mount_id, MAX(timestamp) AS timestamp
+                 FROM mount_samples
+                 WHERE timestamp >= ?3 AND timestamp <= ?4
+                   AND capability = 'available' AND used_bytes IS NOT NULL
+                 GROUP BY mount_id
+             )
+             SELECT current.mount_id, current.mount_point, current.fs_type,
+                    current.used_bytes, comparison.used_bytes
+             FROM current_latest
+             JOIN mount_samples AS current
+               ON current.mount_id = current_latest.mount_id
+              AND current.timestamp = current_latest.timestamp
+             JOIN comparison_latest
+               ON comparison_latest.mount_id = current_latest.mount_id
+             JOIN mount_samples AS comparison
+               ON comparison.mount_id = comparison_latest.mount_id
+              AND comparison.timestamp = comparison_latest.timestamp",
+        )
+        .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(
             params![
@@ -3896,7 +3930,9 @@ pub fn diagnose_storage_windows(
             },
         )
         .map_err(|e| e.to_string())?;
-    let mut mounts: Vec<_> = rows.filter_map(Result::ok).collect();
+    let mut mounts: Vec<_> = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
     if mounts.is_empty() {
         limits
             .push("No comparable available mount-capacity samples exist in both intervals.".into());
@@ -3917,7 +3953,47 @@ pub fn diagnose_storage_windows(
             limitations: limits,
         });
     }
-    let mut dstmt=conn.prepare("SELECT sc.mount_id,sc.root,dc.path,dc.allocated_bytes-dp.allocated_bytes,dc.apparent_bytes-dp.apparent_bytes FROM storage_scans sc JOIN directory_samples dc ON dc.scan_id=sc.id JOIN storage_scans sp ON sp.root=sc.root AND sp.mount_id=sc.mount_id JOIN directory_samples dp ON dp.scan_id=sp.id AND dp.path=dc.path WHERE sc.status='complete' AND sp.status='complete' AND sc.mount_id IS NOT NULL AND sc.started_at=(SELECT max(x.started_at) FROM storage_scans x WHERE x.root=sc.root AND x.mount_id=sc.mount_id AND x.status='complete' AND x.started_at>=?1 AND x.started_at<=?2) AND sp.started_at=(SELECT max(y.started_at) FROM storage_scans y WHERE y.root=sp.root AND y.mount_id=sp.mount_id AND y.status='complete' AND y.started_at>=?3 AND y.started_at<=?4) ORDER BY 4 DESC LIMIT 200").map_err(|e|e.to_string())?;
+    // Apply the same grouped-latest strategy to directory scans.  A scan is
+    // identified by its root and stable mount identity; never pair scans from
+    // different mount identities just because their paths match.
+    let mut dstmt = conn
+        .prepare(
+            "WITH current_latest AS (
+                 SELECT root, mount_id, MAX(started_at) AS started_at
+                 FROM storage_scans
+                 WHERE status = 'complete' AND mount_id IS NOT NULL
+                   AND started_at >= ?1 AND started_at <= ?2
+                 GROUP BY root, mount_id
+             ), comparison_latest AS (
+                 SELECT root, mount_id, MAX(started_at) AS started_at
+                 FROM storage_scans
+                 WHERE status = 'complete' AND mount_id IS NOT NULL
+                   AND started_at >= ?3 AND started_at <= ?4
+                 GROUP BY root, mount_id
+             )
+             SELECT current.mount_id, current.root, current_directory.path,
+                    current_directory.allocated_bytes - comparison_directory.allocated_bytes,
+                    current_directory.apparent_bytes - comparison_directory.apparent_bytes
+             FROM current_latest
+             JOIN storage_scans AS current
+               ON current.root = current_latest.root
+              AND current.mount_id = current_latest.mount_id
+              AND current.started_at = current_latest.started_at
+             JOIN directory_samples AS current_directory
+               ON current_directory.scan_id = current.id
+             JOIN comparison_latest
+               ON comparison_latest.root = current_latest.root
+              AND comparison_latest.mount_id = current_latest.mount_id
+             JOIN storage_scans AS comparison
+               ON comparison.root = comparison_latest.root
+              AND comparison.mount_id = comparison_latest.mount_id
+              AND comparison.started_at = comparison_latest.started_at
+             JOIN directory_samples AS comparison_directory
+               ON comparison_directory.scan_id = comparison.id
+              AND comparison_directory.path = current_directory.path
+             ORDER BY 4 DESC LIMIT 200",
+        )
+        .map_err(|e| e.to_string())?;
     let r = dstmt
         .query_map(
             params![
@@ -3938,7 +4014,9 @@ pub fn diagnose_storage_windows(
         )
         .map_err(|e| e.to_string())?;
     let mut candidates: Vec<_> = r
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
         .filter(|x| x.allocated_bytes_change > 0)
         .collect();
     // Each retained directory includes its descendants.  Reporting only direct
@@ -5262,9 +5340,46 @@ mod tests {
             )
             .unwrap();
         }
+        // Keep additional samples in each interval so the diagnosis must
+        // select the latest row per stable mount identity rather than pairing
+        // every row from the two histories.
+        insert_mounts(
+            &mut c,
+            &[
+                MountSample {
+                    timestamp: now - 7 * 86400 - 30,
+                    mount_id: "dev|ext4|/data".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100 * GIB as i64),
+                    free_bytes: Some(84 * GIB as i64),
+                    used_bytes: Some(16 * GIB as i64),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                },
+                MountSample {
+                    timestamp: now - 30,
+                    mount_id: "dev|ext4|/data".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100 * GIB as i64),
+                    free_bytes: Some(79 * GIB as i64),
+                    used_bytes: Some(21 * GIB as i64),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                },
+            ],
+        )
+        .unwrap();
         let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
         assert_eq!(out.status, "ok");
         assert_eq!(out.mounts[0].used_bytes_change, 5_i64 * GIB as i64);
+        assert_eq!(out.mounts[0].current_used_bytes, 21_i64 * GIB as i64);
+        assert_eq!(out.mounts[0].comparison_used_bytes, 16_i64 * GIB as i64);
         assert_eq!(
             out.directories[0].allocated_bytes_change,
             5_i64 * GIB as i64
