@@ -12,7 +12,9 @@ RestartSec=5
 # Root is intentional: diagnosis-only evidence needs protected host paths.
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=strict
+# Keep the host root mount visible as read-write so the collector can inspect
+# read-only data without the sandbox reclassifying `/` as an ineligible mount.
+ProtectSystem=full
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

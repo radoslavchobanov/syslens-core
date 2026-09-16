@@ -654,7 +654,7 @@ pub fn install_user_service(
 }
 pub fn system_service_unit(binary: &Path, config: &Path, database: &Path) -> String {
     format!(
-        "[Unit]\nDescription=SysLens privileged local diagnosis recorder\nAfter=local-fs.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} daemon --system --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The collector is intentionally root-owned so it can inspect protected host paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nCapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=SysLens privileged local diagnosis recorder\nAfter=local-fs.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} daemon --system --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The collector is intentionally root-owned so it can inspect protected host paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\n# Keep the host root mount visible as read-write so the collector can inspect\n# read-only data without the sandbox reclassifying `/` as an ineligible mount.\nProtectSystem=full\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nCapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
         config.display(),
         binary.display(),
         config.display(),
@@ -5537,7 +5537,7 @@ mod tests {
             Path::new("/etc/syslens-diagnosis/config.toml"),
             Path::new("/var/lib/syslens-diagnosis/diagnosis.sqlite"),
         );
-        assert!(unit.contains("ProtectSystem=strict"));
+        assert!(unit.contains("ProtectSystem=full"));
         assert!(unit.contains("ProtectHome=read-only"));
         assert!(unit.contains("ReadWritePaths=/var/lib/syslens-diagnosis"));
         assert!(unit.contains("NoNewPrivileges=yes"));
@@ -5723,7 +5723,11 @@ mod tests {
             include_str!("../../../systemd/syslens-diagnosis-api-system.service"),
             include_str!("../../../packaging/debian/syslens-diagnosis-api-system.service"),
         ] {
-            assert!(asset.contains("ProtectSystem=strict"));
+            if asset.contains("privileged local diagnosis recorder") {
+                assert!(asset.contains("ProtectSystem=full"));
+            } else {
+                assert!(asset.contains("ProtectSystem=strict"));
+            }
             assert!(asset.contains("ProtectHome=read-only"));
             assert!(asset.contains("User=root"));
             assert!(asset.contains("ReadWritePaths=/var/lib/syslens-diagnosis"));
