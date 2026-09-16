@@ -603,6 +603,123 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
         "used space",
         "used storage",
     ];
+    fn mask_free_space_spans(clause: &str, free_space_terms: &[&str]) -> String {
+        // Mask the complete resource phrase, not only its terminal words.
+        // Otherwise "root filesystem free space" leaves "root filesystem"
+        // behind and is incorrectly treated as root used-space evidence.
+        let mut spans = Vec::new();
+        for term in free_space_terms {
+            let mut search_from = 0;
+            while let Some(relative_start) = clause[search_from..].find(term) {
+                let start = search_from + relative_start;
+                let end = start + term.len();
+                let left_boundary = start == 0
+                    || !clause[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|character| {
+                            character.is_ascii_alphanumeric() || character == '_'
+                        });
+                let right_boundary = end == clause.len()
+                    || !clause[end..].chars().next().is_some_and(|character| {
+                        character.is_ascii_alphanumeric() || character == '_'
+                    });
+                if left_boundary && right_boundary {
+                    let mut span_start = start;
+                    let prefixes = [
+                        "no change in ",
+                        "no increase in ",
+                        "no decrease in ",
+                        "an increase in ",
+                        "a decrease in ",
+                        "an increase of ",
+                        "a decrease of ",
+                        "remained unchanged ",
+                        "remained the same ",
+                        "unchanged ",
+                        "root filesystem's ",
+                        "root file system's ",
+                        "root disk's ",
+                        "root mount's ",
+                        "root volume's ",
+                        "root partition's ",
+                        "root drive's ",
+                        "filesystem's ",
+                        "file system's ",
+                        "disk's ",
+                        "mount's ",
+                        "volume's ",
+                        "partition's ",
+                        "drive's ",
+                        "root filesystem ",
+                        "root file system ",
+                        "root disk ",
+                        "root mount ",
+                        "root volume ",
+                        "root partition ",
+                        "root drive ",
+                        "filesystem ",
+                        "file system ",
+                        "disk ",
+                        "mount ",
+                        "volume ",
+                        "partition ",
+                        "drive ",
+                    ];
+                    loop {
+                        let before = &clause[..span_start];
+                        let Some(prefix) = prefixes.iter().find(|prefix| before.ends_with(*prefix))
+                        else {
+                            break;
+                        };
+                        span_start -= prefix.len();
+                    }
+                    let suffixes = [
+                        " remained unchanged",
+                        " remained the same",
+                        " did not increase",
+                        " did not decrease",
+                        " did not grow",
+                        " did not shrink",
+                        " is unchanged",
+                        " is increased",
+                        " is decreased",
+                        " increased",
+                        " decreased",
+                        " grew",
+                        " shrank",
+                        " went up",
+                        " went down",
+                        " expanded",
+                        " reduced",
+                    ];
+                    let mut span_end = end;
+                    if let Some(suffix) = suffixes
+                        .iter()
+                        .find(|suffix| clause[end..].starts_with(*suffix))
+                    {
+                        span_end += suffix.len();
+                    }
+                    spans.push((span_start, span_end));
+                }
+                search_from = end;
+            }
+        }
+        spans.sort_unstable_by_key(|(start, _)| *start);
+        let mut masked = String::with_capacity(clause.len());
+        let mut cursor = 0;
+        for (start, end) in spans {
+            if start > cursor {
+                masked.push_str(&clause[cursor..start]);
+            }
+            if end > cursor {
+                masked.push_str(&" ".repeat(end - cursor));
+                cursor = end;
+            }
+        }
+        masked.push_str(&clause[cursor..]);
+        masked
+    }
     let mut normalized = answer.to_ascii_lowercase();
     for separator in [
         " while ",
@@ -628,20 +745,19 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
         // "available storage"). Remove those terms before looking for a
         // root-storage resource so their direction cannot be mistaken for
         // the authoritative used-space direction.
-        let mut storage_clause = clause.to_owned();
-        for term in free_space_terms {
-            storage_clause = storage_clause.replace(term, " ");
-        }
+        let storage_clause = mask_free_space_spans(clause, &free_space_terms);
         if !storage_terms
             .iter()
             .any(|term| storage_clause.contains(term))
         {
             continue;
         }
-        if no_change.iter().any(|phrase| clause.contains(phrase))
+        if no_change
+            .iter()
+            .any(|phrase| storage_clause.contains(phrase))
             || opposite_direction
                 .iter()
-                .any(|phrase| clause.contains(phrase))
+                .any(|phrase| storage_clause.contains(phrase))
         {
             return true;
         }
@@ -651,9 +767,9 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
         .iter()
         .any(|value| {
             let mut offset = 0;
-            while let Some(relative) = clause[offset..].find(value) {
+            while let Some(relative) = storage_clause[offset..].find(value) {
                 let index = offset + relative;
-                let preceded_by_number = clause[..index]
+                let preceded_by_number = storage_clause[..index]
                     .chars()
                     .next_back()
                     .is_some_and(|character| character.is_ascii_digit() || character == '.');
@@ -1037,6 +1153,23 @@ mod tests {
                 &positive_facts
             )
             .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while root filesystem free space decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased with no change in free space",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback("Storage increased with 0 bytes.", &positive_facts).is_some()
         );
         assert!(
             grounded_storage_fallback(
