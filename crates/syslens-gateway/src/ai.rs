@@ -405,6 +405,7 @@ pub(crate) struct RootStorageFacts {
 fn bounded_text(value: &str, max_bytes: usize) -> String {
     let mut result = String::new();
     for c in value.chars() {
+        let c = if c.is_control() { ' ' } else { c };
         if result.len() + c.len_utf8() > max_bytes {
             break;
         }
@@ -431,6 +432,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
     let comparison = data.get("comparison")?;
     let current_used_bytes = root.get("current_used_bytes")?.as_i64()?;
     let comparison_used_bytes = root.get("comparison_used_bytes")?.as_i64()?;
+    let root_mount_id = root.get("mount_id")?.as_str()?;
     let path_attribution_status = data
         .get("path_attribution_status")
         .and_then(Value::as_str)
@@ -441,6 +443,10 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .into_iter()
         .flatten()
         .take(12)
+        .filter(|directory| {
+            directory.get("mount_id").and_then(Value::as_str) == Some(root_mount_id)
+                && directory.get("root").and_then(Value::as_str) == Some("/")
+        })
         .filter_map(|directory| {
             let path = directory.get("path")?.as_str()?;
             let allocated = directory.get("allocated_bytes_change")?.as_i64()?;
@@ -516,50 +522,109 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
     bounded_text(&text, MAX_CANONICAL_FACTS_BYTES)
 }
 
-fn directly_contradicts_root_change(answer: &str) -> bool {
-    let lower = answer.to_ascii_lowercase();
-    let no_change = [
-        "no increase",
-        "no growth",
-        "did not increase",
-        "didn't increase",
-        "did not grow",
-        "didn't grow",
-        "no change",
-        "unchanged",
-        "remained unchanged",
-        "remained the same",
-        "zero increase",
-        "zero growth",
-    ];
-    if no_change.iter().any(|phrase| lower.contains(phrase)) {
-        return true;
+fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> bool {
+    let no_change = if facts.used_bytes_change > 0 {
+        [
+            "no increase",
+            "no growth",
+            "did not increase",
+            "didn't increase",
+            "did not grow",
+            "didn't grow",
+            "no change",
+            "unchanged",
+            "remained unchanged",
+            "remained the same",
+            "zero increase",
+            "zero growth",
+        ]
+    } else {
+        [
+            "no decrease",
+            "no shrink",
+            "did not decrease",
+            "didn't decrease",
+            "did not shrink",
+            "didn't shrink",
+            "no change",
+            "unchanged",
+            "remained unchanged",
+            "remained the same",
+            "zero decrease",
+            "zero shrink",
+        ]
+    };
+    let opposite_direction = if facts.used_bytes_change > 0 {
+        ["decreased", "shrank", "went down", "reduced"]
+    } else {
+        ["increased", "grew", "went up", "expanded"]
+    };
+    let sentences = answer.split(['.', '!', '?', '\n']);
+    for sentence in sentences {
+        let lower = sentence.to_ascii_lowercase();
+        let mentions_storage = [
+            "storage",
+            "disk",
+            "filesystem",
+            "file system",
+            "root filesystem",
+            "root mount",
+            "disk usage",
+            "storage usage",
+            "used space",
+            "capacity",
+        ]
+        .iter()
+        .any(|word| lower.contains(word));
+        if !mentions_storage {
+            continue;
+        }
+        if no_change.iter().any(|phrase| lower.contains(phrase))
+            || opposite_direction
+                .iter()
+                .any(|phrase| lower.contains(phrase))
+        {
+            return true;
+        }
+        let says_zero = [
+            "0 bytes", "0 byte", "0 gib", "0.0 gib", "0.00 gib", "0 gb", "0.0 gb", "0.00 gb",
+        ]
+        .iter()
+        .any(|value| {
+            let mut offset = 0;
+            while let Some(relative) = lower[offset..].find(value) {
+                let index = offset + relative;
+                let preceded_by_number = lower[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| character.is_ascii_digit() || character == '.');
+                if !preceded_by_number {
+                    return true;
+                }
+                offset = index + value.len();
+            }
+            false
+        });
+        if says_zero {
+            return true;
+        }
     }
-    let mentions_storage = [
-        "storage",
-        "disk",
-        "filesystem",
-        "file system",
-        "root",
-        "used",
-    ]
-    .iter()
-    .any(|word| lower.contains(word));
-    let says_zero = [
-        "0 bytes", "0 byte", "0 gib", "0.0 gib", "0.00 gib", "0 gb", "0.0 gb", "0.00 gb", "0 b",
-    ]
-    .iter()
-    .any(|value| lower.contains(value));
-    mentions_storage && says_zero
+    false
 }
 
 pub(crate) fn grounded_storage_fallback(answer: &str, facts: &RootStorageFacts) -> Option<String> {
-    if !directly_contradicts_root_change(answer) {
+    if !directly_contradicts_root_change(answer, facts) {
         return None;
     }
+    let direction = if facts.used_bytes_change > 0 {
+        "increased"
+    } else {
+        "decreased"
+    };
+    let magnitude = facts.used_bytes_change.saturating_abs();
     let mut fallback = format!(
         "The model answer was rejected because it contradicted the authoritative storage evidence. \
-         The root filesystem increased by {:+} bytes ({:+.2} GiB): \
+         The root filesystem {direction} by {magnitude} bytes (delta {:+} bytes, {:+.2} GiB): \
          {} bytes used in the current interval versus {} bytes in the comparison interval. \
          Current interval: {} to {}. Comparison interval: {} to {}. \
          Path attribution status: {}. ",
@@ -769,12 +834,13 @@ mod tests {
                 "current": {"start_utc":"2026-09-16T00:00:00Z","end_utc":"2026-09-16T12:00:00Z"},
                 "comparison": {"start_utc":"2026-09-15T00:00:00Z","end_utc":"2026-09-15T12:00:00Z"},
                 "mounts": [{
+                    "mount_id":"root-mount",
                     "mount_point":"/",
                     "current_used_bytes":267787419648i64,
                     "comparison_used_bytes":251263041536i64,
                     "used_bytes_change":16524378112i64
                 }],
-                "directories": [{"path":"/home/acemagic/ollama","allocated_bytes_change":6446710784i64,"apparent_bytes_change":6446710784i64}],
+                "directories": [{"mount_id":"root-mount","root":"/","path":"/home/acemagic/ollama","allocated_bytes_change":6446710784i64,"apparent_bytes_change":6446710784i64}],
                 "path_attribution_status":"available",
                 "limitations":["Directory evidence is path-based"]
             }
@@ -796,11 +862,72 @@ mod tests {
         let evidence = json!({
             "data": {
                 "mounts": [
-                    {"mount_point":"/boot/efi", "used_bytes_change":100},
-                    {"mount_point":"/", "used_bytes_change":0}
+                    {"mount_id":"efi", "mount_point":"/boot/efi", "used_bytes_change":100},
+                    {"mount_id":"root", "mount_point":"/", "used_bytes_change":0}
                 ]
             }
         });
         assert!(root_storage_facts(&evidence).is_none());
+    }
+
+    #[test]
+    fn root_storage_facts_filter_directory_mount_and_root() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"a","end_utc":"b"},
+                "comparison": {"start_utc":"c","end_utc":"d"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":200i64,
+                    "comparison_used_bytes":100i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [
+                    {"mount_id":"root-mount","root":"/","path":"/valid","allocated_bytes_change":10i64,"apparent_bytes_change":10i64},
+                    {"mount_id":"other-mount","root":"/","path":"/wrong-mount","allocated_bytes_change":99i64,"apparent_bytes_change":99i64},
+                    {"mount_id":"root-mount","root":"/nested","path":"/wrong-root","allocated_bytes_change":88i64,"apparent_bytes_change":88i64}
+                ],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        assert_eq!(facts.directories.len(), 1);
+        assert!(facts.directories[0].contains("/valid"));
+        assert!(!facts.directories[0].contains("wrong-mount"));
+        assert!(!facts.directories[0].contains("wrong-root"));
+    }
+
+    #[test]
+    fn contradiction_grounding_is_storage_specific_sign_aware_and_sanitized() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"a","end_utc":"b"},
+                "comparison": {"start_utc":"c","end_utc":"d"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":900i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":-100i64
+                }],
+                "directories": [{"mount_id":"root-mount","root":"/","path":"/safe\nINJECTED","allocated_bytes_change":-10i64,"apparent_bytes_change":-10i64}],
+                "path_attribution_status":"available\nINJECTED",
+                "limitations":["line one\nline two\u{0000}instruction"]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        let canonical = canonical_storage_facts(&facts);
+        assert!(canonical.contains("/safe INJECTED"));
+        assert!(!facts.directories[0].contains('\n'));
+        assert!(!facts.limitations[0].contains('\n'));
+        assert!(grounded_storage_fallback("RAM is unchanged.", &facts).is_none());
+        assert!(
+            grounded_storage_fallback("Storage increased by 100 bytes.", &facts)
+                .unwrap()
+                .contains("decreased by 100 bytes")
+        );
+        assert!(grounded_storage_fallback("Storage decreased by 100 bytes.", &facts).is_none());
     }
 }
