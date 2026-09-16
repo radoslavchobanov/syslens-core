@@ -232,6 +232,11 @@ syslens-diagnosis enable
 syslens-diagnosis disable
 syslens-diagnosis diagnose memory --since today --compare previous-week
 syslens-diagnosis diagnose storage --since 7d --compare previous-week
+# Compare any two retained periods (RFC3339 timestamps are UTC)
+syslens-diagnosis diagnose storage \
+  --since '2026-09-15T00:00:00Z..2026-09-16T00:00:00Z' \
+  --comparison-start 2026-09-14T00:00:00Z \
+  --comparison-end 2026-09-15T00:00:00Z
 syslens diagnose memory --since 7d
 syslens chat --host acemagic "What local evidence explains the recent RAM increase?"
 ```
@@ -242,6 +247,11 @@ its user service. The daemon stores host RAM composition plus visible process
 RssAnon/RSS and CPU/I/O counters every 30 seconds. `diagnose memory` compares
 stored local intervals and names observed process growth; it clearly reports
 insufficient coverage below 80% in either interval and never claims RssAnon is USS/private memory.
+Both the current interval (`--since`) and comparison interval (`--compare`)
+are independently selectable. They can be relative (`today`, `12h`, `2d`,
+or `1w`) or an RFC3339 range written as `start..end`; the explicit
+`--comparison-start`/`--comparison-end` flags are equivalent for the native
+diagnosis command. `previous-week` remains the compatibility default.
 
 The add-on also records durable local warning, escalation, and recovery events
 for sustained unusual memory use, Linux memory pressure, filesystem capacity,
@@ -291,6 +301,12 @@ syslens-gateway enable
 syslens-gateway hosts list
 syslens chat --host acemagic "What local evidence explains the RAM increase?"
 syslens-gateway diagnose --host acemagic memory --since 7d
+# The same gateway command can compare two exact UTC periods:
+syslens-gateway diagnose --host acemagic storage \
+  --current-start 2026-09-15T00:00:00Z \
+  --current-end 2026-09-16T00:00:00Z \
+  --comparison-start 2026-09-14T00:00:00Z \
+  --comparison-end 2026-09-15T00:00:00Z
 ```
 
 Use [`crates/syslens-gateway/config.toml.example`](crates/syslens-gateway/config.toml.example)

@@ -72,6 +72,12 @@ enum Diagnose {
         since: String,
         #[arg(long, default_value = "previous-week")]
         compare: String,
+        /// Explicit comparison interval start as an RFC3339 timestamp.
+        #[arg(long, requires = "comparison_end", conflicts_with = "compare")]
+        comparison_start: Option<String>,
+        /// Explicit comparison interval end as an RFC3339 timestamp.
+        #[arg(long, requires = "comparison_start", conflicts_with = "compare")]
+        comparison_end: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -80,6 +86,12 @@ enum Diagnose {
         since: String,
         #[arg(long, default_value = "previous-week")]
         compare: String,
+        /// Explicit comparison interval start as an RFC3339 timestamp.
+        #[arg(long, requires = "comparison_end", conflicts_with = "compare")]
+        comparison_start: Option<String>,
+        /// Explicit comparison interval end as an RFC3339 timestamp.
+        #[arg(long, requires = "comparison_start", conflicts_with = "compare")]
+        comparison_end: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -115,6 +127,19 @@ enum IncidentCommand {
         json: bool,
     },
 }
+
+fn explicit_comparison(
+    legacy: String,
+    start: Option<String>,
+    end: Option<String>,
+) -> Result<String, String> {
+    match (start, end) {
+        (None, None) => Ok(legacy),
+        (Some(start), Some(end)) => Ok(format!("{start}..{end}")),
+        _ => Err("comparison_start and comparison_end must be provided together".into()),
+    }
+}
+
 fn service(args: &[&str]) -> Result<(), String> {
     let status = Command::new("systemctl")
         .arg("--user")
@@ -187,25 +212,30 @@ fn main() -> ExitCode {
                 Diagnose::Memory {
                     since,
                     compare,
+                    comparison_start,
+                    comparison_end,
                     json,
                 },
         } => {
             let config = config.unwrap_or_else(diagnosis::config_path);
-            match diagnosis::diagnose_memory(
-                &diagnosis::database_path_for_config(&config),
-                &since,
-                &compare,
-            ) {
-                Ok(d) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&d).unwrap())
-                    } else {
-                        print!("{}", diagnosis::render_diagnosis(&d))
-                    };
-                    Ok(())
+            (|| {
+                let compare = explicit_comparison(compare, comparison_start, comparison_end)?;
+                match diagnosis::diagnose_memory(
+                    &diagnosis::database_path_for_config(&config),
+                    &since,
+                    &compare,
+                ) {
+                    Ok(d) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&d).unwrap())
+                        } else {
+                            print!("{}", diagnosis::render_diagnosis(&d))
+                        };
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            }
+            })()
         }
         CommandLine::Diagnose {
             config,
@@ -213,25 +243,30 @@ fn main() -> ExitCode {
                 Diagnose::Storage {
                     since,
                     compare,
+                    comparison_start,
+                    comparison_end,
                     json,
                 },
         } => {
             let config = config.unwrap_or_else(diagnosis::config_path);
-            match diagnosis::diagnose_storage(
-                &diagnosis::database_path_for_config(&config),
-                &since,
-                &compare,
-            ) {
-                Ok(d) => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&d).unwrap())
-                    } else {
-                        print!("{}", diagnosis::render_storage_diagnosis(&d))
-                    };
-                    Ok(())
+            (|| {
+                let compare = explicit_comparison(compare, comparison_start, comparison_end)?;
+                match diagnosis::diagnose_storage(
+                    &diagnosis::database_path_for_config(&config),
+                    &since,
+                    &compare,
+                ) {
+                    Ok(d) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&d).unwrap())
+                        } else {
+                            print!("{}", diagnosis::render_storage_diagnosis(&d))
+                        };
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            }
+            })()
         }
         CommandLine::Chat { question, config } => (|| {
             let config = config.unwrap_or_else(diagnosis::config_path);

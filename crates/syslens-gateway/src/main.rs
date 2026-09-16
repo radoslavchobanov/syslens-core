@@ -50,6 +50,18 @@ enum Commands {
         since: String,
         #[arg(long, default_value = "previous-week")]
         compare: String,
+        /// Explicit current UTC interval start (use with all four explicit bounds).
+        #[arg(long)]
+        current_start: Option<String>,
+        /// Explicit current UTC interval end (use with all four explicit bounds).
+        #[arg(long)]
+        current_end: Option<String>,
+        /// Explicit comparison UTC interval start (use with all four explicit bounds).
+        #[arg(long)]
+        comparison_start: Option<String>,
+        /// Explicit comparison UTC interval end (use with all four explicit bounds).
+        #[arg(long)]
+        comparison_end: Option<String>,
     },
     Incidents {
         #[command(subcommand)]
@@ -304,11 +316,24 @@ async fn run(cli: Cli) -> Result<()> {
             resource,
             since,
             compare,
+            current_start,
+            current_end,
+            comparison_start,
+            comparison_end,
         } => print(
             &daemon::request(
                 &socket,
                 "diagnose",
-                json!({"host":host,"resource":resource,"since":since,"compare":compare}),
+                json!({
+                    "host":host,
+                    "resource":resource,
+                    "since":since,
+                    "compare":compare,
+                    "current_start":current_start,
+                    "current_end":current_end,
+                    "comparison_start":comparison_start,
+                    "comparison_end":comparison_end,
+                }),
             )
             .await?,
         ),

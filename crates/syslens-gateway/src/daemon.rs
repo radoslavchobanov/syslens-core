@@ -179,10 +179,21 @@ impl App {
             "chat" => self.chat(parse(body)?).await,
             "diagnose" => {
                 let r: DiagnoseRequest = parse(body)?;
-                let a = ai::action(
-                    &r.resource,
-                    serde_json::to_value(ai::window(&r.since, &r.compare)?).unwrap(),
-                )?;
+                let args = if r.current_start.is_some()
+                    || r.current_end.is_some()
+                    || r.comparison_start.is_some()
+                    || r.comparison_end.is_some()
+                {
+                    json!({
+                        "current_start": r.current_start,
+                        "current_end": r.current_end,
+                        "comparison_start": r.comparison_start,
+                        "comparison_end": r.comparison_end,
+                    })
+                } else {
+                    serde_json::to_value(ai::window(&r.since, &r.compare)?).unwrap()
+                };
+                let a = ai::action(&r.resource, args)?;
                 self.evidence(&r.host, a).await
             }
             "sessions" => {
@@ -257,6 +268,14 @@ struct DiagnoseRequest {
     resource: String,
     since: String,
     compare: String,
+    #[serde(default)]
+    current_start: Option<String>,
+    #[serde(default)]
+    current_end: Option<String>,
+    #[serde(default)]
+    comparison_start: Option<String>,
+    #[serde(default)]
+    comparison_end: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]

@@ -1295,6 +1295,58 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             }
         }
     }
+
+    fn resolve_range(
+        range: &syslens_protocol::WindowRange,
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>), syslens_protocol::ProtocolError> {
+        if let (Some(start), Some(end)) = (range.start, range.end) {
+            return Ok((start, end));
+        }
+        let now = Utc::now();
+        let r = range.relative.as_ref().ok_or_else(|| {
+            syslens_protocol::ProtocolError::invalid("comparison window is required")
+        })?;
+        match r.unit {
+            syslens_protocol::RelativeUnit::Hours => {
+                Ok((now - Duration::hours(i64::from(r.value)), now))
+            }
+            syslens_protocol::RelativeUnit::Days => {
+                Ok((now - Duration::days(i64::from(r.value)), now))
+            }
+            syslens_protocol::RelativeUnit::Today => {
+                let local = now.with_timezone(&Local);
+                let start = Local
+                    .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
+                    .single()
+                    .ok_or_else(|| {
+                        syslens_protocol::ProtocolError::invalid(
+                            "cannot resolve target-local midnight",
+                        )
+                    })?
+                    .with_timezone(&Utc);
+                Ok((start, now))
+            }
+        }
+    }
+
+    fn resolve_comparison(
+        request: &syslens_protocol::EvidenceRequest,
+        current_start: DateTime<Utc>,
+        current_end: DateTime<Utc>,
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>), syslens_protocol::ProtocolError> {
+        if let Some(range) = &request.comparison {
+            return resolve_range(range);
+        }
+        Ok(match request.window.comparison {
+            syslens_protocol::ComparisonMode::PreviousWeek => (
+                current_start - Duration::days(7),
+                current_end - Duration::days(7),
+            ),
+            syslens_protocol::ComparisonMode::PrecedingWeekAverage => {
+                (current_start - Duration::days(7), current_start)
+            }
+        })
+    }
     async fn memory(
         State(s): State<ApiState>,
         payload: Result<
@@ -1314,20 +1366,20 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "invalid JSON request",
             )
         })?;
-        r.window
-            .validate(s.retention)
+        r.validate(s.retention)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
         let (start, end) = resolve_window(&r.window)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        let (comparison_start, comparison_end) = resolve_comparison(&r, start, end)
+            .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
         guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
-        let mode = r.window.comparison;
         let deadline = s.max_query;
         let d = tokio::time::timeout(
             deadline,
             tokio::task::spawn_blocking(move || {
                 with_api_query_deadline(deadline, || {
-                    diagnose_memory_window(&database, start, end, mode)
+                    diagnose_memory_windows(&database, start, end, comparison_start, comparison_end)
                 })
             }),
         )
@@ -1386,20 +1438,26 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
                 "invalid JSON request",
             )
         })?;
-        r.window
-            .validate(s.retention)
+        r.validate(s.retention)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
         let (start, end) = resolve_window(&r.window)
             .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
+        let (comparison_start, comparison_end) = resolve_comparison(&r, start, end)
+            .map_err(|e| err(id.clone(), StatusCode::BAD_REQUEST, e.code, &e.message))?;
         guard_evidence_store(&s, &id).await?;
         let database = s.database.clone();
-        let mode = r.window.comparison;
         let deadline = s.max_query;
         let d = tokio::time::timeout(
             deadline,
             tokio::task::spawn_blocking(move || {
                 with_api_query_deadline(deadline, || {
-                    diagnose_storage_window(&database, start, end, mode)
+                    diagnose_storage_windows(
+                        &database,
+                        start,
+                        end,
+                        comparison_start,
+                        comparison_end,
+                    )
                 })
             }),
         )
@@ -3532,15 +3590,10 @@ type MemoryAverages = (Option<f64>, Option<f64>, Option<f64>);
 pub fn diagnose_memory(path: &Path, since: &str, compare: &str) -> Result<Diagnosis, String> {
     let now = Utc::now();
     let (start, end) = parse_interval(since, now)?;
-    if compare != "previous-week" {
-        return Err("only --compare previous-week is supported".into());
-    }
-    diagnose_memory_window(
-        path,
-        start,
-        end,
-        syslens_protocol::ComparisonMode::PreviousWeek,
-    )
+    let (cstart, cend) = comparison_interval(compare, start, end, now)?;
+    validate_cli_interval(start, end, now)?;
+    validate_cli_interval(cstart, cend, now)?;
+    diagnose_memory_windows(path, start, end, cstart, cend)
 }
 
 /// Deterministic memory evidence for an API-selected absolute or relative interval.
@@ -3550,20 +3603,34 @@ pub fn diagnose_memory_window(
     end: DateTime<Utc>,
     comparison_mode: syslens_protocol::ComparisonMode,
 ) -> Result<Diagnosis, String> {
-    if end <= start {
-        return Err("evidence interval must end after it starts".into());
-    }
-    let conn = open_readonly(path)?;
-    let duration = end - start;
     let (cstart, cend) = match comparison_mode {
         syslens_protocol::ComparisonMode::PreviousWeek => {
             (start - Duration::days(7), end - Duration::days(7))
         }
-        // Baseline is the complete seven days immediately before the current interval.
         syslens_protocol::ComparisonMode::PrecedingWeekAverage => {
             (start - Duration::days(7), start)
         }
     };
+    diagnose_memory_windows(path, start, end, cstart, cend)
+}
+
+/// Deterministic memory evidence for two independently selected intervals.
+pub fn diagnose_memory_windows(
+    path: &Path,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cstart: DateTime<Utc>,
+    cend: DateTime<Utc>,
+) -> Result<Diagnosis, String> {
+    if end <= start {
+        return Err("evidence interval must end after it starts".into());
+    }
+    if cend <= cstart {
+        return Err("comparison interval must end after it starts".into());
+    }
+    let conn = open_readonly(path)?;
+    let duration = end - start;
+    let comparison_duration = cend - cstart;
     let count = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
         conn.query_row(
             "SELECT count(*) FROM host_samples WHERE timestamp>=? AND timestamp<=? AND mem_total IS NOT NULL AND mem_available IS NOT NULL",
@@ -3586,7 +3653,7 @@ pub fn diagnose_memory_window(
         .unwrap_or(30);
     let expected = ((duration.num_seconds() + interval_seconds - 1) / interval_seconds).max(1);
     let comparison_expected =
-        (((cend - cstart).num_seconds() + interval_seconds - 1) / interval_seconds).max(1);
+        ((comparison_duration.num_seconds() + interval_seconds - 1) / interval_seconds).max(1);
     let gaps = |a: DateTime<Utc>, b: DateTime<Utc>| -> Result<i64, String> {
         conn.query_row(
             "SELECT count(*) FROM collection_gaps WHERE timestamp>=? AND timestamp<=?",
@@ -3765,15 +3832,10 @@ pub fn diagnose_storage(
 ) -> Result<StorageDiagnosis, String> {
     let now = Utc::now();
     let (start, end) = parse_interval(since, now)?;
-    if compare != "previous-week" {
-        return Err("only --compare previous-week is supported".into());
-    }
-    diagnose_storage_window(
-        path,
-        start,
-        end,
-        syslens_protocol::ComparisonMode::PreviousWeek,
-    )
+    let (cstart, cend) = comparison_interval(compare, start, end, now)?;
+    validate_cli_interval(start, end, now)?;
+    validate_cli_interval(cstart, cend, now)?;
+    diagnose_storage_windows(path, start, end, cstart, cend)
 }
 
 /// Deterministic storage evidence for a selected API window.
@@ -3783,10 +3845,6 @@ pub fn diagnose_storage_window(
     end: DateTime<Utc>,
     comparison_mode: syslens_protocol::ComparisonMode,
 ) -> Result<StorageDiagnosis, String> {
-    if end <= start {
-        return Err("evidence interval must end after it starts".into());
-    }
-    let conn = open_readonly(path)?;
     let (cs, ce) = match comparison_mode {
         syslens_protocol::ComparisonMode::PreviousWeek => {
             (start - Duration::days(7), end - Duration::days(7))
@@ -3795,6 +3853,24 @@ pub fn diagnose_storage_window(
             (start - Duration::days(7), start)
         }
     };
+    diagnose_storage_windows(path, start, end, cs, ce)
+}
+
+/// Deterministic storage evidence for two independently selected intervals.
+pub fn diagnose_storage_windows(
+    path: &Path,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cs: DateTime<Utc>,
+    ce: DateTime<Utc>,
+) -> Result<StorageDiagnosis, String> {
+    if end <= start {
+        return Err("evidence interval must end after it starts".into());
+    }
+    if ce <= cs {
+        return Err("comparison interval must end after it starts".into());
+    }
+    let conn = open_readonly(path)?;
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
     let mut limits=vec!["Directory evidence is unprivileged and local. It does not attribute storage use to a process.".into()];
     let mut stmt=conn.prepare("SELECT a.mount_id,a.mount_point,a.fs_type,a.used_bytes,b.used_bytes FROM mount_samples a JOIN mount_samples b ON a.mount_id=b.mount_id WHERE a.timestamp=(SELECT max(timestamp) FROM mount_samples x WHERE x.mount_id=a.mount_id AND x.timestamp>=?1 AND x.timestamp<=?2 AND x.used_bytes IS NOT NULL) AND b.timestamp=(SELECT max(timestamp) FROM mount_samples y WHERE y.mount_id=b.mount_id AND y.timestamp>=?3 AND y.timestamp<=?4 AND y.used_bytes IS NOT NULL)").map_err(|e|e.to_string())?;
@@ -3973,6 +4049,18 @@ fn parse_interval(
     input: &str,
     now: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    if let Some((start, end)) = input.split_once("..") {
+        let start = start
+            .parse::<DateTime<Utc>>()
+            .map_err(|_| "interval range must use RFC3339 timestamps")?;
+        let end = end
+            .parse::<DateTime<Utc>>()
+            .map_err(|_| "interval range must use RFC3339 timestamps")?;
+        if end <= start {
+            return Err("interval range must end after it starts".into());
+        }
+        return Ok((start, end));
+    }
     if input == "today" {
         let local = now.with_timezone(&Local);
         let start = Local
@@ -3990,11 +4078,47 @@ fn parse_interval(
                 .strip_suffix('d')
                 .and_then(|x| x.parse::<i64>().ok().map(|x| x * 24))
         })
-        .ok_or("--since must be today, <hours>h, or <days>d")?;
+        .or_else(|| {
+            input
+                .strip_suffix('w')
+                .and_then(|x| x.parse::<i64>().ok().map(|x| x * 24 * 7))
+        })
+        .ok_or("interval must be today, <hours>h, <days>d, <weeks>w, or RFC3339..RFC3339")?;
     if n <= 0 {
-        return Err("--since duration must be positive".into());
+        return Err("interval duration must be positive".into());
     }
     Ok((now - Duration::hours(n), now))
+}
+
+fn comparison_interval(
+    compare: &str,
+    current_start: DateTime<Utc>,
+    current_end: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    match compare {
+        "previous-week" => Ok((
+            current_start - Duration::days(7),
+            current_end - Duration::days(7),
+        )),
+        "preceding-week-average" => Ok((current_start - Duration::days(7), current_start)),
+        _ => parse_interval(compare, now),
+    }
+}
+
+fn validate_cli_interval(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let duration = end - start;
+    if duration <= Duration::zero() || duration > Duration::days(185) {
+        return Err("interval must be positive and no longer than 185 days".into());
+    }
+    if start < now - Duration::days(185) || end > now + Duration::minutes(5) {
+        return Err("interval is outside the retained 185-day evidence window".into());
+    }
+    Ok(())
 }
 pub fn render_diagnosis(d: &Diagnosis) -> String {
     let mut s = format!(
@@ -6192,6 +6316,27 @@ mod tests {
             (start - Duration::days(7)).to_rfc3339()
         );
         assert_eq!(baseline.comparison.end_utc, start.to_rfc3339());
+    }
+
+    #[test]
+    fn diagnosis_accepts_two_arbitrary_absolute_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("evidence.sqlite");
+        open_db(&path).unwrap();
+        let current_start = Utc::now() - Duration::hours(2);
+        let current_end = Utc::now() - Duration::hours(1);
+        let comparison_start = Utc::now() - Duration::hours(5);
+        let comparison_end = Utc::now() - Duration::hours(4);
+        let result = diagnose_memory_windows(
+            &path,
+            current_start,
+            current_end,
+            comparison_start,
+            comparison_end,
+        )
+        .unwrap();
+        assert_eq!(result.current.start_utc, current_start.to_rfc3339());
+        assert_eq!(result.comparison.start_utc, comparison_start.to_rfc3339());
     }
 
     #[test]
