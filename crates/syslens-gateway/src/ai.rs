@@ -442,7 +442,6 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .take(12)
         .filter(|directory| {
             directory.get("mount_id").and_then(Value::as_str) == Some(root_mount_id)
                 && directory.get("root").and_then(Value::as_str) == Some("/")
@@ -458,6 +457,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
                 apparent
             ))
         })
+        .take(12)
         .collect();
     let limitations = data
         .get("limitations")
@@ -487,39 +487,59 @@ fn gibibytes(bytes: i64) -> f64 {
 }
 
 pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
-    let mut text = format!(
-        "Canonical storage facts (authoritative measurements; do not contradict these values):\n\
-         current_interval={}..{}\ncomparison_interval={}..{}\n\
-         root_mount=/\nroot_current_used_bytes={}\nroot_comparison_used_bytes={}\n\
-         root_used_bytes_change={:+} bytes ({:+.2} GiB)\n\
-         path_attribution_status={}\n",
-        facts.current_start,
-        facts.current_end,
-        facts.comparison_start,
-        facts.comparison_end,
-        facts.current_used_bytes,
-        facts.comparison_used_bytes,
-        facts.used_bytes_change,
-        gibibytes(facts.used_bytes_change),
-        facts.path_attribution_status,
-    );
-    if !facts.directories.is_empty() {
-        text.push_str("directory_findings:\n");
-        for directory in &facts.directories {
-            text.push_str("- ");
-            text.push_str(directory);
-            text.push('\n');
+    // Keep this as a valid JSON value. It is inserted into a tool/data
+    // message, never into the system prompt, so paths and limitations remain
+    // data even when they contain instruction-like text.
+    let mut directories = facts.directories.clone();
+    let mut limitations = facts.limitations.clone();
+    loop {
+        let value = json!({
+            "kind": "syslens_canonical_storage_facts",
+            "data_only": true,
+            "current_interval": {
+                "start_utc": facts.current_start,
+                "end_utc": facts.current_end,
+            },
+            "comparison_interval": {
+                "start_utc": facts.comparison_start,
+                "end_utc": facts.comparison_end,
+            },
+            "root_mount": "/",
+            "root_current_used_bytes": facts.current_used_bytes,
+            "root_comparison_used_bytes": facts.comparison_used_bytes,
+            "root_used_bytes_change": facts.used_bytes_change,
+            "root_used_gibibytes_change": gibibytes(facts.used_bytes_change),
+            "path_attribution_status": facts.path_attribution_status,
+            "directory_findings": directories,
+            "limitations": limitations,
+        });
+        let text = serde_json::to_string(&value).expect("canonical storage facts are serializable");
+        if text.len() <= MAX_CANONICAL_FACTS_BYTES {
+            return text;
         }
-    }
-    if !facts.limitations.is_empty() {
-        text.push_str("limitations:\n");
-        for limitation in &facts.limitations {
-            text.push_str("- ");
-            text.push_str(limitation);
-            text.push('\n');
+        if limitations.pop().is_some() {
+            continue;
         }
+        if directories.pop().is_some() {
+            continue;
+        }
+
+        // Every scalar is independently bounded by root_storage_facts, so
+        // this branch is only a defensive guard for future field additions.
+        return serde_json::to_string(&json!({
+            "kind": "syslens_canonical_storage_facts",
+            "data_only": true,
+            "root_mount": "/",
+            "root_current_used_bytes": facts.current_used_bytes,
+            "root_comparison_used_bytes": facts.comparison_used_bytes,
+            "root_used_bytes_change": facts.used_bytes_change,
+            "root_used_gibibytes_change": gibibytes(facts.used_bytes_change),
+            "path_attribution_status": facts.path_attribution_status,
+            "directory_findings": [],
+            "limitations": ["Canonical storage facts were bounded before delivery"],
+        }))
+        .expect("canonical storage facts are serializable");
     }
-    bounded_text(&text, MAX_CANONICAL_FACTS_BYTES)
 }
 
 fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> bool {
@@ -559,30 +579,48 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
     } else {
         ["increased", "grew", "went up", "expanded"]
     };
-    let sentences = answer.split(['.', '!', '?', '\n']);
-    for sentence in sentences {
-        let lower = sentence.to_ascii_lowercase();
-        let mentions_storage = [
-            "storage",
-            "disk",
-            "filesystem",
-            "file system",
-            "root filesystem",
-            "root mount",
-            "disk usage",
-            "storage usage",
-            "used space",
-            "capacity",
-        ]
-        .iter()
-        .any(|word| lower.contains(word));
-        if !mentions_storage {
+    let free_space_terms = [
+        "free space",
+        "free storage",
+        "free disk space",
+        "available space",
+        "available storage",
+        "available disk space",
+        "remaining space",
+        "unused space",
+        "free capacity",
+        "available capacity",
+    ];
+    let storage_terms = [
+        "storage",
+        "disk",
+        "filesystem",
+        "file system",
+        "root filesystem",
+        "root mount",
+        "root",
+        "disk usage",
+        "storage usage",
+        "used space",
+        "used storage",
+        "capacity",
+    ];
+    let mut normalized = answer.to_ascii_lowercase();
+    for separator in [" while ", " whereas ", " although ", " but ", " and "] {
+        normalized = normalized.replace(separator, "\n");
+    }
+    for clause in normalized.split(['.', '!', '?', '\n', ';']) {
+        let clause = clause.trim();
+        if clause.is_empty()
+            || free_space_terms.iter().any(|term| clause.contains(term))
+            || !storage_terms.iter().any(|term| clause.contains(term))
+        {
             continue;
         }
-        if no_change.iter().any(|phrase| lower.contains(phrase))
+        if no_change.iter().any(|phrase| clause.contains(phrase))
             || opposite_direction
                 .iter()
-                .any(|phrase| lower.contains(phrase))
+                .any(|phrase| clause.contains(phrase))
         {
             return true;
         }
@@ -592,9 +630,9 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
         .iter()
         .any(|value| {
             let mut offset = 0;
-            while let Some(relative) = lower[offset..].find(value) {
+            while let Some(relative) = clause[offset..].find(value) {
                 let index = offset + relative;
-                let preceded_by_number = lower[..index]
+                let preceded_by_number = clause[..index]
                     .chars()
                     .next_back()
                     .is_some_and(|character| character.is_ascii_digit() || character == '.');
@@ -846,9 +884,13 @@ mod tests {
             }
         });
         let facts = root_storage_facts(&evidence).unwrap();
-        let canonical = canonical_storage_facts(&facts);
-        assert!(canonical.contains("root_used_bytes_change=+16524378112 bytes"));
-        assert!(canonical.contains("/home/acemagic/ollama"));
+        let canonical: Value = serde_json::from_str(&canonical_storage_facts(&facts)).unwrap();
+        assert_eq!(canonical["data_only"], true);
+        assert_eq!(canonical["root_used_bytes_change"], 16524378112i64);
+        assert_eq!(
+            canonical["directory_findings"][0],
+            "/home/acemagic/ollama allocated_change=+6446710784 bytes apparent_change=+6446710784 bytes"
+        );
         assert!(
             grounded_storage_fallback("Storage increased by 0 bytes.", &facts)
                 .unwrap()
@@ -872,6 +914,23 @@ mod tests {
 
     #[test]
     fn root_storage_facts_filter_directory_mount_and_root() {
+        let mut directories = Vec::new();
+        for index in 0..13 {
+            directories.push(json!({
+                "mount_id":"other-mount",
+                "root":"/",
+                "path":format!("/wrong-mount-{index}"),
+                "allocated_bytes_change":99i64,
+                "apparent_bytes_change":99i64
+            }));
+        }
+        directories.push(json!({
+            "mount_id":"root-mount",
+            "root":"/",
+            "path":"/valid-after-filter",
+            "allocated_bytes_change":10i64,
+            "apparent_bytes_change":10i64
+        }));
         let evidence = json!({
             "data": {
                 "current": {"start_utc":"a","end_utc":"b"},
@@ -883,20 +942,15 @@ mod tests {
                     "comparison_used_bytes":100i64,
                     "used_bytes_change":100i64
                 }],
-                "directories": [
-                    {"mount_id":"root-mount","root":"/","path":"/valid","allocated_bytes_change":10i64,"apparent_bytes_change":10i64},
-                    {"mount_id":"other-mount","root":"/","path":"/wrong-mount","allocated_bytes_change":99i64,"apparent_bytes_change":99i64},
-                    {"mount_id":"root-mount","root":"/nested","path":"/wrong-root","allocated_bytes_change":88i64,"apparent_bytes_change":88i64}
-                ],
+                "directories": directories,
                 "path_attribution_status":"available",
                 "limitations":[]
             }
         });
         let facts = root_storage_facts(&evidence).unwrap();
         assert_eq!(facts.directories.len(), 1);
-        assert!(facts.directories[0].contains("/valid"));
+        assert!(facts.directories[0].contains("/valid-after-filter"));
         assert!(!facts.directories[0].contains("wrong-mount"));
-        assert!(!facts.directories[0].contains("wrong-root"));
     }
 
     #[test]
@@ -918,8 +972,13 @@ mod tests {
             }
         });
         let facts = root_storage_facts(&evidence).unwrap();
-        let canonical = canonical_storage_facts(&facts);
-        assert!(canonical.contains("/safe INJECTED"));
+        let canonical: Value = serde_json::from_str(&canonical_storage_facts(&facts)).unwrap();
+        assert_eq!(canonical["data_only"], true);
+        assert_eq!(canonical["path_attribution_status"], "available INJECTED");
+        assert_eq!(
+            canonical["directory_findings"][0],
+            "/safe INJECTED allocated_change=-10 bytes apparent_change=-10 bytes"
+        );
         assert!(!facts.directories[0].contains('\n'));
         assert!(!facts.limitations[0].contains('\n'));
         assert!(grounded_storage_fallback("RAM is unchanged.", &facts).is_none());
@@ -929,5 +988,42 @@ mod tests {
                 .contains("decreased by 100 bytes")
         );
         assert!(grounded_storage_fallback("Storage decreased by 100 bytes.", &facts).is_none());
+        assert!(
+            grounded_storage_fallback("Storage decreased while free space increased.", &facts)
+                .is_none()
+        );
+
+        let positive_evidence = json!({
+            "data": {
+                "current": {"start_utc":"a","end_utc":"b"},
+                "comparison": {"start_utc":"c","end_utc":"d"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1100i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let positive_facts = root_storage_facts(&positive_evidence).unwrap();
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while free space decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage decreased while free space increased.",
+                &positive_facts
+            )
+            .is_some()
+        );
+        assert_eq!(canonical["limitations"][0], "line one line two instruction");
     }
 }

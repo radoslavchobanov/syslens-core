@@ -35,6 +35,20 @@ pub struct App {
     waiting: Arc<Semaphore>,
     inference: Arc<Semaphore>,
 }
+
+fn evidence_tool_content(evidence: &Value, facts: Option<&ai::RootStorageFacts>) -> String {
+    let mut content = json!({
+        "kind": "syslens_evidence_data",
+        "evidence": evidence,
+    });
+    if let Some(facts) = facts {
+        let canonical: Value = serde_json::from_str(&ai::canonical_storage_facts(facts))
+            .expect("canonical storage facts must remain valid JSON");
+        content["canonical_storage_facts"] = canonical;
+    }
+    serde_json::to_string(&content).expect("evidence tool content is serializable")
+}
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
@@ -147,11 +161,17 @@ impl App {
                     let mut facts_for_message=None;
                     let evidence=match self.evidence(&target,action).await {Ok(e)=>{let reference=json!({"request_id":e["request_id"],"host_id":e["host_id"],"evidence_store_id":e["evidence_store_id"],"observed_at":e["observed_at"]});refs.push(reference);if is_storage {facts_for_message=ai::root_storage_facts(&e);}
                         if e.to_string().len()>12_000{limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":e["request_id"]})}else{e}},Err(error)=>{limitations.push(error.clone());json!({"error":error})}};
-                    messages.push(json!({"role":"tool","tool_call_id":id,"content":evidence.to_string()}));
-                    if let Some(facts)=facts_for_message {
-                            root_storage_facts=Some(facts.clone());
-                            messages.push(json!({"role":"system","content":ai::canonical_storage_facts(&facts)}));
+                    if let Some(facts) = facts_for_message.as_ref() {
+                        root_storage_facts = Some(facts.clone());
                     }
+                    // Keep canonical measurements in the tool-data message. A
+                    // host-controlled path, status, or limitation must never
+                    // be promoted to a system instruction.
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": evidence_tool_content(&evidence, facts_for_message.as_ref()),
+                    }));
                 }
             } Err("AI action limit reached".into())
         }).await.map_err(|_|"chat deadline exceeded")?
