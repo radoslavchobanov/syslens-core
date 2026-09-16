@@ -138,13 +138,21 @@ impl App {
             let mut refs=Vec::new();let mut limitations=Vec::new();
             let mut root_storage_facts=None;
             if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
-            if let Some(action) = ai::inferred_storage_action(&r.question) {
+            if capabilities.data.resources.iter().any(|resource| resource == "storage")
+                && let Some(action) = ai::inferred_storage_action(&r.question)
+            {
                 let evidence = self.evidence(&target, action).await?;
                 refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
                 root_storage_facts = ai::root_storage_facts(&evidence);
                 let call_id = "syslens-inferred-storage";
                 messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":"{\"current_range\":\"today\",\"comparison_range\":\"previous-day\"}"}}]}));
-                messages.push(json!({"role":"tool","tool_call_id":call_id,"content":evidence_tool_content(&evidence,root_storage_facts.as_ref())}));
+                let model_evidence = if evidence.to_string().len() > 12_000 {
+                    limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());
+                    json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":evidence["request_id"]})
+                } else {
+                    evidence.clone()
+                };
+                messages.push(json!({"role":"tool","tool_call_id":call_id,"content":evidence_tool_content(&model_evidence,root_storage_facts.as_ref())}));
             }
             for round in 0..=self.config.ai.max_rounds {
                 let assistant=model_client.completion(&model,&messages).await?;

@@ -601,10 +601,10 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
 /// A deterministic, bounded summary that keeps a useful answer available when
 /// a local model emits only reasoning or a generic evidence paraphrase.
 pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String {
-    let direction = if facts.used_bytes_change >= 0 {
-        "increased"
-    } else {
-        "decreased"
+    let direction = match facts.used_bytes_change.cmp(&0) {
+        std::cmp::Ordering::Greater => "increased",
+        std::cmp::Ordering::Less => "decreased",
+        std::cmp::Ordering::Equal => "did not change",
     };
     let magnitude = facts.used_bytes_change.saturating_abs();
     let mut summary = format!(
@@ -965,6 +965,9 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
 }
 
 pub(crate) fn grounded_storage_fallback(answer: &str, facts: &RootStorageFacts) -> Option<String> {
+    if facts.used_bytes_change == 0 {
+        return None;
+    }
     if !directly_contradicts_root_change(answer, facts) {
         return None;
     }
