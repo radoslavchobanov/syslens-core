@@ -598,22 +598,43 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
         "file system",
         "root filesystem",
         "root mount",
-        "root",
         "disk usage",
         "storage usage",
         "used space",
         "used storage",
-        "capacity",
     ];
     let mut normalized = answer.to_ascii_lowercase();
-    for separator in [" while ", " whereas ", " although ", " but ", " and "] {
+    for separator in [
+        " while ",
+        " whereas ",
+        " although ",
+        " but ",
+        " and ",
+        " because ",
+        " due to ",
+        " since ",
+        " as ",
+        " despite ",
+        " even though ",
+    ] {
         normalized = normalized.replace(separator, "\n");
     }
-    for clause in normalized.split(['.', '!', '?', '\n', ';']) {
+    for clause in normalized.split(['.', '!', '?', '\n', ';', ',']) {
         let clause = clause.trim();
-        if clause.is_empty()
-            || free_space_terms.iter().any(|term| clause.contains(term))
-            || !storage_terms.iter().any(|term| clause.contains(term))
+        if clause.is_empty() {
+            continue;
+        }
+        // Free-space terms contain generic storage words (for example,
+        // "available storage"). Remove those terms before looking for a
+        // root-storage resource so their direction cannot be mistaken for
+        // the authoritative used-space direction.
+        let mut storage_clause = clause.to_owned();
+        for term in free_space_terms {
+            storage_clause = storage_clause.replace(term, " ");
+        }
+        if !storage_terms
+            .iter()
+            .any(|term| storage_clause.contains(term))
         {
             continue;
         }
@@ -1013,6 +1034,20 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "Storage increased while free space decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage decreased because free space increased.",
+                &positive_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "The root cause remained unchanged while storage increased.",
                 &positive_facts
             )
             .is_none()
