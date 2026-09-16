@@ -6,6 +6,10 @@ use syslens_protocol::{
 };
 
 const MAX_COMPLETION_TOKENS: u64 = 512;
+/// Maximum answer size persisted in a chat exchange and returned by the
+/// gateway. The deterministic storage prefix is bounded separately to 8 KiB,
+/// leaving room for a truncated model analysis.
+pub(crate) const MAX_FINAL_ANSWER_BYTES: usize = 32_768;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -377,19 +381,18 @@ pub fn calls(message: &Value) -> Result<Vec<ParsedCall>> {
                 || c.id.is_empty()
                 || c.id.len() > 128
                 || !ids.insert(c.id.clone())
+                || !c.function.arguments.is_string()
                 || c.function.arguments.to_string().len() > 8192
             {
                 return Err("invalid tool call".into());
             }
-            let action = c
+            let arguments = c
                 .function
                 .arguments
                 .as_str()
-                .ok_or_else(|| "tool arguments must be a JSON string".to_string())
-                .and_then(|arguments| {
-                    serde_json::from_str(arguments)
-                        .map_err(|_| "invalid tool arguments".to_string())
-                })
+                .expect("tool arguments were structurally validated");
+            let action = serde_json::from_str(arguments)
+                .map_err(|_| "invalid tool arguments".to_string())
                 .and_then(|args| action(&c.function.name, args));
             Ok(ParsedCall { id: c.id, action })
         })
@@ -452,7 +455,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .get("path_attribution_status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let directories = data
+    let mut directories = data
         .get("directories")
         .and_then(Value::as_array)
         .into_iter()
@@ -465,14 +468,25 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
             let path = directory.get("path")?.as_str()?;
             let allocated = directory.get("allocated_bytes_change")?.as_i64()?;
             let apparent = directory.get("apparent_bytes_change")?.as_i64()?;
-            Some(format!(
-                "{} allocated_change={:+} bytes apparent_change={:+} bytes",
-                bounded_text(path, 512),
-                allocated,
-                apparent
-            ))
+            let formatted = format!(
+                "{} allocated_change={allocated:+} bytes apparent_change={apparent:+} bytes",
+                bounded_text(path, 512)
+            );
+            Some((allocated, path, apparent, formatted))
         })
+        .collect::<Vec<_>>();
+    directories.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(right.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let directories = directories
+        .into_iter()
         .take(12)
+        .map(|(_, _, _, formatted)| formatted)
         .collect();
     let mut current_directory_snapshot = data
         .get("current_directory_snapshot")
@@ -636,15 +650,70 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
     bounded_text(&summary, 8192)
 }
 
+/// Put the exact deterministic storage summary first, regardless of what the
+/// model says. Remove any identical copy from the model text so retries or a
+/// model echo cannot duplicate the authoritative block.
+pub(crate) fn authoritative_storage_answer(answer: &str, facts: &RootStorageFacts) -> String {
+    let summary = deterministic_storage_summary(facts);
+    let analysis = answer.replace(&summary, "");
+    let analysis = analysis.trim();
+    if analysis.is_empty() {
+        summary
+    } else {
+        let prefix = format!("{summary}\n\nModel analysis:\n");
+        let available = MAX_FINAL_ANSWER_BYTES.saturating_sub(prefix.len());
+        let mut end = available.min(analysis.len());
+        while !analysis.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{prefix}{}", &analysis[..end])
+    }
+}
+
 /// Infer only the narrow, unambiguous everyday storage question. Arbitrary
 /// periods still require the model's typed evidence action.
 pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
     let lower = question.to_ascii_lowercase();
-    let resource = ["storage", "disk", "filesystem", "file system"]
+    let words = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let resource = ["storage", "disk", "filesystem"]
         .iter()
-        .any(|term| lower.contains(term));
-    let equivalent_day = lower.contains("today") && lower.contains("yesterday");
-    if !resource || !equivalent_day {
+        .any(|term| words.contains(term))
+        || words.windows(2).any(|pair| pair == ["file", "system"]);
+    let equivalent_day = words.contains(&"today") && words.contains(&"yesterday");
+    let comparison_or_diagnosis = [
+        "compare",
+        "compared",
+        "comparison",
+        "versus",
+        "vs",
+        "difference",
+        "different",
+        "diagnose",
+        "diagnosis",
+        "explain",
+        "why",
+        "change",
+        "changed",
+        "increase",
+        "increased",
+        "increasing",
+        "growth",
+        "grow",
+        "grew",
+        "decrease",
+        "decreased",
+        "decreasing",
+        "shrink",
+        "shrank",
+        "higher",
+        "lower",
+    ]
+    .iter()
+    .any(|term| words.contains(term));
+    if !resource || !equivalent_day || !comparison_or_diagnosis {
         return None;
     }
     let current = WindowRange {
@@ -1158,6 +1227,16 @@ mod tests {
         assert!(calls(&m).is_err());
     }
     #[test]
+    fn non_string_tool_arguments_invalidate_batch_but_invalid_json_is_retryable() {
+        let non_string = json!({"tool_calls":[{"id":"x","type":"function","function":{"name":"status","arguments":{}}}]});
+        assert!(calls(&non_string).is_err());
+
+        let invalid_json = json!({"tool_calls":[{"id":"x","type":"function","function":{"name":"status","arguments":"not-json"}}]});
+        let parsed = calls(&invalid_json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].action.is_err());
+    }
+    #[test]
     fn accepts_optional_integer_tool_call_index() {
         let m = json!({"tool_calls":[{"id":"x","type":"function","index":0,"function":{"name":"status","arguments":"{}"}}]});
         assert!(calls(&m).is_ok());
@@ -1230,6 +1309,32 @@ mod tests {
     }
 
     #[test]
+    fn root_storage_facts_preserve_a_complete_zero_delta() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1000i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":0i64
+                }],
+                "directories": [],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+
+        assert_eq!(facts.current_used_bytes, 1000);
+        assert_eq!(facts.comparison_used_bytes, 1000);
+        assert_eq!(facts.used_bytes_change, 0);
+        assert!(deterministic_storage_summary(&facts).contains("did not change by 0 bytes"));
+    }
+
+    #[test]
     fn root_storage_facts_filter_directory_mount_and_root() {
         let mut directories = Vec::new();
         for index in 0..13 {
@@ -1268,6 +1373,55 @@ mod tests {
         assert_eq!(facts.directories.len(), 1);
         assert!(facts.directories[0].contains("/valid-after-filter"));
         assert!(!facts.directories[0].contains("wrong-mount"));
+    }
+
+    #[test]
+    fn root_storage_facts_sort_historical_directories_deterministically() {
+        fn facts_for(directories: Value) -> RootStorageFacts {
+            root_storage_facts(&json!({
+                "data": {
+                    "current": {"start_utc":"a","end_utc":"b"},
+                    "comparison": {"start_utc":"c","end_utc":"d"},
+                    "mounts": [{
+                        "mount_id":"root-mount",
+                        "mount_point":"/",
+                        "current_used_bytes":200i64,
+                        "comparison_used_bytes":100i64,
+                        "used_bytes_change":100i64
+                    }],
+                    "directories": directories,
+                    "path_attribution_status":"available",
+                    "limitations":[]
+                }
+            }))
+            .unwrap()
+        }
+
+        let rows = json!([
+            {"mount_id":"root-mount","root":"/","path":"/zeta","allocated_bytes_change":20i64,"apparent_bytes_change":21i64},
+            {"mount_id":"root-mount","root":"/","path":"/largest","allocated_bytes_change":30i64,"apparent_bytes_change":31i64},
+            {"mount_id":"root-mount","root":"/","path":"/alpha","allocated_bytes_change":20i64,"apparent_bytes_change":19i64},
+            {"mount_id":"root-mount","root":"/","path":"/alpha","allocated_bytes_change":20i64,"apparent_bytes_change":22i64}
+        ]);
+        let reversed = json!([
+            {"mount_id":"root-mount","root":"/","path":"/alpha","allocated_bytes_change":20i64,"apparent_bytes_change":22i64},
+            {"mount_id":"root-mount","root":"/","path":"/alpha","allocated_bytes_change":20i64,"apparent_bytes_change":19i64},
+            {"mount_id":"root-mount","root":"/","path":"/largest","allocated_bytes_change":30i64,"apparent_bytes_change":31i64},
+            {"mount_id":"root-mount","root":"/","path":"/zeta","allocated_bytes_change":20i64,"apparent_bytes_change":21i64}
+        ]);
+
+        let first = facts_for(rows).directories;
+        let second = facts_for(reversed).directories;
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![
+                "/largest allocated_change=+30 bytes apparent_change=+31 bytes",
+                "/alpha allocated_change=+20 bytes apparent_change=+22 bytes",
+                "/alpha allocated_change=+20 bytes apparent_change=+19 bytes",
+                "/zeta allocated_change=+20 bytes apparent_change=+21 bytes",
+            ]
+        );
     }
 
     #[test]
@@ -1315,6 +1469,33 @@ mod tests {
             inferred_storage_action("Why did memory increase from yesterday to today?").is_none()
         );
         assert!(inferred_storage_action("Why did storage increase last week?").is_none());
+        assert!(
+            inferred_storage_action("Storage backups ran today and yesterday without errors.")
+                .is_none()
+        );
+        assert!(inferred_storage_action("The disk report mentions today and yesterday.").is_none());
+        assert!(
+            inferred_storage_action("Compare storage todayish with yesterdays report.").is_none()
+        );
+        assert!(
+            inferred_storage_action("Compare profile-system activity from yesterday with today.")
+                .is_none()
+        );
+        assert!(matches!(
+            inferred_storage_action("Compare file system usage today versus yesterday."),
+            Some(Action::Storage(request))
+                if request.window.comparison == ComparisonMode::PreviousDay
+        ));
+        assert!(matches!(
+            inferred_storage_action("Compare disk usage today versus yesterday."),
+            Some(Action::Storage(request))
+                if request.window.comparison == ComparisonMode::PreviousDay
+        ));
+        assert!(matches!(
+            inferred_storage_action("Diagnose storage today against yesterday."),
+            Some(Action::Storage(request))
+                if request.window.comparison == ComparisonMode::PreviousDay
+        ));
     }
 
     #[test]
@@ -1349,6 +1530,51 @@ mod tests {
         assert!(summary.contains("+0.00 GiB"));
         assert!(summary.contains("/home/acemagic/ollama"));
         assert!(summary.contains("inventory is not growth attribution"));
+    }
+
+    #[test]
+    fn authoritative_storage_answer_requires_exact_prefix_without_duplication() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1100i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "path_attribution_status":"unavailable",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        let summary = deterministic_storage_summary(&facts);
+
+        let phrase_only = authoritative_storage_answer(
+            "The phrase Authoritative storage evidence is worth mentioning.",
+            &facts,
+        );
+        assert!(phrase_only.starts_with(&summary));
+        assert_eq!(phrase_only.matches(&summary).count(), 1);
+
+        let echoed = authoritative_storage_answer(
+            &format!("Model preface. {summary}\n{summary}\nModel conclusion."),
+            &facts,
+        );
+        assert!(echoed.starts_with(&summary));
+        assert_eq!(echoed.matches(&summary).count(), 1);
+        assert!(echoed.contains("Model preface."));
+        assert!(echoed.contains("Model conclusion."));
+
+        assert_eq!(authoritative_storage_answer(&summary, &facts), summary);
+
+        let oversized = authoritative_storage_answer(&"é".repeat(32_768), &facts);
+        assert!(oversized.starts_with(&summary));
+        assert!(oversized.len() <= MAX_FINAL_ANSWER_BYTES);
+        assert_eq!(oversized.matches(&summary).count(), 1);
     }
 
     #[test]

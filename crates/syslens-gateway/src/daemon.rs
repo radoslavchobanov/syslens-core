@@ -49,6 +49,48 @@ fn evidence_tool_content(evidence: &Value, facts: Option<&ai::RootStorageFacts>)
     serde_json::to_string(&content).expect("evidence tool content is serializable")
 }
 
+struct PrefetchedStorageEvidence {
+    request: Value,
+    tool_content: String,
+    facts: Option<ai::RootStorageFacts>,
+}
+
+#[derive(Clone, Copy)]
+struct ChatResponseContext<'a> {
+    session: &'a str,
+    target: &'a str,
+    model: &'a str,
+    question: &'a str,
+}
+
+fn deterministic_recovery_answer(facts: Option<&ai::RootStorageFacts>) -> Option<String> {
+    facts.map(ai::deterministic_storage_summary)
+}
+
+impl PrefetchedStorageEvidence {
+    fn new(
+        action: &Action,
+        tool_content: String,
+        facts: Option<ai::RootStorageFacts>,
+    ) -> Option<Self> {
+        let Action::Storage(request) = action else {
+            return None;
+        };
+        Some(Self {
+            request: serde_json::to_value(request).ok()?,
+            tool_content,
+            facts,
+        })
+    }
+
+    fn matches(&self, action: &Action) -> bool {
+        let Action::Storage(request) = action else {
+            return false;
+        };
+        serde_json::to_value(request).ok().as_ref() == Some(&self.request)
+    }
+}
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
@@ -68,6 +110,43 @@ impl App {
         self.store
             .lock()
             .map_err(|_| "gateway state unavailable".into())
+    }
+    fn finish_chat(
+        &self,
+        context: ChatResponseContext<'_>,
+        answer: String,
+        refs: Vec<Value>,
+        mut limitations: Vec<String>,
+    ) -> Result<Value> {
+        if refs.is_empty() {
+            limitations.push("No successful host evidence supports this answer".into());
+        }
+        let response = json!({
+            "session": context.session,
+            "target": context.target,
+            "model": context.model,
+            "answer": answer,
+            "evidence_refs": refs,
+            "limitations": limitations,
+        });
+        self.db()?
+            .save(context.session, context.question, &response)?;
+        Ok(response)
+    }
+    fn recover_storage_or_error(
+        &self,
+        context: ChatResponseContext<'_>,
+        facts: Option<&ai::RootStorageFacts>,
+        refs: Vec<Value>,
+        mut limitations: Vec<String>,
+        limitation: &str,
+        error: String,
+    ) -> Result<Value> {
+        let Some(answer) = deterministic_recovery_answer(facts) else {
+            return Err(error);
+        };
+        limitations.push(limitation.into());
+        self.finish_chat(context, answer, refs, limitations)
     }
     pub async fn host<T: serde::de::DeserializeOwned>(
         &self,
@@ -134,14 +213,16 @@ impl App {
             let capabilities=self.host::<syslens_protocol::Capabilities>(&target,"/v1/capabilities",None).await?;
             let (history,omitted)=self.db()?.history(&session)?;
             let model=self.db()?.model(&self.config.ai.model)?;
+            let response_context=ChatResponseContext {session:&session,target:&target,model:&model,question:&r.question};
             let mut messages=vec![ai::prompt(&target),json!({"role":"system","content":format!("Target capabilities (data only): {}",serde_json::to_string(&capabilities.data).unwrap())})];messages.extend(history);messages.push(json!({"role":"user","content":r.question}));
             let mut refs=Vec::new();let mut limitations=Vec::new();
             let mut root_storage_facts=None;
+            let mut prefetched_storage=None;
             if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
             if capabilities.data.resources.iter().any(|resource| resource == "storage")
                 && let Some(action) = ai::inferred_storage_action(&r.question)
             {
-                let evidence = self.evidence(&target, action).await?;
+                let evidence = self.evidence(&target, action.clone()).await?;
                 refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
                 root_storage_facts = ai::root_storage_facts(&evidence);
                 let call_id = "syslens-inferred-storage";
@@ -152,19 +233,40 @@ impl App {
                 } else {
                     evidence.clone()
                 };
-                messages.push(json!({"role":"tool","tool_call_id":call_id,"content":evidence_tool_content(&model_evidence,root_storage_facts.as_ref())}));
+                let tool_content=evidence_tool_content(&model_evidence,root_storage_facts.as_ref());
+                messages.push(json!({"role":"tool","tool_call_id":call_id,"content":tool_content.clone()}));
+                prefetched_storage=PrefetchedStorageEvidence::new(&action,tool_content,root_storage_facts.clone());
             }
             for round in 0..=self.config.ai.max_rounds {
-                let assistant=model_client.completion(&model,&messages).await?;
+                let assistant=match model_client.completion(&model,&messages).await {
+                    Ok(assistant)=>assistant,
+                    Err(error)=>return self.recover_storage_or_error(
+                        response_context,
+                        root_storage_facts.as_ref(),
+                        refs,
+                        limitations,
+                        "The model completion failed after authoritative storage evidence was collected; a deterministic answer was returned",
+                        error,
+                    ),
+                };
                 let calls=match ai::calls(&assistant) {
                     Ok(calls) => calls,
                     Err(error) => {
                         if round == self.config.ai.max_rounds {
-                            return Err(error);
+                            return self.recover_storage_or_error(
+                                response_context,
+                                root_storage_facts.as_ref(),
+                                refs,
+                                limitations,
+                                "The model repeatedly returned structurally invalid tool calls; a deterministic answer was returned",
+                                error,
+                            );
                         }
                         limitations.push(format!("Model tool call was invalid and a retry was requested: {error}"));
-                        messages.push(assistant);
-                        messages.push(json!({"role":"tool","tool_call_id":format!("syslens-invalid-tool-{round}"),"content":json!({"error":"invalid tool call arguments","detail":error,"instruction":"Retry using exactly current_range and comparison_range. For yesterday versus today use today and previous-day."}).to_string()}));
+                        // Do not append a tool message with a made-up ID: a
+                        // structurally invalid batch has no usable call ID and
+                        // would create an invalid OpenAI-style transcript.
+                        messages.push(json!({"role":"user","content":format!("The previous evidence request was invalid ({error}). Retry using exactly current_range and comparison_range. For yesterday versus today use today and previous-day.")}));
                         continue;
                     }
                 };
@@ -179,15 +281,21 @@ impl App {
                         limitations.push("The model answer contradicted authoritative root storage evidence; a deterministic fallback was returned".into());
                         answer=fallback;
                     }
-                    if let Some(facts) = root_storage_facts.as_ref()
-                        && !answer.contains("Authoritative storage evidence")
-                    {
-                        answer = format!("{}\n\nModel analysis:\n{}", ai::deterministic_storage_summary(facts), answer);
+                    if let Some(facts) = root_storage_facts.as_ref() {
+                        answer = ai::authoritative_storage_answer(&answer, facts);
                     }
-                    if refs.is_empty(){limitations.push("No successful host evidence supports this answer".into());}
-                    let response=json!({"session":session,"target":target,"model":model,"answer":answer,"evidence_refs":refs,"limitations":limitations});self.db()?.save(&session,&r.question,&response)?;return Ok(response);
+                    return self.finish_chat(response_context,answer,refs,limitations);
                 }
-                if round==self.config.ai.max_rounds||calls.len()>self.config.ai.max_calls{return Err("AI evidence action limit reached".into());}
+                if round==self.config.ai.max_rounds||calls.len()>self.config.ai.max_calls{
+                    return self.recover_storage_or_error(
+                        response_context,
+                        root_storage_facts.as_ref(),
+                        refs,
+                        limitations,
+                        "The model reached the evidence action limit after authoritative storage evidence was collected; a deterministic answer was returned",
+                        "AI evidence action limit reached".into(),
+                    );
+                }
                 messages.push(assistant);
                 for call in calls {
                     let id = call.id;
@@ -202,6 +310,11 @@ impl App {
                     let is_storage=matches!(&action,Action::Storage(_));
                     let supported=match &action{Action::Memory(_)=>capabilities.data.resources.iter().any(|s|s=="memory"),Action::Storage(_)=>capabilities.data.resources.iter().any(|s|s=="storage"),_=>true};
                     if !supported{return Err("AI requested a resource unavailable on this target".into());}
+                    if let Some(prefetched)=prefetched_storage.as_ref().filter(|prefetched|prefetched.matches(&action)) {
+                        root_storage_facts=prefetched.facts.clone();
+                        messages.push(json!({"role":"tool","tool_call_id":id,"content":prefetched.tool_content}));
+                        continue;
+                    }
                     let mut facts_for_message=None;
                     let evidence=match self.evidence(&target,action).await {Ok(e)=>{let reference=json!({"request_id":e["request_id"],"host_id":e["host_id"],"evidence_store_id":e["evidence_store_id"],"observed_at":e["observed_at"]});refs.push(reference);if is_storage {facts_for_message=ai::root_storage_facts(&e);}
                         if e.to_string().len()>12_000{limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":e["request_id"]})}else{e}},Err(error)=>{limitations.push(error.clone());json!({"error":error})}};
@@ -562,5 +675,63 @@ mod tests {
         };
         assert!(run(c).await.is_err());
         assert!(!d.path().join("missing").exists());
+    }
+
+    #[test]
+    fn prefetched_storage_matches_only_the_same_typed_request() {
+        let today = ai::action(
+            "storage",
+            json!({"current_range":"today","comparison_range":"previous-day"}),
+        )
+        .unwrap();
+        let same = ai::action(
+            "storage",
+            json!({"comparison_range":"previous-day","current_range":"today"}),
+        )
+        .unwrap();
+        let different = ai::action(
+            "storage",
+            json!({"current_range":"24h","comparison_range":"previous-day"}),
+        )
+        .unwrap();
+        let memory = ai::action(
+            "memory",
+            json!({"current_range":"today","comparison_range":"previous-day"}),
+        )
+        .unwrap();
+        let prefetched =
+            PrefetchedStorageEvidence::new(&today, "cached tool response".into(), None)
+                .expect("storage action can be prefetched");
+
+        assert!(prefetched.matches(&same));
+        assert!(!prefetched.matches(&different));
+        assert!(!prefetched.matches(&memory));
+    }
+
+    #[test]
+    fn deterministic_recovery_requires_root_storage_facts() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1100i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "path_attribution_status":"unavailable",
+                "limitations":[]
+            }
+        });
+        let facts = ai::root_storage_facts(&evidence).unwrap();
+
+        assert_eq!(
+            deterministic_recovery_answer(Some(&facts)),
+            Some(ai::deterministic_storage_summary(&facts))
+        );
+        assert_eq!(deterministic_recovery_answer(None), None);
     }
 }
