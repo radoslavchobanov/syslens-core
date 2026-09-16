@@ -399,6 +399,7 @@ pub(crate) struct RootStorageFacts {
     pub(crate) used_bytes_change: i64,
     pub(crate) path_attribution_status: String,
     pub(crate) directories: Vec<String>,
+    pub(crate) current_directory_snapshot: Vec<String>,
     pub(crate) limitations: Vec<String>,
 }
 
@@ -459,6 +460,30 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         })
         .take(12)
         .collect();
+    let current_directory_snapshot = data
+        .get("current_directory_snapshot")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|directory| {
+            directory.get("mount_id").and_then(Value::as_str) == Some(root_mount_id)
+                && directory.get("root").and_then(Value::as_str) == Some("/")
+        })
+        .filter_map(|directory| {
+            let path = directory.get("path")?.as_str()?;
+            let allocated = directory.get("allocated_bytes")?.as_i64()?;
+            let apparent = directory.get("apparent_bytes")?.as_i64()?;
+            let scan_started_at = directory.get("scan_started_at_utc")?.as_str()?;
+            Some(format!(
+                "{} allocated_bytes={} apparent_bytes={} scan_started_at_utc={}",
+                bounded_text(path, 512),
+                allocated,
+                apparent,
+                bounded_text(scan_started_at, 128)
+            ))
+        })
+        .take(12)
+        .collect();
     let limitations = data
         .get("limitations")
         .and_then(Value::as_array)
@@ -478,6 +503,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         used_bytes_change,
         path_attribution_status: bounded_text(path_attribution_status, 128),
         directories,
+        current_directory_snapshot,
         limitations,
     })
 }
@@ -491,6 +517,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
     // message, never into the system prompt, so paths and limitations remain
     // data even when they contain instruction-like text.
     let mut directories = facts.directories.clone();
+    let mut current_directory_snapshot = facts.current_directory_snapshot.clone();
     let mut limitations = facts.limitations.clone();
     loop {
         let value = json!({
@@ -511,6 +538,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             "root_used_gibibytes_change": gibibytes(facts.used_bytes_change),
             "path_attribution_status": facts.path_attribution_status,
             "directory_findings": directories,
+            "current_directory_snapshot": current_directory_snapshot,
             "limitations": limitations,
         });
         let text = serde_json::to_string(&value).expect("canonical storage facts are serializable");
@@ -521,6 +549,9 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             continue;
         }
         if directories.pop().is_some() {
+            continue;
+        }
+        if current_directory_snapshot.pop().is_some() {
             continue;
         }
 
@@ -536,6 +567,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             "root_used_gibibytes_change": gibibytes(facts.used_bytes_change),
             "path_attribution_status": facts.path_attribution_status,
             "directory_findings": [],
+            "current_directory_snapshot": [],
             "limitations": ["Canonical storage facts were bounded before delivery"],
         }))
         .expect("canonical storage facts are serializable");
@@ -1147,6 +1179,40 @@ mod tests {
         assert_eq!(facts.directories.len(), 1);
         assert!(facts.directories[0].contains("/valid-after-filter"));
         assert!(!facts.directories[0].contains("wrong-mount"));
+    }
+
+    #[test]
+    fn root_storage_facts_include_current_snapshot_without_directory_delta() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"2026-09-16T00:00:00Z","end_utc":"2026-09-16T12:00:00Z"},
+                "comparison": {"start_utc":"2026-09-15T00:00:00Z","end_utc":"2026-09-15T12:00:00Z"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":200i64,
+                    "comparison_used_bytes":100i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "current_directory_snapshot": [
+                    {"mount_id":"other-mount","root":"/","path":"/wrong","allocated_bytes":900i64,"apparent_bytes":900i64,"scan_started_at_utc":"2026-09-16T11:00:00Z"},
+                    {"mount_id":"root-mount","root":"/data","path":"/data/wrong-root","allocated_bytes":800i64,"apparent_bytes":800i64,"scan_started_at_utc":"2026-09-16T11:00:00Z"},
+                    {"mount_id":"root-mount","root":"/","path":"/home/acemagic/ollama","allocated_bytes":700i64,"apparent_bytes":700i64,"scan_started_at_utc":"2026-09-16T11:00:00Z"}
+                ],
+                "path_attribution_status":"unavailable",
+                "limitations":["No comparable historical directory scan"]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        assert_eq!(facts.directories.len(), 0);
+        assert_eq!(facts.current_directory_snapshot.len(), 1);
+        assert!(facts.current_directory_snapshot[0].contains("/home/acemagic/ollama"));
+        let canonical: Value = serde_json::from_str(&canonical_storage_facts(&facts)).unwrap();
+        assert_eq!(
+            canonical["current_directory_snapshot"][0],
+            "/home/acemagic/ollama allocated_bytes=700 apparent_bytes=700 scan_started_at_utc=2026-09-16T11:00:00Z"
+        );
     }
 
     #[test]

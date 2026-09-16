@@ -4421,6 +4421,7 @@ pub struct StorageDiagnosis {
     pub comparison: StorageInterval,
     pub mounts: Vec<MountFinding>,
     pub directories: Vec<DirectoryFinding>,
+    pub current_directory_snapshot: Vec<CurrentDirectorySnapshot>,
     pub path_attribution_status: String,
     pub limitations: Vec<String>,
 }
@@ -4447,6 +4448,15 @@ pub struct DirectoryFinding {
     pub path: String,
     pub allocated_bytes_change: i64,
     pub apparent_bytes_change: i64,
+}
+#[derive(Serialize)]
+pub struct CurrentDirectorySnapshot {
+    pub mount_id: String,
+    pub root: String,
+    pub path: String,
+    pub allocated_bytes: i64,
+    pub apparent_bytes: i64,
+    pub scan_started_at_utc: String,
 }
 pub fn diagnose_storage(
     path: &Path,
@@ -4502,6 +4512,72 @@ pub fn diagnose_storage_windows(
         "Directory evidence is local and path-based. It does not attribute storage use to a process."
             .into(),
     ];
+    // A current inventory is useful even when no comparable historical scan
+    // exists.  Choose one complete scan per stable root/mount identity,
+    // preferring a scan in the requested interval and otherwise using the
+    // latest complete scan available by the interval end.
+    let mut snapshot_stmt = conn
+        .prepare(
+            "WITH latest AS (
+                 SELECT id, root, mount_id, started_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY root, mount_id
+                            ORDER BY CASE WHEN started_at >= ?1 THEN 0 ELSE 1 END,
+                                     started_at DESC, id DESC
+                        ) AS rank
+                 FROM storage_scans
+                 WHERE status = 'complete' AND mount_id IS NOT NULL
+                   AND started_at <= ?2
+             )
+             SELECT latest.mount_id, latest.root, directory.path,
+                    directory.allocated_bytes, directory.apparent_bytes,
+                    latest.started_at
+             FROM latest
+             JOIN directory_samples AS directory ON directory.scan_id = latest.id
+             WHERE latest.rank = 1
+             ORDER BY directory.allocated_bytes DESC, directory.path ASC
+             LIMIT 100",
+        )
+        .map_err(|e| e.to_string())?;
+    let snapshot_rows = snapshot_stmt
+        .query_map(params![start.timestamp(), end.timestamp()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let current_directory_snapshot: Vec<_> = snapshot_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(
+            |(mount_id, root, path, allocated_bytes, apparent_bytes, started_at)| {
+                Ok(CurrentDirectorySnapshot {
+                    mount_id,
+                    root,
+                    path,
+                    allocated_bytes,
+                    apparent_bytes,
+                    scan_started_at_utc: Utc
+                        .timestamp_opt(started_at, 0)
+                        .single()
+                        .ok_or_else(|| format!("invalid storage scan timestamp {started_at}"))?
+                        .to_rfc3339(),
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    if current_directory_snapshot.is_empty() {
+        limits.push(
+            "No complete current directory snapshot exists by the end of the requested interval."
+                .into(),
+        );
+    }
     // Select one latest usable row per mount and interval before joining the
     // two intervals.  The old correlated-max query joined every pair of rows
     // for a mount and then evaluated two max subqueries for each pair.  That
@@ -4575,6 +4651,7 @@ pub fn diagnose_storage_windows(
             },
             mounts: vec![],
             directories: vec![],
+            current_directory_snapshot,
             path_attribution_status: "unavailable".into(),
             limitations: limits,
         });
@@ -4713,6 +4790,7 @@ pub fn diagnose_storage_windows(
         },
         mounts,
         directories,
+        current_directory_snapshot,
         path_attribution_status: path_attribution_status.into(),
         limitations: limits,
     })
@@ -4742,6 +4820,17 @@ pub fn render_storage_diagnosis(d: &StorageDiagnosis) -> String {
             "- Directory {}: {:+} MiB allocated\n",
             x.path,
             x.allocated_bytes_change / 1048576
+        ));
+    }
+    for x in &d.current_directory_snapshot {
+        s.push_str(&format!(
+            "- Current directory {} (mount {}, root {}): {} MiB allocated, {} MiB apparent; scan {}\n",
+            x.path,
+            x.mount_id,
+            x.root,
+            x.allocated_bytes / 1048576,
+            x.apparent_bytes / 1048576,
+            x.scan_started_at_utc,
         ));
     }
     for x in &d.limitations {
@@ -6250,6 +6339,156 @@ mod tests {
     }
 
     #[test]
+    fn storage_diagnosis_returns_current_snapshot_without_comparable_history() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        insert_mounts(
+            &mut c,
+            &[
+                MountSample {
+                    timestamp: now - 60,
+                    mount_id: "root-mount".into(),
+                    mount_point: "/".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100),
+                    free_bytes: Some(40),
+                    used_bytes: Some(60),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                },
+                MountSample {
+                    timestamp: now - 60,
+                    mount_id: "data-mount".into(),
+                    mount_point: "/var/lib/ollama".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100),
+                    free_bytes: Some(20),
+                    used_bytes: Some(80),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                },
+            ],
+        )
+        .unwrap();
+        for (mount_id, root, directories) in [
+            (
+                "root-mount",
+                "/",
+                vec![("/var/lib/ollama", 90_i64), ("/var/lib", 100_i64)],
+            ),
+            (
+                "data-mount",
+                "/var/lib/ollama",
+                vec![("/var/lib/ollama/models", 200_i64)],
+            ),
+        ] {
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: root.into(),
+                    mount_id: Some(mount_id.into()),
+                    started_at: now - 60,
+                    ended_at: now - 60,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 1,
+                    directories: directories
+                        .into_iter()
+                        .map(|(path, allocated)| DirectorySample {
+                            path: path.into(),
+                            allocated_bytes: allocated,
+                            apparent_bytes: allocated,
+                            entry_count: 1,
+                            file_count: 1,
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        }
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.status, "insufficient evidence");
+        assert_eq!(out.path_attribution_status, "unavailable");
+        assert_eq!(out.current_directory_snapshot.len(), 3);
+        assert_eq!(
+            out.current_directory_snapshot[0].path,
+            "/var/lib/ollama/models"
+        );
+        assert_eq!(out.current_directory_snapshot[0].mount_id, "data-mount");
+        assert_eq!(
+            out.current_directory_snapshot[0].scan_started_at_utc,
+            Utc.timestamp_opt(now - 60, 0)
+                .single()
+                .unwrap()
+                .to_rfc3339()
+        );
+        assert!(
+            out.limitations
+                .iter()
+                .all(|limitation| !limitation.contains("No complete current directory snapshot"))
+        );
+    }
+
+    #[test]
+    fn storage_diagnosis_limits_snapshot_to_latest_complete_scan_per_mount() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        insert_mounts(
+            &mut c,
+            &[MountSample {
+                timestamp: now - 60,
+                mount_id: "m".into(),
+                mount_point: "/".into(),
+                fs_type: "ext4".into(),
+                total_bytes: Some(100),
+                free_bytes: Some(40),
+                used_bytes: Some(60),
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            }],
+        )
+        .unwrap();
+        for (started_at, path, allocated) in [
+            (now - 120, "/old", 900_i64),
+            (now - 60, "/current", 100_i64),
+        ] {
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/".into(),
+                    mount_id: Some("m".into()),
+                    started_at,
+                    ended_at: started_at,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 1,
+                    directories: vec![DirectorySample {
+                        path: path.into(),
+                        allocated_bytes: allocated,
+                        apparent_bytes: allocated,
+                        entry_count: 1,
+                        file_count: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.current_directory_snapshot.len(), 1);
+        assert_eq!(out.current_directory_snapshot[0].path, "/current");
+    }
+
+    #[test]
     fn storage_remount_identity_cannot_attribute_paths() {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
@@ -6325,11 +6564,12 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(
-            diagnose_storage(&path, "1h", "previous-week")
-                .unwrap()
-                .status,
-            "insufficient evidence"
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.status, "insufficient evidence");
+        assert!(
+            out.limitations
+                .iter()
+                .any(|limitation| limitation.contains("No complete current directory snapshot"))
         );
     }
 
