@@ -35,6 +35,7 @@ trap 'rm -rf "${STAGING_DIRECTORY}"' EXIT
 mkdir -p \
   "${STAGING_DIRECTORY}/DEBIAN" \
   "${STAGING_DIRECTORY}/usr/bin" \
+  "${STAGING_DIRECTORY}/usr/lib/systemd/system" \
   "${STAGING_DIRECTORY}/usr/lib/systemd/user" \
   "${STAGING_DIRECTORY}/usr/share/doc/syslens-diagnosis"
 
@@ -43,6 +44,10 @@ install -m 0644 "${ROOT_DIRECTORY}/packaging/debian/syslens-diagnosis.service" \
   "${STAGING_DIRECTORY}/usr/lib/systemd/user/syslens-diagnosis.service"
 install -m 0644 "${ROOT_DIRECTORY}/packaging/debian/syslens-diagnosis-api.service" \
   "${STAGING_DIRECTORY}/usr/lib/systemd/user/syslens-diagnosis-api.service"
+install -m 0644 "${ROOT_DIRECTORY}/packaging/debian/syslens-diagnosis-system.service" \
+  "${STAGING_DIRECTORY}/usr/lib/systemd/system/syslens-diagnosis.service"
+install -m 0644 "${ROOT_DIRECTORY}/packaging/debian/syslens-diagnosis-api-system.service" \
+  "${STAGING_DIRECTORY}/usr/lib/systemd/system/syslens-diagnosis-api.service"
 install -m 0644 "${ROOT_DIRECTORY}/LICENSE" \
   "${STAGING_DIRECTORY}/usr/share/doc/syslens-diagnosis/copyright"
 install -m 0644 "${ROOT_DIRECTORY}/README.md" \
@@ -59,7 +64,8 @@ Depends: libc6 (>= 2.34)
 Homepage: https://github.com/radoslavchobanov/syslens-core
 Description: Optional local diagnosis companion for SysLens
  This optional package records local RAM and process evidence after explicit
- enablement. It has a disabled-by-default user service and no AI dependency.
+ enablement. It includes disabled-by-default user and privileged system units;
+ the privileged mode is diagnosis-only and has no AI dependency.
 EOF
 
 mkdir -p "${OUTPUT_DIRECTORY}"

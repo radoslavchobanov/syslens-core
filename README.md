@@ -368,6 +368,43 @@ the default eligible-mount selection.
 the collector will stop after logout; enable it explicitly with
 `loginctl enable-linger $USER` when continuous home-server recording is wanted.
 
+### Privileged system collector
+
+The optional root-owned system mode is a diagnosis-only recorder; it does not
+change or replace the normal `syslens` daemon or the existing diagnosis user
+service. It uses `/etc/syslens-diagnosis/config.toml` and
+`/var/lib/syslens-diagnosis/diagnosis.sqlite`, allowing read-only attribution
+of protected paths such as `/root` while preserving the same bounded scan and
+retention limits. Configure the file first, then use direct terminal commands:
+
+```bash
+sudo syslens-diagnosis migrate-system \
+  --from-config /home/$USER/.config/syslens-diagnosis/config.toml \
+  --from-database /home/$USER/.local/state/syslens-diagnosis/diagnosis.sqlite
+sudo syslens-diagnosis enable-system
+sudo syslens-diagnosis status --config /etc/syslens-diagnosis/config.toml
+sudo syslens-diagnosis disable-system
+```
+
+The optional mTLS API is a separate root unit and remains disabled until its
+`[api]` section has `enabled = true` and absolute certificate, key, and trusted
+gateway CA paths:
+
+```bash
+sudo syslens-diagnosis enable-system-api
+sudo syslens-diagnosis disable-system-api
+```
+
+System commands require root and call the system `systemctl`; they never
+silently alter user services. `migrate-system` refuses destructive overwrite,
+refuses to run while a live user recorder holds its lock, preserves SQLite
+`-wal`/`-shm` files
+and `0600` permissions, and leaves the original user data in place. The
+systemd units use read-only host protection with only the diagnosis state
+directory writable. An inaccessible directory is retained as a partial scan
+gap while sibling directories continue, so storage attribution remains
+explicitly limited rather than guessed.
+
 Core forwards `syslens diagnose ...` and `syslens incidents ...` to the local
 diagnosis companion when installed, and `syslens chat` to the optional gateway
 client. Core-only installations create no diagnosis/gateway state or background

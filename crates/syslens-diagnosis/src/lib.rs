@@ -486,8 +486,37 @@ fn is_trusted_lan_address(address: IpAddr) -> bool {
     }
 }
 
+/// The system-service paths are deliberately separate from the per-user XDG
+/// paths.  Environment overrides keep system-path behavior testable without
+/// writing to `/etc` or `/var` (and are not used by the normal user mode).
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/syslens-diagnosis/config.toml";
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/syslens-diagnosis";
+pub const SYSTEM_DATABASE_PATH: &str = "/var/lib/syslens-diagnosis/diagnosis.sqlite";
+
 pub fn config_path() -> PathBuf {
     xdg_path("XDG_CONFIG_HOME", ".config").join("syslens-diagnosis/config.toml")
+}
+pub fn system_config_path() -> PathBuf {
+    env_path("SYSLENS_DIAGNOSIS_SYSTEM_CONFIG", SYSTEM_CONFIG_PATH)
+}
+pub fn system_state_dir() -> PathBuf {
+    env_path("SYSLENS_DIAGNOSIS_SYSTEM_STATE", SYSTEM_STATE_DIR)
+}
+pub fn system_database_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("SYSLENS_DIAGNOSIS_SYSTEM_DATABASE") {
+        PathBuf::from(path)
+    } else {
+        system_state_dir().join("diagnosis.sqlite")
+    }
+}
+pub fn system_unit_dir() -> PathBuf {
+    env_path("SYSLENS_DIAGNOSIS_SYSTEM_UNIT_DIR", "/etc/systemd/system")
+}
+pub fn system_service_path() -> PathBuf {
+    system_unit_dir().join("syslens-diagnosis.service")
+}
+pub fn system_api_service_path() -> PathBuf {
+    system_unit_dir().join("syslens-diagnosis-api.service")
 }
 pub fn user_service_path() -> PathBuf {
     xdg_path("XDG_CONFIG_HOME", ".config").join("systemd/user/syslens-diagnosis.service")
@@ -535,6 +564,59 @@ pub fn install_user_service(
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
 }
+pub fn system_service_unit(binary: &Path, config: &Path, database: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=SysLens privileged local diagnosis recorder\nAfter=local-fs.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} daemon --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The collector is intentionally root-owned so it can inspect protected host paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\n# Keep the service's normal root DAC capabilities for protected read-only paths.\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
+        config.display(),
+        binary.display(),
+        config.display(),
+        database.display(),
+        database
+            .parent()
+            .unwrap_or_else(|| Path::new(SYSTEM_STATE_DIR))
+            .display()
+    )
+}
+pub fn system_api_service_unit(binary: &Path, config: &Path, database: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=SysLens privileged diagnosis evidence API\nAfter=network-online.target\nWants=network-online.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} serve --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The API remains mTLS-protected by the configured certificate and CA paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
+        config.display(),
+        binary.display(),
+        config.display(),
+        database.display(),
+        database
+            .parent()
+            .unwrap_or_else(|| Path::new(SYSTEM_STATE_DIR))
+            .display()
+    )
+}
+fn install_system_unit(path: &Path, content: String) -> Result<PathBuf, String> {
+    let parent = path.parent().ok_or("system service path has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    fs::write(path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    secure_file(path, 0o644, "system service unit")?;
+    Ok(path.to_path_buf())
+}
+pub fn install_system_service(
+    binary: &Path,
+    config: &Path,
+    database: &Path,
+) -> Result<PathBuf, String> {
+    install_system_unit(
+        &system_service_path(),
+        system_service_unit(binary, config, database),
+    )
+}
+pub fn install_system_api_service(
+    binary: &Path,
+    config: &Path,
+    database: &Path,
+) -> Result<PathBuf, String> {
+    install_system_unit(
+        &system_api_service_path(),
+        system_api_service_unit(binary, config, database),
+    )
+}
 pub fn linger_warning_message(user: &str, linger_enabled: bool) -> Option<String> {
     (!linger_enabled).then(|| format!("Warning: systemd user services may stop after logout because lingering is not enabled. To keep diagnosis recording, run: loginctl enable-linger {user}"))
 }
@@ -547,8 +629,36 @@ pub fn database_path() -> PathBuf {
 pub fn database_path_for_config(config: &Path) -> PathBuf {
     if config == config_path() {
         database_path()
+    } else if config == system_config_path() {
+        system_database_path()
     } else {
         config.with_extension("sqlite")
+    }
+}
+pub fn state_dir_for_config(config: &Path) -> PathBuf {
+    if config == system_config_path() {
+        system_state_dir()
+    } else if config == config_path() {
+        state_dir()
+    } else {
+        // Preserve the historical user-state lock for explicitly supplied
+        // custom config paths; only the fixed system config switches state.
+        state_dir()
+    }
+}
+/// Select the writer-lock directory for the exact database used by a daemon.
+/// A custom database must lock beside that database so system units and their
+/// `ReadWritePaths` remain consistent; the default user path is unchanged.
+pub fn state_dir_for_database(_config: &Path, database: &Path) -> PathBuf {
+    if database == system_database_path() {
+        system_state_dir()
+    } else if database == database_path() {
+        state_dir()
+    } else {
+        database
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(state_dir)
     }
 }
 fn xdg_path(var: &str, fallback: &str) -> PathBuf {
@@ -557,6 +667,11 @@ fn xdg_path(var: &str, fallback: &str) -> PathBuf {
             .map(|h| PathBuf::from(h).join(fallback))
             .unwrap_or_else(|| PathBuf::from(fallback))
     })
+}
+fn env_path(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(fallback))
 }
 pub fn load_config(path: &Path) -> Result<Config, String> {
     let text =
@@ -595,10 +710,213 @@ pub fn ensure_config(path: &Path) -> Result<Config, String> {
     Ok(Config::default())
 }
 
+/// Copy an existing user installation into the privileged system paths.
+///
+/// Migration is intentionally no-overwrite: the destination must not contain
+/// a config, database, or SQLite sidecar.  The source remains untouched, so a
+/// user service can be stopped or rolled back independently after migration.
+pub fn migrate_to_system(
+    source_config: &Path,
+    source_database: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    migrate_to_system_at(
+        source_config,
+        source_database,
+        &system_config_path(),
+        &system_database_path(),
+    )
+}
+
+/// Testable form of [`migrate_to_system`] with explicit destinations.
+pub fn migrate_to_system_at(
+    source_config: &Path,
+    source_database: &Path,
+    destination_config: &Path,
+    destination_database: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    if path_exists(destination_config) {
+        return Err(format!(
+            "system configuration already exists at {}; refusing to overwrite",
+            destination_config.display()
+        ));
+    }
+    if path_exists(destination_database)
+        || database_sidecar_paths(destination_database)
+            .iter()
+            .any(|path| path_exists(path))
+    {
+        return Err(format!(
+            "system evidence database already exists at {}; refusing to overwrite",
+            destination_database.display()
+        ));
+    }
+    // Hold the same directory lock as the writer before copying SQLite's
+    // main file and any WAL/SHM sidecars. This refuses a live user daemon and
+    // gives the migration a quiescent, internally consistent source.
+    let source_state = source_database
+        .parent()
+        .ok_or("source database has no parent")?;
+    let _source_lock = acquire_writer_lock(source_state)
+        .map_err(|e| format!("cannot migrate while the source recorder is active: {e}"))?;
+    let config = load_config(source_config)?;
+    let source_config_mode = private_mode(source_config, "source configuration")?;
+    let source_database_mode = private_mode(source_database, "source evidence database")?;
+    let source_sidecars: Vec<_> = database_sidecar_paths(source_database)
+        .into_iter()
+        .filter(|path| path_exists(path))
+        .map(|path| {
+            private_mode(&path, "source evidence database sidecar").map(|mode| (path, mode))
+        })
+        .collect::<Result<_, _>>()?;
+
+    if let Some(parent) = destination_config.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        secure_directory(parent)?;
+    }
+    if let Some(parent) = destination_database.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        secure_directory(parent)?;
+    }
+    let mut created = Vec::new();
+    let copy = (|| -> Result<(), String> {
+        copy_new_file(source_config, destination_config, source_config_mode)?;
+        created.push(destination_config.to_path_buf());
+        copy_new_file(source_database, destination_database, source_database_mode)?;
+        created.push(destination_database.to_path_buf());
+        for (source, mode) in source_sidecars {
+            let name = source
+                .file_name()
+                .ok_or("source database sidecar has no filename")?;
+            let destination = destination_database
+                .parent()
+                .ok_or("system database has no parent")?
+                .join(name);
+            copy_new_file(&source, &destination, mode)?;
+            created.push(destination);
+        }
+        // Re-parse the copied config and check all copied database files
+        // without opening SQLite (opening can alter a live WAL/SHM source).
+        config.validate()?;
+        validate_config_permissions(destination_config)?;
+        secure_database_files(destination_database)?;
+        Ok(())
+    })();
+    if let Err(error) = copy {
+        for path in created {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    Ok((
+        destination_config.to_path_buf(),
+        destination_database.to_path_buf(),
+    ))
+}
+
+fn private_mode(path: &Path, kind: &str) -> Result<u32, String> {
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("cannot inspect {kind} {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        return Err(format!(
+            "{kind} {} has mode {:o}, expected 600; refusing unsafe migration",
+            path.display(),
+            mode
+        ));
+    }
+    Ok(mode)
+}
+
+fn copy_new_file(source: &Path, destination: &Path, mode: u32) -> Result<(), String> {
+    if path_exists(destination) {
+        return Err(format!(
+            "destination {} already exists; refusing to overwrite",
+            destination.display()
+        ));
+    }
+    let mut input = File::open(source)
+        .map_err(|e| format!("cannot open {} for migration: {e}", source.display()))?;
+    // `create_new(true)` maps to O_CREAT|O_EXCL, so a destination appearing
+    // after the preflight can never be silently overwritten.
+    let mut output = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(destination)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(format!(
+                "cannot create migration destination {} without overwrite: {error}",
+                destination.display()
+            ));
+        }
+    };
+    let result = io::copy(&mut input, &mut output)
+        .and_then(|_| output.sync_all())
+        .and_then(|_| fs::set_permissions(destination, fs::Permissions::from_mode(mode)));
+    if let Err(error) = result {
+        drop(output);
+        let _ = fs::remove_file(destination);
+        return Err(format!(
+            "cannot copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 pub fn secure_config(path: &Path) -> Result<(), String> {
     let parent = path.parent().ok_or("config path has no parent")?;
     secure_directory(parent)?;
     secure_file(path, 0o600, "configuration")
+}
+
+/// Validate config permissions without mutating them.  Systemd's
+/// `ProtectSystem=strict` intentionally makes the system config filesystem
+/// read-only while the privileged service is running, so service startup must
+/// not call `chmod` on an already-validated config.
+pub fn validate_config_permissions(path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("config path has no parent")?;
+    let parent_mode = fs::metadata(parent)
+        .map_err(|e| {
+            format!(
+                "cannot inspect configuration directory {}: {e}",
+                parent.display()
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    if parent_mode != 0o700 {
+        return Err(format!(
+            "configuration directory {} has mode {:o}, expected 700",
+            parent.display(),
+            parent_mode
+        ));
+    }
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("cannot inspect configuration {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        return Err(format!(
+            "configuration {} has mode {:o}, expected 600",
+            path.display(),
+            mode
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -971,7 +1289,11 @@ fn response_envelope<T: Serialize>(
 /// Serve the narrow, deterministic evidence interface. It is deliberately a
 /// separate process from the recorder: if it is stopped, collection continues.
 pub fn serve_api(config_path: &Path, database: &Path) -> Result<(), String> {
-    secure_config(config_path)?;
+    if config_path == system_config_path() || database == system_database_path() {
+        validate_config_permissions(config_path)?;
+    } else {
+        secure_config(config_path)?;
+    }
     let config = load_config(config_path)?;
     if !config.api.enabled {
         return Err("API is disabled; set [api].enabled = true and configure mTLS paths".into());
@@ -3196,6 +3518,18 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
     let mut seen = HashSet::from([root_key]);
     let mut entries = 0u64;
     let mut reason = None;
+    let mut stop = false;
+    fn add_reason(reason: &mut Option<String>, value: String) {
+        match reason {
+            Some(existing) => {
+                if !existing.contains(&value) {
+                    existing.push_str("; ");
+                    existing.push_str(&value);
+                }
+            }
+            None => *reason = Some(value),
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     fn walk(
         dir: &Path,
@@ -3208,38 +3542,47 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         entries: &mut u64,
         dirs: &mut BTreeMap<PathBuf, DirectorySample>,
         reason: &mut Option<String>,
+        stop: &mut bool,
     ) {
-        if reason.is_some() {
+        if *stop {
             return;
         }
         if elapsed().as_secs() >= cfg.max_duration_seconds {
-            *reason = Some("scan duration limit reached".into());
+            add_reason(reason, "scan duration limit reached".into());
+            *stop = true;
             return;
         }
         let rd = match fs::read_dir(dir) {
             Ok(x) => x,
             Err(e) => {
-                *reason = Some(format!("cannot read {}: {e}", dir.display()));
+                // An unreadable child is a truthful partial-data gap, not a
+                // reason to discard all of its siblings.  The caller stores
+                // the reason in collection_gaps and keeps the scan partial.
+                add_reason(reason, format!("cannot read {}: {e}", dir.display()));
                 return;
             }
         };
         for ent in rd {
-            if reason.is_some() {
+            if *stop {
                 break;
             }
             if *entries >= cfg.max_entries {
-                *reason = Some("scan entry limit reached".into());
+                add_reason(reason, "scan entry limit reached".into());
+                *stop = true;
                 break;
             }
             if elapsed().as_secs() >= cfg.max_duration_seconds {
-                *reason = Some("scan duration limit reached".into());
+                add_reason(reason, "scan duration limit reached".into());
+                *stop = true;
                 break;
             };
             let ent = match ent {
                 Ok(x) => x,
                 Err(e) => {
-                    *reason = Some(format!("directory entry unavailable: {e}"));
-                    break;
+                    add_reason(reason, format!("directory entry unavailable: {e}"));
+                    // `ReadDir` can continue after an individual entry error;
+                    // retain all siblings that remain accessible.
+                    continue;
                 }
             };
             *entries += 1;
@@ -3247,8 +3590,8 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
             let m = match fs::symlink_metadata(&path) {
                 Ok(x) => x,
                 Err(e) => {
-                    *reason = Some(format!("cannot stat {}: {e}", path.display()));
-                    break;
+                    add_reason(reason, format!("cannot stat {}: {e}", path.display()));
+                    continue;
                 }
             };
             if m.file_type().is_symlink() {
@@ -3304,6 +3647,7 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
                     entries,
                     dirs,
                     reason,
+                    stop,
                 )
             }
         }
@@ -3319,6 +3663,7 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         &mut entries,
         &mut directories,
         &mut reason,
+        &mut stop,
     );
     let ended = now + elapsed().as_secs() as i64;
     ScanResult {
@@ -4915,6 +5260,132 @@ mod tests {
         assert!(unit.contains("--config /tmp/custom.toml --database /tmp/custom.sqlite"));
     }
     #[test]
+    fn system_units_keep_state_writable_and_protected_paths_readable() {
+        let unit = system_service_unit(
+            Path::new("/usr/bin/syslens-diagnosis"),
+            Path::new("/etc/syslens-diagnosis/config.toml"),
+            Path::new("/var/lib/syslens-diagnosis/diagnosis.sqlite"),
+        );
+        assert!(unit.contains("ProtectSystem=strict"));
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("ReadWritePaths=/var/lib/syslens-diagnosis"));
+        assert!(unit.contains("NoNewPrivileges=yes"));
+        assert!(unit.contains("User=root"));
+        assert!(!unit.contains("CapabilityBoundingSet="));
+        assert!(unit.contains("daemon --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite"));
+        let api = system_api_service_unit(
+            Path::new("/usr/bin/syslens-diagnosis"),
+            Path::new("/etc/syslens-diagnosis/config.toml"),
+            Path::new("/var/lib/syslens-diagnosis/diagnosis.sqlite"),
+        );
+        assert!(api.contains("serve --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite"));
+        assert!(api.contains("ProtectHome=read-only"));
+    }
+    #[test]
+    fn database_lock_paths_follow_selected_database() {
+        let d = tempdir().unwrap();
+        let custom_database = d.path().join("custom/diagnosis.sqlite");
+        let custom_state = custom_database.parent().unwrap().to_path_buf();
+        assert_eq!(
+            state_dir_for_database(&config_path(), &custom_database),
+            custom_state
+        );
+        assert_eq!(
+            state_dir_for_database(&config_path(), &database_path()),
+            state_dir()
+        );
+        assert_eq!(
+            state_dir_for_database(&system_config_path(), &custom_database),
+            custom_database.parent().unwrap()
+        );
+        let unit = system_service_unit(
+            Path::new("/usr/bin/syslens-diagnosis"),
+            Path::new("/etc/syslens-diagnosis/config.toml"),
+            &custom_database,
+        );
+        assert!(unit.contains(&format!("ReadWritePaths={}", custom_state.display())));
+    }
+    #[test]
+    fn system_config_permission_validation_is_read_only() {
+        let d = tempdir().unwrap();
+        let parent = d.path().join("syslens-diagnosis");
+        let config = parent.join("config.toml");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&config, "version = 1\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        validate_config_permissions(&config).unwrap();
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_config_permissions(&config).is_err());
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+    #[test]
+    fn system_migration_preserves_sidecars_and_refuses_overwrite() {
+        let d = tempdir().unwrap();
+        let source_config = d.path().join("user/config.toml");
+        let source_database = d.path().join("user/diagnosis.sqlite");
+        fs::create_dir_all(source_config.parent().unwrap()).unwrap();
+        fs::write(
+            &source_config,
+            toml::to_string_pretty(&Config::default()).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&source_config, fs::Permissions::from_mode(0o600)).unwrap();
+        let _conn = open_db(&source_database).unwrap();
+        drop(_conn);
+        for sidecar in database_sidecar_paths(&source_database) {
+            fs::write(&sidecar, b"sidecar").unwrap();
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let destination_config = d.path().join("system/config.toml");
+        let destination_database = d.path().join("system/diagnosis.sqlite");
+        let (config, database) = migrate_to_system_at(
+            &source_config,
+            &source_database,
+            &destination_config,
+            &destination_database,
+        )
+        .unwrap();
+        assert_eq!(config, destination_config);
+        assert_eq!(database, destination_database);
+        assert_eq!(
+            fs::read(&destination_config).unwrap(),
+            fs::read(&source_config).unwrap()
+        );
+        for (source, destination) in database_sidecar_paths(&source_database)
+            .into_iter()
+            .zip(database_sidecar_paths(&destination_database))
+        {
+            assert_eq!(fs::read(&destination).unwrap(), fs::read(&source).unwrap());
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            migrate_to_system_at(
+                &source_config,
+                &source_database,
+                &destination_config,
+                &destination_database,
+            )
+            .is_err()
+        );
+        assert!(source_config.exists());
+        assert!(source_database.exists());
+    }
+    #[test]
     fn package_service_and_linger_warning_are_truthful() {
         let asset = include_str!("../../../packaging/debian/syslens-diagnosis.service");
         assert!(asset.contains("daemon --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
@@ -4926,6 +5397,18 @@ mod tests {
         assert!(api_asset.contains("ExecStart=/usr/bin/syslens-diagnosis serve --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
         let repo_api_asset = include_str!("../../../systemd/syslens-diagnosis-api.service");
         assert!(repo_api_asset.contains("ExecStart=%h/.local/bin/syslens-diagnosis serve --config %h/.config/syslens-diagnosis/config.toml --database %h/.local/state/syslens-diagnosis/diagnosis.sqlite"));
+        for asset in [
+            include_str!("../../../systemd/syslens-diagnosis-system.service"),
+            include_str!("../../../packaging/debian/syslens-diagnosis-system.service"),
+            include_str!("../../../systemd/syslens-diagnosis-api-system.service"),
+            include_str!("../../../packaging/debian/syslens-diagnosis-api-system.service"),
+        ] {
+            assert!(asset.contains("ProtectSystem=strict"));
+            assert!(asset.contains("ProtectHome=read-only"));
+            assert!(asset.contains("User=root"));
+            assert!(asset.contains("ReadWritePaths=/var/lib/syslens-diagnosis"));
+            assert!(!asset.contains("CapabilityBoundingSet="));
+        }
         assert!(
             service_unit(Path::new("/bin/d"), Path::new("/c"), Path::new("/d"))
                 .contains("Type=simple")
@@ -5261,6 +5744,34 @@ mod tests {
             )
             .unwrap(),
             2
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inaccessible_proc_child_keeps_sibling_scan_evidence() {
+        // Linux procfs deliberately denies map_files even to many root-like
+        // callers. The scanner must retain the partial gap and continue with
+        // ordinary siblings such as status rather than aborting the tree.
+        let cfg = StorageConfig {
+            max_depth: 1,
+            max_entries: 10_000,
+            max_duration_seconds: 30,
+            ..StorageConfig::default()
+        };
+        let scan = scan_directory(Path::new("/proc/1"), None, &cfg, 1);
+        assert!(scan.entries_seen > 0);
+        assert!(scan.reason.is_some(), "procfs gap should remain visible");
+        assert!(
+            scan.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot read")
+        );
+        assert!(
+            scan.directories
+                .iter()
+                .any(|directory| directory.path == "/proc/1")
         );
     }
 

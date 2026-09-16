@@ -44,8 +44,26 @@ packaging/debian/build-diagnosis-deb.sh \
   dist
 ```
 
-The package installs a disabled systemd user-service template. Package
-installation never starts it. Enable it explicitly after installation.
+The package installs disabled systemd user and system-service templates.
+Package installation never starts either service. The default `enable` command
+keeps the existing unprivileged user service. For valid attribution of
+protected host paths, explicitly use the root-owned system collector:
+
+```bash
+sudo syslens-diagnosis migrate-system \
+  --from-config /home/$USER/.config/syslens-diagnosis/config.toml \
+  --from-database /home/$USER/.local/state/syslens-diagnosis/diagnosis.sqlite
+sudo syslens-diagnosis enable-system
+# Only after configuring [api] mTLS paths:
+sudo syslens-diagnosis enable-system-api
+```
+
+`migrate-system` refuses to overwrite existing system files and refuses to run
+while the source writer lock is held. It copies SQLite WAL/SHM sidecars with mode `0600`, and never
+deletes the old user config or database. Disable only the system units with
+`sudo syslens-diagnosis disable-system` and
+`sudo syslens-diagnosis disable-system-api`; ordinary `enable`/`disable`
+commands continue to manage only user services.
 
 ## Optional gateway
 

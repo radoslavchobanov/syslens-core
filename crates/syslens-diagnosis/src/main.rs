@@ -21,11 +21,36 @@ enum CommandLine {
         config: Option<PathBuf>,
     },
     Disable,
+    /// Install and enable the privileged system collector (requires root).
+    EnableSystem {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Disable only the privileged system collector (requires root).
+    DisableSystem,
     EnableApi {
         #[arg(long)]
         config: Option<PathBuf>,
     },
     DisableApi,
+    /// Install and enable the privileged system mTLS API (requires root).
+    EnableSystemApi {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Disable only the privileged system mTLS API (requires root).
+    DisableSystemApi,
+    /// Copy user diagnosis evidence into system paths without overwriting.
+    MigrateSystem {
+        #[arg(long)]
+        from_config: Option<PathBuf>,
+        #[arg(long)]
+        from_database: Option<PathBuf>,
+    },
     Status {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -156,6 +181,31 @@ fn service(args: &[&str]) -> Result<(), String> {
         ))
     }
 }
+fn require_root(operation: &str) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(format!(
+            "{operation} requires root; run `sudo syslens-diagnosis {}` (user services are unchanged)",
+            operation.replace('_', "-")
+        ));
+    }
+    Ok(())
+}
+fn system_service(args: &[&str]) -> Result<(), String> {
+    let status = Command::new("systemctl")
+        .args(args)
+        .status()
+        .map_err(|e| format!("systemctl unavailable: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl {} failed ({status})", args.join(" ")))
+    }
+}
+fn system_paths(config: Option<PathBuf>, database: Option<PathBuf>) -> (PathBuf, PathBuf) {
+    let config = config.unwrap_or_else(diagnosis::system_config_path);
+    let database = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
+    (config, database)
+}
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let r = match cli.command {
@@ -180,6 +230,22 @@ fn main() -> ExitCode {
             }
         }
         CommandLine::Disable => service(&["disable", "--now", "syslens-diagnosis.service"]),
+        CommandLine::EnableSystem { config, database } => {
+            require_root("enable-system").and_then(|_| {
+                let (p, db) = system_paths(config, database);
+                diagnosis::ensure_config(&p)
+                    .and_then(|cfg| diagnosis::initialize_db(&db, &cfg).map(|_| ()))
+                    .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
+                    .and_then(|binary| diagnosis::install_system_service(&binary, &p, &db))
+                    .and_then(|_| system_service(&["daemon-reload"]))
+                    .and_then(|_| system_service(&["enable", "--now", "syslens-diagnosis.service"]))
+                    .map(|_| println!("system diagnosis collector enabled; recording uses {}", db.display()))
+            })
+        }
+        CommandLine::DisableSystem => {
+            require_root("disable-system")
+                .and_then(|_| system_service(&["disable", "--now", "syslens-diagnosis.service"]))
+        }
         CommandLine::EnableApi { config } => {
             let p = config.unwrap_or_else(diagnosis::config_path);
             let db = diagnosis::database_path_for_config(&p);
@@ -200,6 +266,45 @@ fn main() -> ExitCode {
                 .and_then(|_| service(&["enable", "--now", "syslens-diagnosis-api.service"]))
         }
         CommandLine::DisableApi => service(&["disable", "--now", "syslens-diagnosis-api.service"]),
+        CommandLine::EnableSystemApi { config, database } => {
+            require_root("enable-system-api").and_then(|_| {
+                let (p, db) = system_paths(config, database);
+                diagnosis::ensure_config(&p)
+                    .and_then(|cfg| {
+                        if !cfg.api.enabled {
+                            return Err(
+                                "API is disabled; configure [api] with mTLS paths before enabling"
+                                    .into(),
+                            );
+                        }
+                        diagnosis::initialize_db(&db, &cfg).map(|_| ())
+                    })
+                    .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
+                    .and_then(|binary| diagnosis::install_system_api_service(&binary, &p, &db))
+                    .and_then(|_| system_service(&["daemon-reload"]))
+                    .and_then(|_| {
+                        system_service(&["enable", "--now", "syslens-diagnosis-api.service"])
+                    })
+                    .map(|_| println!("system diagnosis API enabled; bind and mTLS remain configured in {}", p.display()))
+            })
+        }
+        CommandLine::DisableSystemApi => require_root("disable-system-api")
+            .and_then(|_| system_service(&["disable", "--now", "syslens-diagnosis-api.service"])),
+        CommandLine::MigrateSystem {
+            from_config,
+            from_database,
+        } => require_root("migrate-system").and_then(|_| {
+            let source_config = from_config.unwrap_or_else(diagnosis::config_path);
+            let source_database = from_database
+                .unwrap_or_else(|| diagnosis::database_path_for_config(&source_config));
+            diagnosis::migrate_to_system(&source_config, &source_database).map(|(config, db)| {
+                println!(
+                    "migrated diagnosis config and evidence to system paths without deleting user data:\nconfig={}\ndatabase={}",
+                    config.display(),
+                    db.display()
+                )
+            })
+        }),
         CommandLine::Status { config } => status(config.unwrap_or_else(diagnosis::config_path)),
         CommandLine::Daemon { config, database } => daemon(config, database),
         CommandLine::Serve { config, database } => {
@@ -465,12 +570,19 @@ fn status(config: PathBuf) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let (mount_count, scan_count, last_scan, partial_scans, unavailable_mounts): (i64, i64, Option<i64>, i64, i64) = conn.query_row("SELECT (SELECT count(DISTINCT mount_id) FROM mount_samples), (SELECT count(*) FROM storage_scans), (SELECT max(ended_at) FROM storage_scans), (SELECT count(*) FROM storage_scans WHERE status!='complete'), (SELECT count(*) FROM mount_samples WHERE timestamp=(SELECT max(timestamp) FROM mount_samples) AND capability='unavailable')", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e| e.to_string())?;
     let (open_incidents, event_count, last_detection): (i64, i64, Option<String>) = conn.query_row("SELECT (SELECT count(*) FROM incidents WHERE status='open'), (SELECT count(*) FROM notification_events), (SELECT value FROM metadata WHERE key='last_detection_run')", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| e.to_string())?;
-    let active = Command::new("systemctl")
-        .args(["--user", "is-active", "syslens-diagnosis.service"])
-        .output()
-        .ok()
-        .map(|x| String::from_utf8_lossy(&x.stdout).trim() == "active")
-        .unwrap_or(false);
+    let system_mode = config == diagnosis::system_config_path();
+    let active = if system_mode {
+        Command::new("systemctl")
+            .args(["is-active", "syslens-diagnosis.service"])
+            .output()
+    } else {
+        Command::new("systemctl")
+            .args(["--user", "is-active", "syslens-diagnosis.service"])
+            .output()
+    }
+    .ok()
+    .map(|x| String::from_utf8_lossy(&x.stdout).trim() == "active")
+    .unwrap_or(false);
     let paused = !diagnosis::budget_allows(&db, cfg.database_budget_bytes)
         || !diagnosis::filesystem_has_reserve(&db);
     println!(
@@ -506,10 +618,14 @@ fn status(config: PathBuf) -> Result<(), String> {
     Ok(())
 }
 fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
-    diagnosis::secure_config(&config)?;
-    let cfg = diagnosis::load_config(&config)?;
     let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
-    let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir())?;
+    if config == diagnosis::system_config_path() || db == diagnosis::system_database_path() {
+        diagnosis::validate_config_permissions(&config)?;
+    } else {
+        diagnosis::secure_config(&config)?;
+    }
+    let cfg = diagnosis::load_config(&config)?;
+    let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir_for_database(&config, &db))?;
     let mut conn = diagnosis::initialize_db(&db, &cfg)?;
     let collector = diagnosis::Collector::new(PathBuf::from("/proc"));
     let mut scan_worker: Option<thread::JoinHandle<()>> = None;

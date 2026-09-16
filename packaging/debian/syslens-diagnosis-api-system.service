@@ -1,0 +1,25 @@
+[Unit]
+Description=SysLens privileged diagnosis evidence API
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/syslens-diagnosis/config.toml
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/syslens-diagnosis serve --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/syslens-diagnosis
+
+[Install]
+WantedBy=multi-user.target

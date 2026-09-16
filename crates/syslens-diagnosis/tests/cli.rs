@@ -63,6 +63,27 @@ fn help_lists_local_storage_diagnosis() {
 }
 
 #[test]
+fn help_lists_explicit_system_mode_without_replacing_user_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "enable-system",
+        "disable-system",
+        "enable-system-api",
+        "disable-system-api",
+        "migrate-system",
+    ] {
+        assert!(help.contains(command), "missing {command} in {help}");
+    }
+    assert!(help.contains("enable"));
+    assert!(help.contains("disable"));
+}
+
+#[test]
 fn chat_requires_a_question_and_reports_disabled_configuration() {
     let binary = env!("CARGO_BIN_EXE_syslens-diagnosis");
     let missing_question = Command::new(binary).args(["chat"]).output().unwrap();
