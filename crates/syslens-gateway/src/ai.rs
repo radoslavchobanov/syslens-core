@@ -38,32 +38,22 @@ fn evidence_request(args: Value) -> Result<EvidenceRequest> {
     // EvidenceRequest. Keep accepting the canonical nested form for the
     // deterministic CLI path and previously recorded sessions.
     let has_legacy = args.get("since").is_some() || args.get("compare").is_some();
-    let has_explicit = [
+    let explicit_count = [
         "current_start",
         "current_end",
         "comparison_start",
         "comparison_end",
     ]
     .iter()
-    .any(|key| args.get(*key).is_some());
-    if has_legacy && has_explicit {
-        return Err("choose relative arguments or explicit interval bounds, not both".into());
-    }
-    if has_legacy {
-        let flat: FlatEvidenceArguments =
-            serde_json::from_value(args).map_err(|_| "invalid evidence arguments")?;
-        return window(
-            flat.since.as_deref().ok_or("invalid evidence arguments")?,
-            flat.compare
-                .as_deref()
-                .ok_or("invalid evidence arguments")?,
-        );
-    }
-    if args.get("current_start").is_some()
-        || args.get("current_end").is_some()
-        || args.get("comparison_start").is_some()
-        || args.get("comparison_end").is_some()
-    {
+    .filter(|key| args.get(*key).is_some())
+    .count();
+    // Local models sometimes repeat their relative choice as metadata while
+    // also emitting the exact four bounds. The complete explicit interval is
+    // authoritative; partial explicit bounds are never silently ignored.
+    if explicit_count > 0 {
+        if explicit_count != 4 {
+            return Err("all four explicit interval bounds are required".into());
+        }
         let flat: FlatEvidenceArguments =
             serde_json::from_value(args).map_err(|_| "invalid evidence arguments")?;
         let current = absolute_range(
@@ -84,10 +74,19 @@ fn evidence_request(args: Value) -> Result<EvidenceRequest> {
         )?;
         return request(current, Some(comparison), ComparisonMode::PreviousWeek);
     }
+    if has_legacy {
+        let flat: FlatEvidenceArguments =
+            serde_json::from_value(args).map_err(|_| "invalid evidence arguments")?;
+        return window(
+            flat.since.as_deref().ok_or("invalid evidence arguments")?,
+            flat.compare
+                .as_deref()
+                .ok_or("invalid evidence arguments")?,
+        );
+    }
     let request: EvidenceRequest =
         serde_json::from_value(args).map_err(|_| "invalid evidence arguments")?;
     request
-        .window
         .validate(185)
         .map_err(|_| "invalid evidence interval")?;
     Ok(request)
@@ -416,6 +415,8 @@ mod tests {
             )
             .is_ok()
         );
+        // A model may repeat relative metadata alongside an exact interval;
+        // the complete explicit bounds remain authoritative.
         assert!(
             action(
                 "storage",
@@ -426,6 +427,17 @@ mod tests {
                     "current_end":"2026-09-16T00:00:00Z",
                     "comparison_start":"2026-09-14T00:00:00Z",
                     "comparison_end":"2026-09-15T00:00:00Z"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            action(
+                "storage",
+                json!({
+                    "since":"today",
+                    "compare":"1d",
+                    "current_start":"2026-09-15T00:00:00Z"
                 })
             )
             .is_err()
