@@ -346,9 +346,18 @@ pub struct ToolCall {
 #[serde(deny_unknown_fields)]
 pub struct Function {
     pub name: String,
-    pub arguments: String,
+    pub arguments: Value,
 }
-pub fn calls(message: &Value) -> Result<Vec<(String, Action)>> {
+
+/// A tool call with a valid protocol envelope may still contain invalid
+/// arguments. Keep that distinction so the daemon can return a bounded,
+/// retryable tool error to the model when the call id is usable.
+pub struct ParsedCall {
+    pub id: String,
+    pub action: Result<Action>,
+}
+
+pub fn calls(message: &Value) -> Result<Vec<ParsedCall>> {
     let Some(raw) = message.get("tool_calls") else {
         return Ok(Vec::new());
     };
@@ -368,13 +377,21 @@ pub fn calls(message: &Value) -> Result<Vec<(String, Action)>> {
                 || c.id.is_empty()
                 || c.id.len() > 128
                 || !ids.insert(c.id.clone())
-                || c.function.arguments.len() > 8192
+                || c.function.arguments.to_string().len() > 8192
             {
                 return Err("invalid tool call".into());
             }
-            let args = serde_json::from_str(&c.function.arguments)
-                .map_err(|_| "invalid tool arguments")?;
-            Ok((c.id, action(&c.function.name, args)?))
+            let action = c
+                .function
+                .arguments
+                .as_str()
+                .ok_or_else(|| "tool arguments must be a JSON string".to_string())
+                .and_then(|arguments| {
+                    serde_json::from_str(arguments)
+                        .map_err(|_| "invalid tool arguments".to_string())
+                })
+                .and_then(|args| action(&c.function.name, args));
+            Ok(ParsedCall { id: c.id, action })
         })
         .collect()
 }
@@ -426,9 +443,6 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .iter()
         .find(|mount| mount.get("mount_point").and_then(Value::as_str) == Some("/"))?;
     let used_bytes_change = root.get("used_bytes_change")?.as_i64()?;
-    if used_bytes_change == 0 {
-        return None;
-    }
     let current = data.get("current")?;
     let comparison = data.get("comparison")?;
     let current_used_bytes = root.get("current_used_bytes")?.as_i64()?;
@@ -460,7 +474,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         })
         .take(12)
         .collect();
-    let current_directory_snapshot = data
+    let mut current_directory_snapshot = data
         .get("current_directory_snapshot")
         .and_then(Value::as_array)
         .into_iter()
@@ -474,15 +488,25 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
             let allocated = directory.get("allocated_bytes")?.as_i64()?;
             let apparent = directory.get("apparent_bytes")?.as_i64()?;
             let scan_started_at = directory.get("scan_started_at_utc")?.as_str()?;
-            Some(format!(
-                "{} allocated_bytes={} apparent_bytes={} scan_started_at_utc={}",
-                bounded_text(path, 512),
+            Some((
                 allocated,
-                apparent,
-                bounded_text(scan_started_at, 128)
+                bounded_text(path, 512),
+                format!(
+                    "{} allocated_bytes={} apparent_bytes={} scan_started_at_utc={}",
+                    bounded_text(path, 512),
+                    allocated,
+                    apparent,
+                    bounded_text(scan_started_at, 128)
+                ),
             ))
         })
+        .collect::<Vec<_>>();
+    current_directory_snapshot
+        .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let current_directory_snapshot = current_directory_snapshot
+        .into_iter()
         .take(12)
+        .map(|(_, _, formatted)| formatted)
         .collect();
     let limitations = data
         .get("limitations")
@@ -572,6 +596,68 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
         }))
         .expect("canonical storage facts are serializable");
     }
+}
+
+/// A deterministic, bounded summary that keeps a useful answer available when
+/// a local model emits only reasoning or a generic evidence paraphrase.
+pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String {
+    let direction = if facts.used_bytes_change >= 0 {
+        "increased"
+    } else {
+        "decreased"
+    };
+    let magnitude = facts.used_bytes_change.saturating_abs();
+    let mut summary = format!(
+        "Authoritative storage evidence (deterministic): the root filesystem {direction} by {magnitude} bytes ({:+.2} GiB; signed delta {:+} bytes). Current used bytes: {}. Comparison used bytes: {}. Current interval: {} to {}. Comparison interval: {} to {}. Path attribution status: {}. ",
+        gibibytes(facts.used_bytes_change),
+        facts.used_bytes_change,
+        facts.current_used_bytes,
+        facts.comparison_used_bytes,
+        facts.current_start,
+        facts.current_end,
+        facts.comparison_start,
+        facts.comparison_end,
+        facts.path_attribution_status,
+    );
+    if !facts.current_directory_snapshot.is_empty() {
+        summary.push_str("Current directory inventory (point-in-time; not growth attribution): ");
+        summary.push_str(&facts.current_directory_snapshot.join("; "));
+        summary.push_str(". ");
+    }
+    if !facts.directories.is_empty() {
+        summary.push_str("Historical directory delta findings: ");
+        summary.push_str(&facts.directories.join("; "));
+        summary.push_str(". ");
+    }
+    if !facts.limitations.is_empty() {
+        summary.push_str("Limitations: ");
+        summary.push_str(&facts.limitations.join("; "));
+    }
+    bounded_text(&summary, 8192)
+}
+
+/// Infer only the narrow, unambiguous everyday storage question. Arbitrary
+/// periods still require the model's typed evidence action.
+pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
+    let lower = question.to_ascii_lowercase();
+    let resource = ["storage", "disk", "filesystem", "file system"]
+        .iter()
+        .any(|term| lower.contains(term));
+    let equivalent_day = lower.contains("today") && lower.contains("yesterday");
+    if !resource || !equivalent_day {
+        return None;
+    }
+    let current = WindowRange {
+        relative: Some(RelativeRange {
+            value: 1,
+            unit: RelativeUnit::Today,
+        }),
+        start: None,
+        end: None,
+    };
+    request(current, None, ComparisonMode::PreviousDay)
+        .ok()
+        .map(Action::Storage)
 }
 
 fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> bool {
@@ -1213,6 +1299,53 @@ mod tests {
             canonical["current_directory_snapshot"][0],
             "/home/acemagic/ollama allocated_bytes=700 apparent_bytes=700 scan_started_at_utc=2026-09-16T11:00:00Z"
         );
+    }
+
+    #[test]
+    fn inferred_storage_action_only_handles_explicit_today_yesterday_question() {
+        assert!(matches!(
+            inferred_storage_action("Why did storage increase from yesterday to today?"),
+            Some(Action::Storage(request))
+                if request.window.comparison == ComparisonMode::PreviousDay
+        ));
+        assert!(
+            inferred_storage_action("Why did memory increase from yesterday to today?").is_none()
+        );
+        assert!(inferred_storage_action("Why did storage increase last week?").is_none());
+    }
+
+    #[test]
+    fn deterministic_storage_summary_contains_exact_delta_and_inventory() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1100i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "current_directory_snapshot": [{
+                    "mount_id":"root-mount",
+                    "root":"/",
+                    "path":"/home/acemagic/ollama",
+                    "allocated_bytes":700i64,
+                    "apparent_bytes":700i64,
+                    "scan_started_at_utc":"scan-time"
+                }],
+                "path_attribution_status":"unavailable",
+                "limitations":["inventory is not growth attribution"]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        let summary = deterministic_storage_summary(&facts);
+        assert!(summary.contains("increased by 100 bytes"));
+        assert!(summary.contains("+0.00 GiB"));
+        assert!(summary.contains("/home/acemagic/ollama"));
+        assert!(summary.contains("inventory is not growth attribution"));
     }
 
     #[test]

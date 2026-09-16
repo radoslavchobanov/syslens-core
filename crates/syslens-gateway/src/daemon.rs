@@ -138,23 +138,59 @@ impl App {
             let mut refs=Vec::new();let mut limitations=Vec::new();
             let mut root_storage_facts=None;
             if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
+            if let Some(action) = ai::inferred_storage_action(&r.question) {
+                let evidence = self.evidence(&target, action).await?;
+                refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
+                root_storage_facts = ai::root_storage_facts(&evidence);
+                let call_id = "syslens-inferred-storage";
+                messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":"{\"current_range\":\"today\",\"comparison_range\":\"previous-day\"}"}}]}));
+                messages.push(json!({"role":"tool","tool_call_id":call_id,"content":evidence_tool_content(&evidence,root_storage_facts.as_ref())}));
+            }
             for round in 0..=self.config.ai.max_rounds {
                 let assistant=model_client.completion(&model,&messages).await?;
-                let calls=ai::calls(&assistant)?;
-                if calls.is_empty(){let answer=assistant["content"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=32_768).ok_or("AI returned no bounded answer")?;
-                    let mut answer=answer.to_owned();
+                let calls=match ai::calls(&assistant) {
+                    Ok(calls) => calls,
+                    Err(error) => {
+                        if round == self.config.ai.max_rounds {
+                            return Err(error);
+                        }
+                        limitations.push(format!("Model tool call was invalid and a retry was requested: {error}"));
+                        messages.push(assistant);
+                        messages.push(json!({"role":"tool","tool_call_id":format!("syslens-invalid-tool-{round}"),"content":json!({"error":"invalid tool call arguments","detail":error,"instruction":"Retry using exactly current_range and comparison_range. For yesterday versus today use today and previous-day."}).to_string()}));
+                        continue;
+                    }
+                };
+                if calls.is_empty(){let mut answer=assistant["content"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=32_768).map(str::to_owned);
+                    if answer.is_none() {
+                        answer = root_storage_facts.as_ref().map(ai::deterministic_storage_summary);
+                    }
+                    let mut answer=answer.ok_or("AI returned no bounded answer")?;
                     if let Some(facts)=root_storage_facts.as_ref()
                         && let Some(fallback)=ai::grounded_storage_fallback(&answer,facts)
                     {
                         limitations.push("The model answer contradicted authoritative root storage evidence; a deterministic fallback was returned".into());
                         answer=fallback;
                     }
+                    if let Some(facts) = root_storage_facts.as_ref()
+                        && !answer.contains("Authoritative storage evidence")
+                    {
+                        answer = format!("{}\n\nModel analysis:\n{}", ai::deterministic_storage_summary(facts), answer);
+                    }
                     if refs.is_empty(){limitations.push("No successful host evidence supports this answer".into());}
                     let response=json!({"session":session,"target":target,"model":model,"answer":answer,"evidence_refs":refs,"limitations":limitations});self.db()?.save(&session,&r.question,&response)?;return Ok(response);
                 }
                 if round==self.config.ai.max_rounds||calls.len()>self.config.ai.max_calls{return Err("AI evidence action limit reached".into());}
                 messages.push(assistant);
-                for (id,action) in calls {
+                for call in calls {
+                    let id = call.id;
+                    let action = match call.action {
+                        Ok(action) => action,
+                        Err(error) => {
+                            limitations.push(format!("Model tool arguments were invalid; a retry was requested: {error}"));
+                            messages.push(json!({"role":"tool","tool_call_id":id,"content":json!({"error":"invalid tool arguments","detail":error,"instruction":"Retry with valid typed evidence arguments."}).to_string()}));
+                            continue;
+                        }
+                    };
                     let is_storage=matches!(&action,Action::Storage(_));
                     let supported=match &action{Action::Memory(_)=>capabilities.data.resources.iter().any(|s|s=="memory"),Action::Storage(_)=>capabilities.data.resources.iter().any(|s|s=="storage"),_=>true};
                     if !supported{return Err("AI requested a resource unavailable on this target".into());}
