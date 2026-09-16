@@ -351,14 +351,17 @@ capacity exhaustion.
 The add-on also records local writable mount capacity and inode counters every
 collection interval. It scans eligible local mount roots at startup and then
 hourly by default, retaining directory summaries to four levels. Directory
-paths remain only in the host-local SQLite database. The unprivileged scanner
-does not follow symlinks or cross mount boundaries, applies configured time and
+paths remain only in the host-local SQLite database. The default user-mode
+scanner does not follow symlinks or cross mount boundaries, applies configured time and
 entry budgets, traverses deeper descendants into the deepest retained summary,
 includes directory metadata allocation consistently, and marks permission-limited or partial scans as incomplete.
 The separate scanner worker requests a lower CPU priority on Unix as a best-effort
 hint; collection and diagnosis remain usable if that request is denied.
 `diagnose storage` only attributes growth to a path when two complete scans are
 comparable; it can prove mount growth without guessing a path or process cause.
+The optional root-owned system collector uses the same bounded scanner with
+read-only access to protected host paths, so those paths can be included in
+the comparison without changing the normal SysLens daemon.
 The optional `[storage]` configuration accepts `scan_interval_seconds` (300 to
 86400), `max_depth` (1 to 8), `max_entries` (1000 to 10000000),
 `max_duration_seconds` (5 to 3600), and an explicit `roots` list that replaces
@@ -421,8 +424,9 @@ silently alter user services. `migrate-system` refuses destructive overwrite,
 refuses to run while a live user recorder holds its lock, preserves SQLite
 `-wal`/`-shm` files
 and `0600` permissions, and leaves the original user data in place. The
-systemd units use read-only host protection with only the diagnosis state
-directory writable. The collector's capability set is limited to
+systemd units use read-only protection for system paths with only the diagnosis
+state directory writable; the collector keeps the host root mount inspectable
+so read-only data is not hidden by its own sandbox. The collector's capability set is limited to
 `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, and `CAP_SYS_PTRACE`; the API drops
 all capabilities. An inaccessible directory is retained as a partial scan
 gap while sibling directories continue, so storage attribution remains

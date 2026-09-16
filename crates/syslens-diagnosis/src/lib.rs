@@ -4489,7 +4489,7 @@ pub fn diagnose_storage_windows(
     let conn = open_readonly(path)?;
     let fmt = |x: DateTime<Utc>| x.to_rfc3339();
     let mut limits = vec![
-        "Directory evidence is unprivileged and local. It does not attribute storage use to a process."
+        "Directory evidence is local and path-based. It does not attribute storage use to a process."
             .into(),
     ];
     // Select one latest usable row per mount and interval before joining the
