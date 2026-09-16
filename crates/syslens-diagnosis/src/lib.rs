@@ -518,6 +518,41 @@ pub fn system_service_path() -> PathBuf {
 pub fn system_api_service_path() -> PathBuf {
     system_unit_dir().join("syslens-diagnosis-api.service")
 }
+/// Validate a binary before a root system unit is allowed to persistently
+/// execute it. The package path is root-owned; custom paths must meet the same
+/// ownership and mode requirements.
+pub fn validate_system_binary(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect system binary {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "system binary {} must be a regular file, not a symlink",
+            path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!(
+            "system binary {} must be owned by root",
+            path.display()
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "system binary {} is group/world writable (mode {:o})",
+            path.display(),
+            mode
+        ));
+    }
+    if mode & 0o111 == 0 {
+        return Err(format!(
+            "system binary {} is not executable (mode {:o})",
+            path.display(),
+            mode
+        ));
+    }
+    Ok(())
+}
 pub fn user_service_path() -> PathBuf {
     xdg_path("XDG_CONFIG_HOME", ".config").join("systemd/user/syslens-diagnosis.service")
 }
@@ -566,7 +601,7 @@ pub fn install_user_service(
 }
 pub fn system_service_unit(binary: &Path, config: &Path, database: &Path) -> String {
     format!(
-        "[Unit]\nDescription=SysLens privileged local diagnosis recorder\nAfter=local-fs.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} daemon --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The collector is intentionally root-owned so it can inspect protected host paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\n# Keep the service's normal root DAC capabilities for protected read-only paths.\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=SysLens privileged local diagnosis recorder\nAfter=local-fs.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} daemon --system --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The collector is intentionally root-owned so it can inspect protected host paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nCapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
         config.display(),
         binary.display(),
         config.display(),
@@ -579,7 +614,7 @@ pub fn system_service_unit(binary: &Path, config: &Path, database: &Path) -> Str
 }
 pub fn system_api_service_unit(binary: &Path, config: &Path, database: &Path) -> String {
     format!(
-        "[Unit]\nDescription=SysLens privileged diagnosis evidence API\nAfter=network-online.target\nWants=network-online.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} serve --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The API remains mTLS-protected by the configured certificate and CA paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=SysLens privileged diagnosis evidence API\nAfter=network-online.target\nWants=network-online.target\nConditionPathExists={}\n\n[Service]\nType=simple\nUser=root\nExecStart={} serve --system --config {} --database {}\nRestart=on-failure\nRestartSec=5\n# The API remains mTLS-protected by the configured certificate and CA paths.\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nCapabilityBoundingSet=\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
         config.display(),
         binary.display(),
         config.display(),
@@ -734,6 +769,12 @@ pub fn migrate_to_system_at(
     destination_config: &Path,
     destination_database: &Path,
 ) -> Result<(PathBuf, PathBuf), String> {
+    let destination_state = destination_database
+        .parent()
+        .ok_or("system database has no parent")?;
+    let _destination_lock = acquire_writer_lock(destination_state)
+        .map_err(|e| format!("cannot migrate while the system recorder is active: {e}"))?;
+    recover_migration(destination_config, destination_database)?;
     if path_exists(destination_config) {
         return Err(format!(
             "system configuration already exists at {}; refusing to overwrite",
@@ -763,9 +804,10 @@ pub fn migrate_to_system_at(
     let source_database_mode = private_mode(source_database, "source evidence database")?;
     let source_sidecars: Vec<_> = database_sidecar_paths(source_database)
         .into_iter()
-        .filter(|path| path_exists(path))
-        .map(|path| {
-            private_mode(&path, "source evidence database sidecar").map(|mode| (path, mode))
+        .enumerate()
+        .filter(|(_, path)| path_exists(path))
+        .map(|(index, path)| {
+            private_mode(&path, "source evidence database sidecar").map(|mode| (index, path, mode))
         })
         .collect::<Result<_, _>>()?;
 
@@ -779,34 +821,46 @@ pub fn migrate_to_system_at(
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         secure_directory(parent)?;
     }
-    let mut created = Vec::new();
+    let pid = std::process::id();
+    let marker = migration_marker_path(destination_database);
+    let staged_config = migration_stage_path(destination_config, pid);
+    let staged_database = migration_stage_path(destination_database, pid);
+    let staged_sidecars = database_sidecar_paths(&staged_database);
+    write_migration_marker(&marker, pid)?;
+    let mut staged = vec![migration_stage_path(&marker, pid)];
+    let mut committed = Vec::new();
     let copy = (|| -> Result<(), String> {
-        copy_new_file(source_config, destination_config, source_config_mode)?;
-        created.push(destination_config.to_path_buf());
-        copy_new_file(source_database, destination_database, source_database_mode)?;
-        created.push(destination_database.to_path_buf());
-        for (source, mode) in source_sidecars {
-            let name = source
-                .file_name()
-                .ok_or("source database sidecar has no filename")?;
-            let destination = destination_database
-                .parent()
-                .ok_or("system database has no parent")?
-                .join(name);
-            copy_new_file(&source, &destination, mode)?;
-            created.push(destination);
+        copy_new_file(source_config, &staged_config, source_config_mode)?;
+        staged.push(staged_config.clone());
+        copy_new_file(source_database, &staged_database, source_database_mode)?;
+        staged.push(staged_database.clone());
+        for (index, source, mode) in source_sidecars {
+            let staged_sidecar = staged_sidecars
+                .get(index)
+                .ok_or("source database sidecar index is invalid")?;
+            copy_new_file(&source, staged_sidecar, mode)?;
+            staged.push(staged_sidecar.clone());
         }
-        // Re-parse the copied config and check all copied database files
-        // without opening SQLite (opening can alter a live WAL/SHM source).
+        // Validate staged copies before any target is committed. Opening the
+        // staged SQLite file is deliberately avoided so a WAL/SHM source is
+        // never changed by migration.
         config.validate()?;
-        validate_config_permissions(destination_config)?;
-        secure_database_files(destination_database)?;
+        validate_config_permissions(&staged_config)?;
+        secure_database_files(&staged_database)?;
+        commit_migration_file(&staged_config, destination_config, &mut committed)?;
+        commit_migration_file(&staged_database, destination_database, &mut committed)?;
+        for (index, staged_sidecar) in staged_sidecars.iter().enumerate() {
+            if path_exists(staged_sidecar) {
+                let destination = database_sidecar_paths(destination_database)[index].clone();
+                commit_migration_file(staged_sidecar, &destination, &mut committed)?;
+            }
+        }
+        fs::remove_file(&marker)
+            .map_err(|e| format!("cannot finalize migration marker {}: {e}", marker.display()))?;
         Ok(())
     })();
     if let Err(error) = copy {
-        for path in created {
-            let _ = fs::remove_file(path);
-        }
+        cleanup_migration(&marker, &staged, &committed);
         return Err(error);
     }
     Ok((
@@ -869,6 +923,137 @@ fn copy_new_file(source: &Path, destination: &Path, mode: u32) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+fn migration_marker_path(destination_database: &Path) -> PathBuf {
+    destination_database
+        .parent()
+        .unwrap_or_else(|| Path::new(SYSTEM_STATE_DIR))
+        .join(".migration-in-progress")
+}
+
+fn migration_stage_path(target: &Path, pid: u32) -> PathBuf {
+    let mut value = target.as_os_str().to_os_string();
+    value.push(format!(".syslens-migration-{pid}"));
+    PathBuf::from(value)
+}
+
+fn write_migration_marker(marker: &Path, pid: u32) -> Result<(), String> {
+    // Publish the marker only after its contents are durable.  A process
+    // crash while writing the marker must not leave an empty/partial marker
+    // that prevents a subsequent migration from recovering safely.
+    let temporary = migration_stage_path(marker, pid);
+    let _ = fs::remove_file(&temporary);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|e| format!("cannot create migration marker {}: {e}", marker.display()))?;
+    use std::io::Write;
+    if let Err(error) = file
+        .write_all(pid.to_string().as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot write migration marker {}: {error}",
+            marker.display()
+        ));
+    }
+    drop(file);
+    if let Err(error) = fs::hard_link(&temporary, marker) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot publish migration marker {}: {error}",
+            marker.display()
+        ));
+    }
+    fs::remove_file(&temporary).map_err(|e| {
+        format!(
+            "cannot remove temporary migration marker {}: {e}",
+            temporary.display()
+        )
+    })
+}
+
+fn commit_migration_file(
+    staged: &Path,
+    destination: &Path,
+    committed: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if path_exists(destination) {
+        return Err(format!(
+            "destination {} appeared during migration; refusing overwrite",
+            destination.display()
+        ));
+    }
+    // Hard-linking within each destination filesystem provides an atomic
+    // no-overwrite commit; the marker allows recovery if the following unlink
+    // or later commit is interrupted by a crash.
+    fs::hard_link(staged, destination).map_err(|e| {
+        format!(
+            "cannot commit migration file {} to {}: {e}",
+            staged.display(),
+            destination.display()
+        )
+    })?;
+    committed.push(destination.to_path_buf());
+    fs::remove_file(staged).map_err(|e| {
+        format!(
+            "cannot remove staged migration file {}: {e}",
+            staged.display()
+        )
+    })
+}
+
+fn remove_migration_file(path: &Path) -> Result<(), String> {
+    if path_exists(path) {
+        fs::remove_file(path)
+            .map_err(|e| format!("cannot remove migration file {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn cleanup_migration(marker: &Path, staged: &[PathBuf], committed: &[PathBuf]) {
+    for path in staged.iter().chain(committed) {
+        let _ = remove_migration_file(path);
+    }
+    let _ = remove_migration_file(marker);
+}
+
+fn recover_migration(destination_config: &Path, destination_database: &Path) -> Result<(), String> {
+    let marker = migration_marker_path(destination_database);
+    if !path_exists(&marker) {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&marker)
+        .map_err(|e| format!("cannot inspect migration marker {}: {e}", marker.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "migration marker {} must not be a symlink",
+            marker.display()
+        ));
+    }
+    let pid = fs::read_to_string(&marker)
+        .map_err(|e| format!("cannot read migration marker {}: {e}", marker.display()))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("invalid migration marker {}: {e}", marker.display()))?;
+    let staged_config = migration_stage_path(destination_config, pid);
+    let staged_database = migration_stage_path(destination_database, pid);
+    let staged_sidecars = database_sidecar_paths(&staged_database);
+    let mut paths = vec![staged_config, staged_database];
+    paths.extend(staged_sidecars);
+    paths.push(migration_stage_path(&marker, pid));
+    paths.push(destination_config.to_path_buf());
+    paths.push(destination_database.to_path_buf());
+    paths.extend(database_sidecar_paths(destination_database));
+    for path in paths {
+        remove_migration_file(&path)?;
+    }
+    remove_migration_file(&marker)
 }
 
 fn path_exists(path: &Path) -> bool {
@@ -1289,7 +1474,13 @@ fn response_envelope<T: Serialize>(
 /// Serve the narrow, deterministic evidence interface. It is deliberately a
 /// separate process from the recorder: if it is stopped, collection continues.
 pub fn serve_api(config_path: &Path, database: &Path) -> Result<(), String> {
-    if config_path == system_config_path() || database == system_database_path() {
+    serve_api_mode(config_path, database, false)
+}
+pub fn serve_api_system(config_path: &Path, database: &Path) -> Result<(), String> {
+    serve_api_mode(config_path, database, true)
+}
+fn serve_api_mode(config_path: &Path, database: &Path, system: bool) -> Result<(), String> {
+    if system || config_path == system_config_path() || database == system_database_path() {
         validate_config_permissions(config_path)?;
     } else {
         secure_config(config_path)?;
@@ -1298,25 +1489,52 @@ pub fn serve_api(config_path: &Path, database: &Path) -> Result<(), String> {
     if !config.api.enabled {
         return Err("API is disabled; set [api].enabled = true and configure mTLS paths".into());
     }
-    secure_api_material(&config.api)?;
+    secure_api_material(
+        &config.api,
+        system || config_path == system_config_path() || database == system_database_path(),
+    )?;
     let runtime =
         tokio::runtime::Runtime::new().map_err(|_| "cannot start API runtime".to_string())?;
     runtime.block_on(serve_api_async(config, database.to_path_buf()))
 }
-fn secure_api_material(api: &ApiConfig) -> Result<(), String> {
+fn secure_api_material(api: &ApiConfig, require_root_owned: bool) -> Result<(), String> {
     for path in [
         &api.tls_cert_path,
         &api.tls_key_path,
         &api.trusted_gateway_ca_path,
     ] {
         let p = path.as_ref().ok_or("enabled API requires TLS material")?;
-        let mode = fs::metadata(p)
-            .map_err(|_| "cannot access API TLS material")?
-            .permissions()
-            .mode()
-            & 0o777;
+        let metadata = fs::symlink_metadata(p).map_err(|_| "cannot access API TLS material")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("API TLS material must be regular files, not symlinks".into());
+        }
+        let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err("API TLS material must be owner-only".into());
+        }
+        if require_root_owned {
+            if metadata.uid() != 0 {
+                return Err(
+                    "system API TLS material must be root-owned; migrate it to /etc/syslens-diagnosis/pki or configure root-owned paths"
+                        .into(),
+                );
+            }
+            let mut parent = p.parent();
+            while let Some(directory) = parent {
+                let directory_metadata = fs::symlink_metadata(directory)
+                    .map_err(|_| "system API TLS material parent is inaccessible or unsafe")?;
+                if directory_metadata.file_type().is_symlink()
+                    || !directory_metadata.is_dir()
+                    || directory_metadata.uid() != 0
+                    || directory_metadata.permissions().mode() & 0o022 != 0
+                {
+                    return Err(
+                        "system API TLS material must be under root-owned, non-writable directories"
+                            .into(),
+                    );
+                }
+                parent = directory.parent();
+            }
         }
     }
     Ok(())
@@ -5271,15 +5489,42 @@ mod tests {
         assert!(unit.contains("ReadWritePaths=/var/lib/syslens-diagnosis"));
         assert!(unit.contains("NoNewPrivileges=yes"));
         assert!(unit.contains("User=root"));
-        assert!(!unit.contains("CapabilityBoundingSet="));
-        assert!(unit.contains("daemon --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite"));
+        assert!(
+            unit.contains(
+                "CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE"
+            )
+        );
+        assert!(
+            unit.contains(
+                "AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE"
+            )
+        );
+        assert!(unit.contains("daemon --system --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite"));
         let api = system_api_service_unit(
             Path::new("/usr/bin/syslens-diagnosis"),
             Path::new("/etc/syslens-diagnosis/config.toml"),
             Path::new("/var/lib/syslens-diagnosis/diagnosis.sqlite"),
         );
-        assert!(api.contains("serve --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite"));
+        assert!(api.contains("serve --system --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite"));
         assert!(api.contains("ProtectHome=read-only"));
+        assert!(api.contains("CapabilityBoundingSet=\n"));
+    }
+    #[test]
+    fn system_binary_validation_rejects_symlinks_and_writable_files() {
+        let d = tempdir().unwrap();
+        let binary = d.path().join("syslens-diagnosis");
+        fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        if fs::metadata(&binary).unwrap().uid() == 0 {
+            validate_system_binary(&binary).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(validate_system_binary(&binary).is_err());
+        } else {
+            assert!(validate_system_binary(&binary).is_err());
+        }
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&binary, &link).unwrap();
+        assert!(validate_system_binary(&link).is_err());
     }
     #[test]
     fn database_lock_paths_follow_selected_database() {
@@ -5334,7 +5579,7 @@ mod tests {
     fn system_migration_preserves_sidecars_and_refuses_overwrite() {
         let d = tempdir().unwrap();
         let source_config = d.path().join("user/config.toml");
-        let source_database = d.path().join("user/diagnosis.sqlite");
+        let source_database = d.path().join("user/user-evidence.db");
         fs::create_dir_all(source_config.parent().unwrap()).unwrap();
         fs::write(
             &source_config,
@@ -5349,7 +5594,22 @@ mod tests {
             fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let destination_config = d.path().join("system/config.toml");
-        let destination_database = d.path().join("system/diagnosis.sqlite");
+        let destination_database = d.path().join("system/system-evidence.sqlite");
+        fs::create_dir_all(destination_database.parent().unwrap()).unwrap();
+        let marker = migration_marker_path(&destination_database);
+        fs::write(&marker, "424242").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&destination_config, b"stale target").unwrap();
+        fs::write(
+            migration_stage_path(&destination_config, 424242),
+            b"stale staged config",
+        )
+        .unwrap();
+        fs::write(
+            migration_stage_path(&destination_database, 424242),
+            b"stale staged database",
+        )
+        .unwrap();
         let (config, database) = migrate_to_system_at(
             &source_config,
             &source_database,
@@ -5359,6 +5619,7 @@ mod tests {
         .unwrap();
         assert_eq!(config, destination_config);
         assert_eq!(database, destination_database);
+        assert!(!marker.exists());
         assert_eq!(
             fs::read(&destination_config).unwrap(),
             fs::read(&source_config).unwrap()
@@ -5373,6 +5634,8 @@ mod tests {
                 0o600
             );
         }
+        assert!(!d.path().join("system/user-evidence.db-wal").exists());
+        assert!(!d.path().join("system/user-evidence.db-shm").exists());
         assert!(
             migrate_to_system_at(
                 &source_config,
@@ -5407,7 +5670,13 @@ mod tests {
             assert!(asset.contains("ProtectHome=read-only"));
             assert!(asset.contains("User=root"));
             assert!(asset.contains("ReadWritePaths=/var/lib/syslens-diagnosis"));
-            assert!(!asset.contains("CapabilityBoundingSet="));
+            if asset.contains(" daemon ") {
+                assert!(asset.contains(
+                    "CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE"
+                ));
+            } else {
+                assert!(asset.contains("CapabilityBoundingSet=\n"));
+            }
         }
         assert!(
             service_unit(Path::new("/bin/d"), Path::new("/c"), Path::new("/d"))
@@ -6906,6 +7175,36 @@ mod tests {
         let mut enabled = config;
         enabled.api.enabled = true;
         assert!(enabled.validate().is_err());
+    }
+
+    #[test]
+    fn api_tls_material_rejects_symlinks_and_unsafe_system_ownership() {
+        let d = tempfile::tempdir().unwrap();
+        let cert = d.path().join("host.crt");
+        let key = d.path().join("host.key");
+        let ca = d.path().join("gateway-ca.crt");
+        for path in [&cert, &key, &ca] {
+            fs::write(path, b"material").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let api = ApiConfig {
+            enabled: true,
+            tls_cert_path: Some(cert.clone()),
+            tls_key_path: Some(key.clone()),
+            trusted_gateway_ca_path: Some(ca.clone()),
+            ..ApiConfig::default()
+        };
+        secure_api_material(&api, false).unwrap();
+        let link = d.path().join("key-link");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        let mut symlink_api = api.clone();
+        symlink_api.tls_key_path = Some(link);
+        assert!(secure_api_material(&symlink_api, false).is_err());
+        if fs::metadata(&cert).unwrap().uid() == 0 {
+            secure_api_material(&api, true).unwrap();
+        } else {
+            assert!(secure_api_material(&api, true).is_err());
+        }
     }
 
     #[test]

@@ -386,6 +386,11 @@ sudo syslens-diagnosis status --config /etc/syslens-diagnosis/config.toml
 sudo syslens-diagnosis disable-system
 ```
 
+System enable commands execute `/usr/bin/syslens-diagnosis` by default. A
+custom `--binary` is accepted only when it is a root-owned, executable,
+non-group/world-writable regular file; the command never persists an unchecked
+user-owned `current_exe`.
+
 The optional mTLS API is a separate root unit and remains disabled until its
 `[api]` section has `enabled = true` and absolute certificate, key, and trusted
 gateway CA paths:
@@ -395,13 +400,30 @@ sudo syslens-diagnosis enable-system-api
 sudo syslens-diagnosis disable-system-api
 ```
 
+System API TLS material must be regular, root-owned, owner-only files under
+root-owned non-writable directories. Migration deliberately leaves user-home
+PKI references unchanged and the system API will refuse them. Before enabling
+the system API, install the three files into the dedicated directory and edit
+the copied system config paths:
+
+```bash
+sudo install -d -o root -g root -m 700 /etc/syslens-diagnosis/pki
+sudo install -o root -g root -m 600 /home/$USER/.config/syslens-diagnosis/certs/host.crt /etc/syslens-diagnosis/pki/host.crt
+sudo install -o root -g root -m 600 /home/$USER/.config/syslens-diagnosis/certs/host.key /etc/syslens-diagnosis/pki/host.key
+sudo install -o root -g root -m 600 /home/$USER/.config/syslens-diagnosis/certs/gateway-ca.crt /etc/syslens-diagnosis/pki/gateway-ca.crt
+# Set tls_cert_path, tls_key_path, and trusted_gateway_ca_path to these /etc paths.
+sudo syslens-diagnosis enable-system-api
+```
+
 System commands require root and call the system `systemctl`; they never
 silently alter user services. `migrate-system` refuses destructive overwrite,
 refuses to run while a live user recorder holds its lock, preserves SQLite
 `-wal`/`-shm` files
 and `0600` permissions, and leaves the original user data in place. The
 systemd units use read-only host protection with only the diagnosis state
-directory writable. An inaccessible directory is retained as a partial scan
+directory writable. The collector's capability set is limited to
+`CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, and `CAP_SYS_PTRACE`; the API drops
+all capabilities. An inaccessible directory is retained as a partial scan
 gap while sibling directories continue, so storage attribution remains
 explicitly limited rather than guessed.
 

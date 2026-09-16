@@ -81,6 +81,12 @@ fn help_lists_explicit_system_mode_without_replacing_user_commands() {
     }
     assert!(help.contains("enable"));
     assert!(help.contains("disable"));
+    let system_help = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .args(["enable-system", "--help"])
+        .output()
+        .unwrap();
+    assert!(system_help.status.success());
+    assert!(String::from_utf8_lossy(&system_help.stdout).contains("--binary"));
 }
 
 #[test]

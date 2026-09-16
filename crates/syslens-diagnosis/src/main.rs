@@ -27,6 +27,9 @@ enum CommandLine {
         config: Option<PathBuf>,
         #[arg(long)]
         database: Option<PathBuf>,
+        /// Root-owned executable to run from the system unit.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
     /// Disable only the privileged system collector (requires root).
     DisableSystem,
@@ -41,6 +44,9 @@ enum CommandLine {
         config: Option<PathBuf>,
         #[arg(long)]
         database: Option<PathBuf>,
+        /// Root-owned executable to run from the system unit.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
     /// Disable only the privileged system mTLS API (requires root).
     DisableSystemApi,
@@ -60,6 +66,8 @@ enum CommandLine {
         config: PathBuf,
         #[arg(long)]
         database: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        system: bool,
     },
     /// Run the opt-in mutually authenticated evidence API.
     Serve {
@@ -67,6 +75,8 @@ enum CommandLine {
         config: PathBuf,
         #[arg(long)]
         database: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        system: bool,
     },
     Diagnose {
         #[arg(long)]
@@ -206,6 +216,10 @@ fn system_paths(config: Option<PathBuf>, database: Option<PathBuf>) -> (PathBuf,
     let database = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
     (config, database)
 }
+fn system_binary(binary: Option<PathBuf>) -> Result<PathBuf, String> {
+    let path = binary.unwrap_or_else(|| PathBuf::from("/usr/bin/syslens-diagnosis"));
+    diagnosis::validate_system_binary(&path).map(|_| path)
+}
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let r = match cli.command {
@@ -230,12 +244,19 @@ fn main() -> ExitCode {
             }
         }
         CommandLine::Disable => service(&["disable", "--now", "syslens-diagnosis.service"]),
-        CommandLine::EnableSystem { config, database } => {
+        CommandLine::EnableSystem {
+            config,
+            database,
+            binary,
+        } => {
             require_root("enable-system").and_then(|_| {
                 let (p, db) = system_paths(config, database);
-                diagnosis::ensure_config(&p)
-                    .and_then(|cfg| diagnosis::initialize_db(&db, &cfg).map(|_| ()))
-                    .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
+                system_binary(binary)
+                    .and_then(|binary| {
+                        diagnosis::ensure_config(&p)
+                            .and_then(|cfg| diagnosis::initialize_db(&db, &cfg).map(|_| ()))
+                            .map(|_| binary)
+                    })
                     .and_then(|binary| diagnosis::install_system_service(&binary, &p, &db))
                     .and_then(|_| system_service(&["daemon-reload"]))
                     .and_then(|_| system_service(&["enable", "--now", "syslens-diagnosis.service"]))
@@ -266,20 +287,27 @@ fn main() -> ExitCode {
                 .and_then(|_| service(&["enable", "--now", "syslens-diagnosis-api.service"]))
         }
         CommandLine::DisableApi => service(&["disable", "--now", "syslens-diagnosis-api.service"]),
-        CommandLine::EnableSystemApi { config, database } => {
+        CommandLine::EnableSystemApi {
+            config,
+            database,
+            binary,
+        } => {
             require_root("enable-system-api").and_then(|_| {
                 let (p, db) = system_paths(config, database);
-                diagnosis::ensure_config(&p)
-                    .and_then(|cfg| {
-                        if !cfg.api.enabled {
-                            return Err(
-                                "API is disabled; configure [api] with mTLS paths before enabling"
-                                    .into(),
-                            );
-                        }
-                        diagnosis::initialize_db(&db, &cfg).map(|_| ())
+                system_binary(binary)
+                    .and_then(|binary| {
+                        diagnosis::ensure_config(&p)
+                            .and_then(|cfg| {
+                                if !cfg.api.enabled {
+                                    return Err(
+                                        "API is disabled; configure [api] with mTLS paths before enabling"
+                                            .into(),
+                                    );
+                                }
+                                diagnosis::initialize_db(&db, &cfg).map(|_| ())
+                            })
+                            .map(|_| binary)
                     })
-                    .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
                     .and_then(|binary| diagnosis::install_system_api_service(&binary, &p, &db))
                     .and_then(|_| system_service(&["daemon-reload"]))
                     .and_then(|_| {
@@ -306,10 +334,22 @@ fn main() -> ExitCode {
             })
         }),
         CommandLine::Status { config } => status(config.unwrap_or_else(diagnosis::config_path)),
-        CommandLine::Daemon { config, database } => daemon(config, database),
-        CommandLine::Serve { config, database } => {
+        CommandLine::Daemon {
+            config,
+            database,
+            system,
+        } => daemon(config, database, system),
+        CommandLine::Serve {
+            config,
+            database,
+            system,
+        } => {
             let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
-            diagnosis::serve_api(&config, &db)
+            if system {
+                diagnosis::serve_api_system(&config, &db)
+            } else {
+                diagnosis::serve_api(&config, &db)
+            }
         }
         CommandLine::Diagnose {
             config,
@@ -617,9 +657,12 @@ fn status(config: PathBuf) -> Result<(), String> {
     );
     Ok(())
 }
-fn daemon(config: PathBuf, database: Option<PathBuf>) -> Result<(), String> {
+fn daemon(config: PathBuf, database: Option<PathBuf>, system: bool) -> Result<(), String> {
     let db = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
-    if config == diagnosis::system_config_path() || db == diagnosis::system_database_path() {
+    if system
+        || config == diagnosis::system_config_path()
+        || db == diagnosis::system_database_path()
+    {
         diagnosis::validate_config_permissions(&config)?;
     } else {
         diagnosis::secure_config(&config)?;

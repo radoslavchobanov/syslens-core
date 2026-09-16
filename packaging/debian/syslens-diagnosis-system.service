@@ -6,7 +6,7 @@ ConditionPathExists=/etc/syslens-diagnosis/config.toml
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/syslens-diagnosis daemon --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite
+ExecStart=/usr/bin/syslens-diagnosis daemon --system --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
@@ -18,6 +18,8 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SYS_PTRACE
 ReadWritePaths=/var/lib/syslens-diagnosis
 
 [Install]

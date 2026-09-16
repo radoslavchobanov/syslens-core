@@ -7,7 +7,7 @@ ConditionPathExists=/etc/syslens-diagnosis/config.toml
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/syslens-diagnosis serve --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite
+ExecStart=/usr/bin/syslens-diagnosis serve --system --config /etc/syslens-diagnosis/config.toml --database /var/lib/syslens-diagnosis/diagnosis.sqlite
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
@@ -19,6 +19,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+CapabilityBoundingSet=
 ReadWritePaths=/var/lib/syslens-diagnosis
 
 [Install]

@@ -64,6 +64,15 @@ deletes the old user config or database. Disable only the system units with
 `sudo syslens-diagnosis disable-system` and
 `sudo syslens-diagnosis disable-system-api`; ordinary `enable`/`disable`
 commands continue to manage only user services.
+System commands use the packaged `/usr/bin/syslens-diagnosis` binary by
+default; `--binary` is allowed only for a root-owned executable that is not
+group/world writable.
+
+For `enable-system-api`, install the configured certificate, key, and gateway
+CA as regular root-owned mode-`0600` files under a root-owned mode-`0700`
+directory such as `/etc/syslens-diagnosis/pki`, then update the copied system
+config's three `[api]` paths. User-home PKI references are intentionally
+rejected by the root API.
 
 ## Optional gateway
 
