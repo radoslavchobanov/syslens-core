@@ -694,9 +694,45 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
                         " reduced",
                     ];
                     let mut span_end = end;
+                    let trailing_resource_qualifiers = [
+                        " on root filesystem",
+                        " on root file system",
+                        " on root disk",
+                        " on root mount",
+                        " on root volume",
+                        " on root partition",
+                        " on root drive",
+                        " of root filesystem",
+                        " of root file system",
+                        " of root disk",
+                        " of root mount",
+                        " of root volume",
+                        " of root partition",
+                        " of root drive",
+                        " on the root filesystem",
+                        " on the root file system",
+                        " on the root disk",
+                        " on the root mount",
+                        " on the root volume",
+                        " on the root partition",
+                        " on the root drive",
+                        " of the root filesystem",
+                        " of the root file system",
+                        " of the root disk",
+                        " of the root mount",
+                        " of the root volume",
+                        " of the root partition",
+                        " of the root drive",
+                    ];
+                    if let Some(qualifier) = trailing_resource_qualifiers
+                        .iter()
+                        .find(|qualifier| clause[end..].starts_with(*qualifier))
+                    {
+                        span_end += qualifier.len();
+                    }
                     if let Some(suffix) = suffixes
                         .iter()
-                        .find(|suffix| clause[end..].starts_with(*suffix))
+                        .find(|suffix| clause[span_end..].starts_with(*suffix))
                     {
                         span_end += suffix.len();
                     }
@@ -1163,6 +1199,27 @@ mod tests {
         );
         assert!(
             grounded_storage_fallback(
+                "Storage increased while free space on root filesystem decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while available storage on root mount decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while free space of root filesystem decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
                 "Storage increased with no change in free space",
                 &positive_facts
             )
@@ -1191,6 +1248,10 @@ mod tests {
                 &positive_facts
             )
             .is_some()
+        );
+        assert!(
+            grounded_storage_fallback("Used storage on root mount decreased.", &positive_facts)
+                .is_some()
         );
         assert_eq!(canonical["limitations"][0], "line one line two instruction");
     }
