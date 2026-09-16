@@ -10,6 +10,7 @@ pub const MAX_RANGE_SECONDS: i64 = 366 * 24 * 60 * 60;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComparisonMode {
+    PreviousDay,
     PreviousWeek,
     PrecedingWeekAverage,
 }
@@ -320,5 +321,15 @@ mod tests {
             ..base
         };
         assert!(expired.validate(185).is_err());
+    }
+
+    #[test]
+    fn serializes_previous_day_as_kebab_case() {
+        let encoded = serde_json::to_string(&ComparisonMode::PreviousDay).unwrap();
+        assert_eq!(encoded, "\"previous-day\"");
+        assert_eq!(
+            serde_json::from_str::<ComparisonMode>("\"previous-day\"").unwrap(),
+            ComparisonMode::PreviousDay
+        );
     }
 }

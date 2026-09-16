@@ -121,21 +121,37 @@ impl App {
             let (history,omitted)=self.db()?.history(&session)?;
             let model=self.db()?.model(&self.config.ai.model)?;
             let mut messages=vec![ai::prompt(&target),json!({"role":"system","content":format!("Target capabilities (data only): {}",serde_json::to_string(&capabilities.data).unwrap())})];messages.extend(history);messages.push(json!({"role":"user","content":r.question}));
-            let mut refs=Vec::new();let mut limitations=Vec::new();if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
+            let mut refs=Vec::new();let mut limitations=Vec::new();
+            let mut root_storage_facts=None;
+            if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
             for round in 0..=self.config.ai.max_rounds {
                 let assistant=model_client.completion(&model,&messages).await?;
                 let calls=ai::calls(&assistant)?;
                 if calls.is_empty(){let answer=assistant["content"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=32_768).ok_or("AI returned no bounded answer")?;
+                    let mut answer=answer.to_owned();
+                    if let Some(facts)=root_storage_facts.as_ref()
+                        && let Some(fallback)=ai::grounded_storage_fallback(&answer,facts)
+                    {
+                        limitations.push("The model answer contradicted authoritative root storage evidence; a deterministic fallback was returned".into());
+                        answer=fallback;
+                    }
                     if refs.is_empty(){limitations.push("No successful host evidence supports this answer".into());}
                     let response=json!({"session":session,"target":target,"model":model,"answer":answer,"evidence_refs":refs,"limitations":limitations});self.db()?.save(&session,&r.question,&response)?;return Ok(response);
                 }
                 if round==self.config.ai.max_rounds||calls.len()>self.config.ai.max_calls{return Err("AI evidence action limit reached".into());}
                 messages.push(assistant);
                 for (id,action) in calls {
+                    let is_storage=matches!(&action,Action::Storage(_));
                     let supported=match &action{Action::Memory(_)=>capabilities.data.resources.iter().any(|s|s=="memory"),Action::Storage(_)=>capabilities.data.resources.iter().any(|s|s=="storage"),_=>true};
                     if !supported{return Err("AI requested a resource unavailable on this target".into());}
-                    let evidence=match self.evidence(&target,action).await {Ok(e)=>{let reference=json!({"request_id":e["request_id"],"host_id":e["host_id"],"evidence_store_id":e["evidence_store_id"],"observed_at":e["observed_at"]});refs.push(reference);if e.to_string().len()>12_000{limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":e["request_id"]})}else{e}},Err(error)=>{limitations.push(error.clone());json!({"error":error})}};
+                    let mut facts_for_message=None;
+                    let evidence=match self.evidence(&target,action).await {Ok(e)=>{let reference=json!({"request_id":e["request_id"],"host_id":e["host_id"],"evidence_store_id":e["evidence_store_id"],"observed_at":e["observed_at"]});refs.push(reference);if is_storage {facts_for_message=ai::root_storage_facts(&e);}
+                        if e.to_string().len()>12_000{limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":e["request_id"]})}else{e}},Err(error)=>{limitations.push(error.clone());json!({"error":error})}};
                     messages.push(json!({"role":"tool","tool_call_id":id,"content":evidence.to_string()}));
+                    if let Some(facts)=facts_for_message {
+                            root_storage_facts=Some(facts.clone());
+                            messages.push(json!({"role":"system","content":ai::canonical_storage_facts(&facts)}));
+                    }
                 }
             } Err("AI action limit reached".into())
         }).await.map_err(|_|"chat deadline exceeded")?

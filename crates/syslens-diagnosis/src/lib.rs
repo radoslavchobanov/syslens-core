@@ -1931,6 +1931,10 @@ async fn serve_api_async(config: Config, database: PathBuf) -> Result<(), String
             return resolve_range(range);
         }
         Ok(match request.window.comparison {
+            syslens_protocol::ComparisonMode::PreviousDay => (
+                current_start - Duration::days(1),
+                current_end - Duration::days(1),
+            ),
             syslens_protocol::ComparisonMode::PreviousWeek => (
                 current_start - Duration::days(7),
                 current_end - Duration::days(7),
@@ -4220,6 +4224,9 @@ pub fn diagnose_memory_window(
     comparison_mode: syslens_protocol::ComparisonMode,
 ) -> Result<Diagnosis, String> {
     let (cstart, cend) = match comparison_mode {
+        syslens_protocol::ComparisonMode::PreviousDay => {
+            (start - Duration::days(1), end - Duration::days(1))
+        }
         syslens_protocol::ComparisonMode::PreviousWeek => {
             (start - Duration::days(7), end - Duration::days(7))
         }
@@ -4462,6 +4469,9 @@ pub fn diagnose_storage_window(
     comparison_mode: syslens_protocol::ComparisonMode,
 ) -> Result<StorageDiagnosis, String> {
     let (cs, ce) = match comparison_mode {
+        syslens_protocol::ComparisonMode::PreviousDay => {
+            (start - Duration::days(1), end - Duration::days(1))
+        }
         syslens_protocol::ComparisonMode::PreviousWeek => {
             (start - Duration::days(7), end - Duration::days(7))
         }
@@ -4791,6 +4801,10 @@ fn comparison_interval(
     now: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
     match compare {
+        "previous-day" => Ok((
+            current_start - Duration::days(1),
+            current_end - Duration::days(1),
+        )),
         "previous-week" => Ok((
             current_start - Duration::days(7),
             current_end - Duration::days(7),
@@ -7302,6 +7316,21 @@ mod tests {
             (start - Duration::days(7)).to_rfc3339()
         );
         assert_eq!(baseline.comparison.end_utc, start.to_rfc3339());
+        let previous_day = diagnose_memory_window(
+            &path,
+            start,
+            end,
+            syslens_protocol::ComparisonMode::PreviousDay,
+        )
+        .unwrap();
+        assert_eq!(
+            previous_day.comparison.start_utc,
+            (start - Duration::days(1)).to_rfc3339()
+        );
+        assert_eq!(
+            previous_day.comparison.end_utc,
+            (end - Duration::days(1)).to_rfc3339()
+        );
     }
 
     #[test]
