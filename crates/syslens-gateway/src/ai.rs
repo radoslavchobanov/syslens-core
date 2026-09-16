@@ -604,6 +604,53 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
         "used storage",
     ];
     fn mask_free_space_spans(clause: &str, free_space_terms: &[&str]) -> String {
+        fn resource_qualifier_len(text: &str) -> Option<usize> {
+            let prepositions = [" on ", " of ", " in "];
+            let resource_nouns = [
+                "filesystem",
+                "file system",
+                "disk",
+                "mount",
+                "volume",
+                "partition",
+                "drive",
+            ];
+            let mut offset = prepositions.iter().find_map(|preposition| {
+                text.strip_prefix(preposition).map(|_| preposition.len())
+            })?;
+
+            // Keep this grammar deliberately bounded: a qualifier may contain
+            // each of the optional words at most once before one known noun.
+            let mut consumed_optional = [false; 2];
+            for _ in 0..2 {
+                let mut consumed = false;
+                for (index, word) in ["the ", "root "].iter().enumerate() {
+                    if !consumed_optional[index] && text[offset..].starts_with(word) {
+                        consumed_optional[index] = true;
+                        offset += word.len();
+                        consumed = true;
+                        break;
+                    }
+                }
+                if !consumed {
+                    break;
+                }
+            }
+
+            resource_nouns.iter().find_map(|resource| {
+                let end = offset + resource.len();
+                if text[offset..].starts_with(resource)
+                    && text.as_bytes().get(end).is_none_or(|character| {
+                        !character.is_ascii_alphanumeric() && *character != b'_'
+                    })
+                {
+                    Some(end)
+                } else {
+                    None
+                }
+            })
+        }
+
         // Mask the complete resource phrase, not only its terminal words.
         // Otherwise "root filesystem free space" leaves "root filesystem"
         // behind and is incorrectly treated as root used-space evidence.
@@ -694,47 +741,23 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
                         " reduced",
                     ];
                     let mut span_end = end;
-                    let trailing_resource_qualifiers = [
-                        " on root filesystem",
-                        " on root file system",
-                        " on root disk",
-                        " on root mount",
-                        " on root volume",
-                        " on root partition",
-                        " on root drive",
-                        " of root filesystem",
-                        " of root file system",
-                        " of root disk",
-                        " of root mount",
-                        " of root volume",
-                        " of root partition",
-                        " of root drive",
-                        " on the root filesystem",
-                        " on the root file system",
-                        " on the root disk",
-                        " on the root mount",
-                        " on the root volume",
-                        " on the root partition",
-                        " on the root drive",
-                        " of the root filesystem",
-                        " of the root file system",
-                        " of the root disk",
-                        " of the root mount",
-                        " of the root volume",
-                        " of the root partition",
-                        " of the root drive",
-                    ];
-                    if let Some(qualifier) = trailing_resource_qualifiers
-                        .iter()
-                        .find(|qualifier| clause[end..].starts_with(*qualifier))
-                    {
-                        span_end += qualifier.len();
-                    }
-                    if let Some(suffix) = suffixes
-                        .iter()
-                        .find(|suffix| clause[span_end..].starts_with(*suffix))
-                    {
-                        span_end += suffix.len();
+                    // A resource qualifier can occur before or after the
+                    // direction suffix ("free space on disk decreased" and
+                    // "free space decreased on disk"). At most one of each
+                    // is consumed, keeping masking bounded to this grammar.
+                    for _ in 0..2 {
+                        let previous_end = span_end;
+                        if let Some(qualifier_end) = resource_qualifier_len(&clause[span_end..]) {
+                            span_end += qualifier_end;
+                        } else if let Some(suffix) = suffixes
+                            .iter()
+                            .find(|suffix| clause[span_end..].starts_with(*suffix))
+                        {
+                            span_end += suffix.len();
+                        }
+                        if span_end == previous_end {
+                            break;
+                        }
                     }
                     spans.push((span_start, span_end));
                 }
@@ -1214,6 +1237,34 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "Storage increased while free space of root filesystem decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while free space on the filesystem decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while free space in the root disk decreased.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while free space decreased on filesystem.",
+                &positive_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage increased while available storage on the disk decreased.",
                 &positive_facts
             )
             .is_none()
