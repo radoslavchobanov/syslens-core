@@ -4546,11 +4546,15 @@ pub fn diagnose_storage_windows(
                             ORDER BY allocated_bytes DESC, path ASC
                         ) AS directory_rank
                  FROM directory_rows
+             ), bounded AS (
+                 SELECT mount_id, root, path, allocated_bytes, apparent_bytes, started_at,
+                        COUNT(*) OVER () > ?4 AND root = '/' AS root_priority
+                 FROM ranked
+                 WHERE directory_rank <= ?3
              )
              SELECT mount_id, root, path, allocated_bytes, apparent_bytes, started_at
-             FROM ranked
-             WHERE directory_rank <= ?3
-             ORDER BY allocated_bytes DESC, path ASC
+             FROM bounded
+             ORDER BY root_priority DESC, allocated_bytes DESC, path ASC
              LIMIT ?4",
         )
         .map_err(|e| e.to_string())?;
@@ -6607,6 +6611,112 @@ mod tests {
                 .count(),
             CURRENT_DIRECTORY_SNAPSHOT_PER_ROOT_MOUNT_LIMIT as usize
         );
+    }
+
+    #[test]
+    fn storage_snapshot_prioritizes_root_before_total_cap() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        let mut mounts = vec![MountSample {
+            timestamp: now - 60,
+            mount_id: "root-mount".into(),
+            mount_point: "/".into(),
+            fs_type: "ext4".into(),
+            total_bytes: Some(100),
+            free_bytes: Some(40),
+            used_bytes: Some(60),
+            total_inodes: None,
+            free_inodes: None,
+            read_only: false,
+            capability: "available".into(),
+        }];
+        for mount_index in 0..9 {
+            mounts.push(MountSample {
+                timestamp: now - 60,
+                mount_id: format!("data-mount-{mount_index}"),
+                mount_point: format!("/data-{mount_index}"),
+                fs_type: "ext4".into(),
+                total_bytes: Some(100),
+                free_bytes: Some(40),
+                used_bytes: Some(60),
+                total_inodes: None,
+                free_inodes: None,
+                read_only: false,
+                capability: "available".into(),
+            });
+        }
+        insert_mounts(&mut c, &mounts).unwrap();
+
+        insert_scan(
+            &mut c,
+            &ScanResult {
+                root: "/".into(),
+                mount_id: Some("root-mount".into()),
+                started_at: now - 60,
+                ended_at: now - 60,
+                status: "complete".into(),
+                reason: None,
+                entries_seen: 1,
+                directories: vec![DirectorySample {
+                    path: "/root-only".into(),
+                    allocated_bytes: 1,
+                    apparent_bytes: 1,
+                    entry_count: 1,
+                    file_count: 1,
+                }],
+            },
+        )
+        .unwrap();
+        for mount_index in 0..9 {
+            let directories = (0..32)
+                .map(|directory_index| DirectorySample {
+                    path: format!("/data-{mount_index}/entry-{directory_index:02}"),
+                    allocated_bytes: 10_000 - directory_index,
+                    apparent_bytes: 10_000 - directory_index,
+                    entry_count: 1,
+                    file_count: 1,
+                })
+                .collect();
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: format!("/data-{mount_index}"),
+                    mount_id: Some(format!("data-mount-{mount_index}")),
+                    started_at: now - 60,
+                    ended_at: now - 60,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 32,
+                    directories,
+                },
+            )
+            .unwrap();
+        }
+
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(
+            out.current_directory_snapshot.len(),
+            CURRENT_DIRECTORY_SNAPSHOT_TOTAL_LIMIT as usize
+        );
+        assert_eq!(out.current_directory_snapshot[0].root, "/");
+        assert_eq!(out.current_directory_snapshot[0].path, "/root-only");
+        assert!(
+            out.current_directory_snapshot
+                .iter()
+                .any(|entry| entry.mount_id == "root-mount" && entry.path == "/root-only")
+        );
+        for mount_index in 0..9 {
+            let mount_id = format!("data-mount-{mount_index}");
+            assert!(
+                out.current_directory_snapshot
+                    .iter()
+                    .filter(|entry| entry.mount_id == mount_id)
+                    .count()
+                    <= CURRENT_DIRECTORY_SNAPSHOT_PER_ROOT_MOUNT_LIMIT as usize
+            );
+        }
     }
 
     #[test]
