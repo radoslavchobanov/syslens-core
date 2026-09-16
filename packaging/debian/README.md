@@ -66,7 +66,8 @@ deletes the old user config or database. Disable only the system units with
 commands continue to manage only user services.
 System commands use the packaged `/usr/bin/syslens-diagnosis` binary by
 default; `--binary` is allowed only for a root-owned executable that is not
-group/world writable.
+group/world writable and whose ancestor directories are real, root-owned, and
+not group/world writable.
 
 For `enable-system-api`, install the configured certificate, key, and gateway
 CA as regular root-owned mode-`0600` files under a root-owned mode-`0700`

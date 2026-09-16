@@ -522,6 +522,19 @@ pub fn system_api_service_path() -> PathBuf {
 /// execute it. The package path is root-owned; custom paths must meet the same
 /// ownership and mode requirements.
 pub fn validate_system_binary(path: &Path) -> Result<(), String> {
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(format!(
+            "system binary {} must be an absolute path without . or .. components",
+            path.display()
+        ));
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| format!("cannot inspect system binary {}: {e}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -550,6 +563,46 @@ pub fn validate_system_binary(path: &Path) -> Result<(), String> {
             path.display(),
             mode
         ));
+    }
+    let mut ancestor = path
+        .parent()
+        .ok_or_else(|| format!("system binary {} has no parent directory", path.display()))?;
+    loop {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|e| {
+            format!(
+                "cannot inspect system binary directory {}: {e}",
+                ancestor.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "system binary directory {} must be a real directory",
+                ancestor.display()
+            ));
+        }
+        if metadata.uid() != 0 {
+            return Err(format!(
+                "system binary directory {} must be owned by root",
+                ancestor.display()
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "system binary directory {} is group/world writable (mode {:o})",
+                ancestor.display(),
+                mode
+            ));
+        }
+        if ancestor == Path::new("/") {
+            break;
+        }
+        ancestor = ancestor.parent().ok_or_else(|| {
+            format!(
+                "system binary directory {} has no root ancestor",
+                ancestor.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -5515,8 +5568,12 @@ mod tests {
         let binary = d.path().join("syslens-diagnosis");
         fs::write(&binary, b"#!/bin/sh\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        // Even a root-owned executable is unsafe when an untrusted parent can
+        // replace it after the unit is installed.
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o777)).unwrap();
         if fs::metadata(&binary).unwrap().uid() == 0 {
-            validate_system_binary(&binary).unwrap();
+            let error = validate_system_binary(&binary).unwrap_err();
+            assert!(error.contains("directory"));
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o775)).unwrap();
             assert!(validate_system_binary(&binary).is_err());
         } else {

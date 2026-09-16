@@ -388,8 +388,9 @@ sudo syslens-diagnosis disable-system
 
 System enable commands execute `/usr/bin/syslens-diagnosis` by default. A
 custom `--binary` is accepted only when it is a root-owned, executable,
-non-group/world-writable regular file; the command never persists an unchecked
-user-owned `current_exe`.
+non-group/world-writable regular file whose ancestor directories are also
+real, root-owned, and non-group/world-writable; the command never persists an
+unchecked user-owned `current_exe`.
 
 The optional mTLS API is a separate root unit and remains disabled until its
 `[api]` section has `enabled = true` and absolute certificate, key, and trusted
