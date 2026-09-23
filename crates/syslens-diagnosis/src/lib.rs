@@ -1274,6 +1274,20 @@ pub fn request_storage_scan(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Atomically reserve a due storage scan for the daemon.
+///
+/// The compare-and-set prevents a scan request written after the daemon's
+/// previous read from being overwritten by a stale scheduling update.
+pub fn claim_storage_scan(conn: &Connection, now: i64, scheduled_at: i64) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE metadata SET value=? WHERE key='next_storage_scan' AND CAST(value AS INTEGER) <= ?",
+            params![scheduled_at, now],
+        )
+        .map_err(|e| format!("cannot reserve storage scan: {e}"))?;
+    Ok(changed == 1)
+}
+
 pub fn initialize_db(path: &Path, config: &Config) -> Result<Connection, String> {
     let conn = open_db(path)?;
     conn.execute("INSERT INTO metadata(key,value) VALUES('interval_seconds',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [config.interval_seconds.to_string()]).map_err(|e| e.to_string())?;
@@ -6110,6 +6124,34 @@ mod tests {
             .unwrap();
         assert_eq!(next, "0");
         assert_eq!(scan_count, 0);
+    }
+
+    #[test]
+    fn storage_scan_claim_does_not_overwrite_a_future_or_stale_schedule() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let conn = open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES('next_storage_scan','200')",
+            [],
+        )
+        .unwrap();
+
+        assert!(!claim_storage_scan(&conn, 100, 300).unwrap());
+        conn.execute(
+            "UPDATE metadata SET value='0' WHERE key='next_storage_scan'",
+            [],
+        )
+        .unwrap();
+        assert!(claim_storage_scan(&conn, 100, 300).unwrap());
+        let next: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='next_storage_scan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, "300");
     }
 
     #[test]

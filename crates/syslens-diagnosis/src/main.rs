@@ -725,6 +725,11 @@ fn daemon(config: PathBuf, database: Option<PathBuf>, system: bool) -> Result<()
     let cfg = diagnosis::load_config(&config)?;
     let _lock = diagnosis::acquire_writer_lock(&diagnosis::state_dir_for_database(&config, &db))?;
     let mut conn = diagnosis::initialize_db(&db, &cfg)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(key,value) VALUES('next_storage_scan','0')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     let collector = diagnosis::Collector::new(PathBuf::from("/proc"));
     let mut scan_worker: Option<thread::JoinHandle<()>> = None;
     loop {
@@ -808,16 +813,14 @@ fn daemon(config: PathBuf, database: Option<PathBuf>, system: bool) -> Result<()
                     eprintln!("syslens-diagnosis: mount gap write failed: {e}")
                 }
             }
-            let next_scan: i64 = conn
-                .query_row(
-                    "SELECT value FROM metadata WHERE key='next_storage_scan'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            if diagnosis::unix_now() >= next_scan && scan_worker.is_none() {
+            if scan_worker.is_none() {
+                let schedule_now = diagnosis::unix_now();
+                let scheduled_at = schedule_now + cfg.storage.scan_interval_seconds as i64;
+                let claimed = diagnosis::claim_storage_scan(&conn, schedule_now, scheduled_at)?;
+                if !claimed {
+                    thread::sleep(Duration::from_secs(cfg.interval_seconds));
+                    continue;
+                }
                 let planned: Vec<_> = if let Some(roots) = cfg.storage.roots.clone() {
                     roots
                         .into_iter()
@@ -881,7 +884,6 @@ fn daemon(config: PathBuf, database: Option<PathBuf>, system: bool) -> Result<()
                         }
                     }
                 }));
-                conn.execute("INSERT INTO metadata(key,value) VALUES('next_storage_scan',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[(diagnosis::unix_now()+cfg.storage.scan_interval_seconds as i64).to_string()]).map_err(|e| e.to_string())?;
                 diagnosis::secure_database_files(&db)?;
             }
         } else {
