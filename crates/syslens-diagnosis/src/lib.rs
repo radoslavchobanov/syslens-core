@@ -37,6 +37,7 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 const CONTROL_HEADROOM: u64 = 64 * 1024 * 1024;
 const CURRENT_DIRECTORY_SNAPSHOT_PER_ROOT_MOUNT_LIMIT: i64 = 32;
 const CURRENT_DIRECTORY_SNAPSHOT_TOTAL_LIMIT: i64 = 256;
+const STORAGE_DIRECTORY_DETAILS_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -4415,7 +4416,7 @@ pub fn diagnose_memory_windows(
         limitations,
     })
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StorageDiagnosis {
     pub version: u32,
     pub status: String,
@@ -4423,16 +4424,20 @@ pub struct StorageDiagnosis {
     pub comparison: StorageInterval,
     pub mounts: Vec<MountFinding>,
     pub directories: Vec<DirectoryFinding>,
+    /// Positive directory deltas at every retained scan depth. Unlike
+    /// `directories`, these overlap and must never be summed for attribution.
+    #[serde(default)]
+    pub directory_details: Vec<DirectoryFinding>,
     pub current_directory_snapshot: Vec<CurrentDirectorySnapshot>,
     pub path_attribution_status: String,
     pub limitations: Vec<String>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StorageInterval {
     pub start_utc: String,
     pub end_utc: String,
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MountFinding {
     pub mount_id: String,
     pub mount_point: String,
@@ -4443,7 +4448,7 @@ pub struct MountFinding {
     pub attributable_bytes: i64,
     pub unexplained_bytes: i64,
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DirectoryFinding {
     pub mount_id: String,
     pub root: String,
@@ -4451,7 +4456,7 @@ pub struct DirectoryFinding {
     pub allocated_bytes_change: i64,
     pub apparent_bytes_change: i64,
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CurrentDirectorySnapshot {
     pub mount_id: String,
     pub root: String,
@@ -4662,27 +4667,6 @@ pub fn diagnose_storage_windows(
     let mut mounts: Vec<_> = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    if mounts.is_empty() {
-        limits
-            .push("No comparable available mount-capacity samples exist in both intervals.".into());
-        return Ok(StorageDiagnosis {
-            version: 1,
-            status: "insufficient evidence".into(),
-            current: StorageInterval {
-                start_utc: fmt(start),
-                end_utc: fmt(end),
-            },
-            comparison: StorageInterval {
-                start_utc: fmt(cs),
-                end_utc: fmt(ce),
-            },
-            mounts: vec![],
-            directories: vec![],
-            current_directory_snapshot,
-            path_attribution_status: "unavailable".into(),
-            limitations: limits,
-        });
-    }
     // Apply the same grouped-latest strategy to directory scans.  A scan is
     // identified by its root and stable mount identity; never pair scans from
     // different mount identities just because their paths match.
@@ -4702,8 +4686,10 @@ pub fn diagnose_storage_windows(
                  GROUP BY root, mount_id
              )
              SELECT current.mount_id, current.root, current_directory.path,
-                    current_directory.allocated_bytes - comparison_directory.allocated_bytes,
-                    current_directory.apparent_bytes - comparison_directory.apparent_bytes
+                    current_directory.allocated_bytes -
+                        COALESCE(comparison_directory.allocated_bytes, 0),
+                    current_directory.apparent_bytes -
+                        COALESCE(comparison_directory.apparent_bytes, 0)
              FROM current_latest
              JOIN storage_scans AS current
                ON current.root = current_latest.root
@@ -4718,10 +4704,12 @@ pub fn diagnose_storage_windows(
                ON comparison.root = comparison_latest.root
               AND comparison.mount_id = comparison_latest.mount_id
               AND comparison.started_at = comparison_latest.started_at
-             JOIN directory_samples AS comparison_directory
+             LEFT JOIN directory_samples AS comparison_directory
                ON comparison_directory.scan_id = comparison.id
               AND comparison_directory.path = current_directory.path
-             ORDER BY 4 DESC LIMIT 200",
+             ORDER BY 4 DESC, current_directory.path ASC,
+                      current.mount_id ASC, current.root ASC
+             LIMIT ?5",
         )
         .map_err(|e| e.to_string())?;
     let r = dstmt
@@ -4730,7 +4718,8 @@ pub fn diagnose_storage_windows(
                 start.timestamp(),
                 end.timestamp(),
                 cs.timestamp(),
-                ce.timestamp()
+                ce.timestamp(),
+                STORAGE_DIRECTORY_DETAILS_LIMIT as i64,
             ],
             |x| {
                 Ok(DirectoryFinding {
@@ -4749,6 +4738,42 @@ pub fn diagnose_storage_windows(
         .into_iter()
         .filter(|x| x.allocated_bytes_change > 0)
         .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .allocated_bytes_change
+            .cmp(&left.allocated_bytes_change)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.mount_id.cmp(&right.mount_id))
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    let directory_details: Vec<_> = candidates
+        .iter()
+        .filter(|finding| finding.path != finding.root)
+        .take(STORAGE_DIRECTORY_DETAILS_LIMIT)
+        .cloned()
+        .collect();
+    if mounts.is_empty() {
+        limits
+            .push("No comparable available mount-capacity samples exist in both intervals.".into());
+        return Ok(StorageDiagnosis {
+            version: 1,
+            status: "insufficient evidence".into(),
+            current: StorageInterval {
+                start_utc: fmt(start),
+                end_utc: fmt(end),
+            },
+            comparison: StorageInterval {
+                start_utc: fmt(cs),
+                end_utc: fmt(ce),
+            },
+            mounts: vec![],
+            directories: vec![],
+            directory_details,
+            current_directory_snapshot,
+            path_attribution_status: "unavailable".into(),
+            limitations: limits,
+        });
+    }
     // Each retained directory includes its descendants.  Reporting only direct
     // children of a scan root avoids double counting parent and child totals.
     candidates.retain(|d| {
@@ -4817,6 +4842,7 @@ pub fn diagnose_storage_windows(
         },
         mounts,
         directories,
+        directory_details,
         current_directory_snapshot,
         path_attribution_status: path_attribution_status.into(),
         limitations: limits,
@@ -4846,6 +4872,14 @@ pub fn render_storage_diagnosis(d: &StorageDiagnosis) -> String {
         s.push_str(&format!(
             "- Directory {}: {:+} MiB allocated\n",
             x.path,
+            x.allocated_bytes_change / 1048576
+        ));
+    }
+    for x in &d.directory_details {
+        s.push_str(&format!(
+            "- Directory detail {} (root {}): {:+} MiB allocated\n",
+            x.path,
+            x.root,
             x.allocated_bytes_change / 1048576
         ));
     }
@@ -6366,6 +6400,179 @@ mod tests {
     }
 
     #[test]
+    fn storage_diagnosis_exposes_recursive_details_without_double_counting() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        let mib = 1024_i64 * 1024;
+        for (time, used, sizes) in [
+            (
+                now - 7 * 86400 - 60,
+                10_i64 * GIB as i64,
+                [Some(0_i64), Some(0_i64), None],
+            ),
+            (
+                now - 60,
+                10_i64 * GIB as i64 + 100 * mib,
+                [Some(90_i64 * mib), Some(80_i64 * mib), Some(70_i64 * mib)],
+            ),
+        ] {
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp: time,
+                    mount_id: "root-mount".into(),
+                    mount_point: "/".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(100 * GIB as i64),
+                    free_bytes: Some(100 * GIB as i64 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/".into(),
+                    mount_id: Some("root-mount".into()),
+                    started_at: time,
+                    ended_at: time,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 3,
+                    directories: ["/var", "/var/lib", "/var/lib/docker"]
+                        .into_iter()
+                        .zip(sizes)
+                        .filter_map(|(path, size)| {
+                            size.map(|size| DirectorySample {
+                                path: path.into(),
+                                allocated_bytes: size,
+                                apparent_bytes: size,
+                                entry_count: 1,
+                                file_count: 1,
+                            })
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        }
+
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.directories.len(), 1);
+        assert_eq!(out.directories[0].path, "/var");
+        assert_eq!(out.mounts[0].attributable_bytes, 90 * mib);
+        assert_eq!(out.mounts[0].unexplained_bytes, 10 * mib);
+        assert_eq!(
+            out.directory_details
+                .iter()
+                .map(|finding| finding.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/var", "/var/lib", "/var/lib/docker"]
+        );
+        assert!(
+            render_storage_diagnosis(&out)
+                .contains("Directory detail /var/lib/docker (root /): +70 MiB allocated")
+        );
+    }
+
+    #[test]
+    fn storage_directory_details_are_bounded_and_deterministically_sorted() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (time, used, current) in [
+            (now - 7 * 86400 - 60, 1_000_i64, false),
+            (now - 60, 1_000_000_i64, true),
+        ] {
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp: time,
+                    mount_id: "m".into(),
+                    mount_point: "/data".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(2_000_000),
+                    free_bytes: Some(2_000_000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+            let directories = (0..205)
+                .rev()
+                .map(|index| DirectorySample {
+                    path: format!("/data/entry-{index:03}"),
+                    allocated_bytes: if current { 10_000 - index / 2 } else { 0 },
+                    apparent_bytes: if current { 10_000 - index / 2 } else { 0 },
+                    entry_count: 1,
+                    file_count: 1,
+                })
+                .collect();
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/data".into(),
+                    mount_id: Some("m".into()),
+                    started_at: time,
+                    ended_at: time,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 205,
+                    directories,
+                },
+            )
+            .unwrap();
+        }
+
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.directory_details.len(), STORAGE_DIRECTORY_DETAILS_LIMIT);
+        assert_eq!(out.directory_details[0].path, "/data/entry-000");
+        assert_eq!(out.directory_details[1].path, "/data/entry-001");
+        assert!(out.directory_details.windows(2).all(|pair| {
+            pair[0].allocated_bytes_change > pair[1].allocated_bytes_change
+                || (pair[0].allocated_bytes_change == pair[1].allocated_bytes_change
+                    && pair[0].path <= pair[1].path)
+        }));
+    }
+
+    #[test]
+    fn storage_diagnosis_deserializes_legacy_response_without_directory_details() {
+        let mut value = serde_json::to_value(StorageDiagnosis {
+            version: 1,
+            status: "insufficient evidence".into(),
+            current: StorageInterval {
+                start_utc: "2026-01-01T00:00:00Z".into(),
+                end_utc: "2026-01-01T01:00:00Z".into(),
+            },
+            comparison: StorageInterval {
+                start_utc: "2025-12-31T00:00:00Z".into(),
+                end_utc: "2025-12-31T01:00:00Z".into(),
+            },
+            mounts: vec![],
+            directories: vec![],
+            directory_details: vec![],
+            current_directory_snapshot: vec![],
+            path_attribution_status: "unavailable".into(),
+            limitations: vec![],
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("directory_details");
+
+        let decoded: StorageDiagnosis = serde_json::from_value(value).unwrap();
+        assert!(decoded.directory_details.is_empty());
+    }
+
+    #[test]
     fn storage_diagnosis_returns_current_snapshot_without_comparable_history() {
         let d = tempdir().unwrap();
         let path = d.path().join("x.sqlite");
@@ -6460,6 +6667,44 @@ mod tests {
                 .iter()
                 .all(|limitation| !limitation.contains("No complete current directory snapshot"))
         );
+    }
+
+    #[test]
+    fn insufficient_storage_diagnosis_keeps_comparable_recursive_details() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (time, size) in [(now - 7 * 86400 - 60, 10_i64), (now - 60, 30_i64)] {
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/".into(),
+                    mount_id: Some("root-mount".into()),
+                    started_at: time,
+                    ended_at: time,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: 1,
+                    directories: vec![DirectorySample {
+                        path: "/var/lib/docker".into(),
+                        allocated_bytes: size,
+                        apparent_bytes: size,
+                        entry_count: 1,
+                        file_count: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.status, "insufficient evidence");
+        assert!(out.mounts.is_empty());
+        assert!(out.directories.is_empty());
+        assert_eq!(out.directory_details.len(), 1);
+        assert_eq!(out.directory_details[0].path, "/var/lib/docker");
+        assert_eq!(out.directory_details[0].allocated_bytes_change, 20);
     }
 
     #[test]

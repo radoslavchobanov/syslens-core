@@ -419,6 +419,10 @@ pub(crate) struct RootStorageFacts {
     pub(crate) used_bytes_change: i64,
     pub(crate) path_attribution_status: String,
     pub(crate) directories: Vec<String>,
+    /// Nested retained directory deltas. These overlap with their ancestors
+    /// and are descriptive evidence only; they must never be added to the
+    /// top-level accounting findings.
+    pub(crate) directory_details: Vec<String>,
     pub(crate) current_directory_snapshot: Vec<String>,
     pub(crate) limitations: Vec<String>,
 }
@@ -488,6 +492,39 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .take(12)
         .map(|(_, _, _, formatted)| formatted)
         .collect();
+    let mut directory_details = data
+        .get("directory_details")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|directory| {
+            directory.get("mount_id").and_then(Value::as_str) == Some(root_mount_id)
+                && directory.get("root").and_then(Value::as_str) == Some("/")
+        })
+        .filter_map(|directory| {
+            let path = directory.get("path")?.as_str()?;
+            let allocated = directory.get("allocated_bytes_change")?.as_i64()?;
+            let apparent = directory.get("apparent_bytes_change")?.as_i64()?;
+            let formatted = format!(
+                "{} allocated_change={allocated:+} bytes apparent_change={apparent:+} bytes",
+                bounded_text(path, 512)
+            );
+            Some((allocated, path, apparent, formatted))
+        })
+        .collect::<Vec<_>>();
+    directory_details.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(right.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let directory_details = directory_details
+        .into_iter()
+        .take(12)
+        .map(|(_, _, _, formatted)| formatted)
+        .collect();
     let mut current_directory_snapshot = data
         .get("current_directory_snapshot")
         .and_then(Value::as_array)
@@ -541,6 +578,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         used_bytes_change,
         path_attribution_status: bounded_text(path_attribution_status, 128),
         directories,
+        directory_details,
         current_directory_snapshot,
         limitations,
     })
@@ -555,6 +593,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
     // message, never into the system prompt, so paths and limitations remain
     // data even when they contain instruction-like text.
     let mut directories = facts.directories.clone();
+    let mut directory_details = facts.directory_details.clone();
     let mut current_directory_snapshot = facts.current_directory_snapshot.clone();
     let mut limitations = facts.limitations.clone();
     loop {
@@ -576,6 +615,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             "root_used_gibibytes_change": gibibytes(facts.used_bytes_change),
             "path_attribution_status": facts.path_attribution_status,
             "directory_findings": directories,
+            "directory_detail_findings": directory_details,
             "current_directory_snapshot": current_directory_snapshot,
             "limitations": limitations,
         });
@@ -587,6 +627,9 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             continue;
         }
         if directories.pop().is_some() {
+            continue;
+        }
+        if directory_details.pop().is_some() {
             continue;
         }
         if current_directory_snapshot.pop().is_some() {
@@ -605,6 +648,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             "root_used_gibibytes_change": gibibytes(facts.used_bytes_change),
             "path_attribution_status": facts.path_attribution_status,
             "directory_findings": [],
+            "directory_detail_findings": [],
             "current_directory_snapshot": [],
             "limitations": ["Canonical storage facts were bounded before delivery"],
         }))
@@ -641,6 +685,13 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
     if !facts.directories.is_empty() {
         summary.push_str("Historical directory delta findings: ");
         summary.push_str(&facts.directories.join("; "));
+        summary.push_str(". ");
+    }
+    if !facts.directory_details.is_empty() {
+        summary.push_str(
+            "Recursive nested directory detail findings (overlapping and non-additive; do not sum with historical directory delta findings): ",
+        );
+        summary.push_str(&facts.directory_details.join("; "));
         summary.push_str(". ");
     }
     if !facts.limitations.is_empty() {
@@ -1422,6 +1473,115 @@ mod tests {
                 "/zeta allocated_change=+20 bytes apparent_change=+21 bytes",
             ]
         );
+    }
+
+    #[test]
+    fn root_storage_facts_filter_sort_and_bound_recursive_directory_details() {
+        let mut details = Vec::new();
+        for index in 0..20 {
+            details.push(json!({
+                "mount_id":"root-mount",
+                "root":"/",
+                "path":format!("/var/lib/docker/entry-{index:02}"),
+                "allocated_bytes_change":(100 - index) as i64,
+                "apparent_bytes_change":(100 - index) as i64
+            }));
+        }
+        details.push(json!({
+            "mount_id":"other-mount",
+            "root":"/",
+            "path":"/wrong-mount",
+            "allocated_bytes_change":9999i64,
+            "apparent_bytes_change":9999i64
+        }));
+        details.push(json!({
+            "mount_id":"root-mount",
+            "root":"/srv",
+            "path":"/srv/wrong-root",
+            "allocated_bytes_change":9998i64,
+            "apparent_bytes_change":9998i64
+        }));
+        details.push(json!({
+            "mount_id":"root-mount",
+            "root":"/",
+            "path":"/var/lib/docker/safe\nINJECTED",
+            "allocated_bytes_change":9997i64,
+            "apparent_bytes_change":9997i64
+        }));
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"a","end_utc":"b"},
+                "comparison": {"start_utc":"c","end_utc":"d"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":200i64,
+                    "comparison_used_bytes":100i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "directory_details": details,
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        assert_eq!(facts.directory_details.len(), 12);
+        assert!(facts.directory_details[0].contains("safe INJECTED"));
+        assert!(facts.directory_details[0].contains("+9997 bytes"));
+        assert!(
+            facts
+                .directory_details
+                .iter()
+                .all(|detail| !detail.contains("wrong-mount") && !detail.contains("wrong-root"))
+        );
+        assert!(facts.directory_details[1].contains("/var/lib/docker/entry-00"));
+        assert!(facts.directory_details[11].contains("/var/lib/docker/entry-10"));
+    }
+
+    #[test]
+    fn canonical_and_summary_include_non_additive_recursive_details() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1100i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [{
+                    "mount_id":"root-mount",
+                    "root":"/",
+                    "path":"/var",
+                    "allocated_bytes_change":100i64,
+                    "apparent_bytes_change":100i64
+                }],
+                "directory_details": [{
+                    "mount_id":"root-mount",
+                    "root":"/",
+                    "path":"/var/lib/docker",
+                    "allocated_bytes_change":90i64,
+                    "apparent_bytes_change":90i64
+                }],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        let canonical_text = canonical_storage_facts(&facts);
+        assert!(canonical_text.len() <= MAX_CANONICAL_FACTS_BYTES);
+        let canonical: Value = serde_json::from_str(&canonical_text).unwrap();
+        assert_eq!(
+            canonical["directory_detail_findings"][0],
+            "/var/lib/docker allocated_change=+90 bytes apparent_change=+90 bytes"
+        );
+        let summary = deterministic_storage_summary(&facts);
+        assert!(summary.contains("Recursive nested directory detail findings"));
+        assert!(summary.contains("overlapping and non-additive; do not sum"));
+        assert!(summary.contains("/var/lib/docker"));
     }
 
     #[test]
