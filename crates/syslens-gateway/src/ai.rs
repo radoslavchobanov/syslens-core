@@ -740,6 +740,70 @@ fn gibibytes(bytes: i64) -> f64 {
     bytes as f64 / 1_073_741_824.0
 }
 
+/// The storage fact vectors are deliberately kept as bounded, rendered data
+/// strings at the gateway boundary. These helpers read only the fields that
+/// the gateway itself rendered, so the causal preamble can stay small without
+/// introducing a second unbounded representation of the evidence.
+fn rendered_finding_path(finding: &str) -> &str {
+    if let Some((path, _)) = finding.split_once(" baseline_status=") {
+        return path;
+    }
+    finding
+        .split_once(" allocated_change=")
+        .map(|(path, _)| path)
+        .unwrap_or(finding)
+}
+
+fn rendered_finding_field<'a>(finding: &'a str, field: &str) -> Option<&'a str> {
+    let value = finding.split_once(field)?.1;
+    value.split_whitespace().next()
+}
+
+fn rendered_finding_i64(finding: &str, field: &str) -> Option<i64> {
+    rendered_finding_field(finding, field)?.parse().ok()
+}
+
+fn rendered_file_temporal_status(finding: &str) -> &str {
+    rendered_finding_field(finding, "temporal_status=").unwrap_or("unknown")
+}
+
+fn rendered_file_baseline_status(finding: &str) -> &str {
+    rendered_finding_field(finding, "baseline_status=").unwrap_or("unknown")
+}
+
+fn rendered_file_candidate(finding: &str) -> String {
+    let path = rendered_finding_path(finding);
+    let temporal_status = rendered_file_temporal_status(finding);
+    let baseline_status = rendered_file_baseline_status(finding);
+    let delta = rendered_finding_i64(finding, "allocated_change=")
+        .map(|value| format!("{value:+} bytes"))
+        .unwrap_or_else(|| "unknown bytes".into());
+    format!(
+        "{} (temporal_status={temporal_status}; baseline_status={baseline_status}; allocated_change={delta})",
+        bounded_text(path, 512)
+    )
+}
+
+fn append_file_candidates(
+    summary: &mut String,
+    findings: &[String],
+    temporal_status: &str,
+    heading: &str,
+) {
+    let candidates = findings
+        .iter()
+        .filter(|finding| rendered_file_temporal_status(finding) == temporal_status)
+        .take(3)
+        .map(|finding| rendered_file_candidate(finding))
+        .collect::<Vec<_>>();
+    if !candidates.is_empty() {
+        summary.push_str(heading);
+        summary.push_str(": ");
+        summary.push_str(&candidates.join("; "));
+        summary.push_str(". ");
+    }
+}
+
 pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
     // Keep this as a valid JSON value. It is inserted into a tool/data
     // message, never into the system prompt, so paths and limitations remain
@@ -835,6 +899,87 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
         facts.comparison_end,
         facts.path_attribution_status,
     );
+    summary.push_str("Causal interpretation: ");
+    if let Some(top_directory) = facts.directories.first() {
+        let top_path = rendered_finding_path(top_directory);
+        let top_change = rendered_finding_i64(top_directory, "allocated_change=")
+            .map(|value| format!("{value:+} bytes"))
+            .unwrap_or_else(|| "an unknown allocated delta".into());
+        let direct_child_total = facts
+            .directories
+            .iter()
+            .filter_map(|finding| rendered_finding_i64(finding, "allocated_change="))
+            .map(i128::from)
+            .sum::<i128>();
+        let aggregate_label = if facts.path_attribution_status == "available" {
+            "non-overlapping first-level attribution aggregate"
+        } else {
+            "retained first-level attribution aggregate"
+        };
+        summary.push_str(&format!(
+            "the largest first-level directory attribution is {} ({top_change}); the {aggregate_label} is {direct_child_total:+} bytes against the exact root delta {:+} bytes. ",
+            bounded_text(top_path, 512),
+            facts.used_bytes_change,
+        ));
+        if let Some(top_detail) = facts.directory_details.first() {
+            let detail_path = rendered_finding_path(top_detail);
+            let detail_change = rendered_finding_i64(top_detail, "allocated_change=")
+                .map(|value| format!("{value:+} bytes"))
+                .unwrap_or_else(|| "an unknown allocated delta".into());
+            summary.push_str(&format!(
+                "The largest nested detail is {} ({detail_change}); it is inside the first-level attribution and is not additional growth. ",
+                bounded_text(detail_path, 512),
+            ));
+        }
+    } else {
+        summary.push_str(
+            "no first-level directory attribution is available for this interval; the exact root delta is not explained by path evidence. ",
+        );
+    }
+    if !facts.file_findings.is_empty() {
+        summary.push_str("Sampled-file timing read (descriptive and non-additive): ");
+        append_file_candidates(
+            &mut summary,
+            &facts.file_findings,
+            "current_interval",
+            "current-period candidates; timestamp evidence supports change during the current interval",
+        );
+        append_file_candidates(
+            &mut summary,
+            &facts.file_findings,
+            "comparison_interval",
+            "comparison-period candidates; these are historical context, not current-period causation",
+        );
+        append_file_candidates(
+            &mut summary,
+            &facts.file_findings,
+            "before_comparison",
+            "pre-window candidates; timestamps predate both intervals",
+        );
+        append_file_candidates(
+            &mut summary,
+            &facts.file_findings,
+            "unknown",
+            "timing-unknown candidates; timestamps do not establish when the change occurred",
+        );
+        summary.push_str(
+            "File paths overlap their containing directory and mount totals; never add them to directory attribution. ",
+        );
+        let known = facts
+            .file_findings
+            .iter()
+            .filter(|finding| rendered_file_baseline_status(finding) == "known")
+            .count();
+        let growth_from_zero = facts
+            .file_findings
+            .iter()
+            .filter(|finding| rendered_file_baseline_status(finding) == "growth_from_zero")
+            .count();
+        let unknown = facts.file_findings.len() - known - growth_from_zero;
+        summary.push_str(&format!(
+            "File-baseline confidence: {known} matched comparison sample(s), {growth_from_zero} growth-from-zero candidate(s), and {unknown} candidate(s) with unknown or incomplete baseline; unknown-baseline file deltas are not exact measurements. ",
+        ));
+    }
     if !facts.current_directory_snapshot.is_empty() {
         summary.push_str("Current directory inventory (point-in-time; not growth attribution): ");
         summary.push_str(&facts.current_directory_snapshot.join("; "));
@@ -2122,6 +2267,96 @@ mod tests {
             summary.contains("comparison_interval points to a change during the comparison window")
         );
         assert!(summary.contains("minecraft.qcow2"));
+    }
+
+    #[test]
+    fn deterministic_storage_summary_leads_with_causal_directory_and_file_read() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":2200i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":1200i64
+                }],
+                "directories": [
+                    {"mount_id":"root-mount","root":"/","path":"/var","allocated_bytes_change":1000i64,"apparent_bytes_change":1000i64},
+                    {"mount_id":"root-mount","root":"/","path":"/home","allocated_bytes_change":10i64,"apparent_bytes_change":10i64}
+                ],
+                "directory_details": [{
+                    "mount_id":"root-mount",
+                    "root":"/",
+                    "path":"/var/lib/libvirt/images",
+                    "allocated_bytes_change":900i64,
+                    "apparent_bytes_change":900i64
+                }],
+                "file_findings": [
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/var/lib/libvirt/images/minecraft-rpg.qcow2",
+                        "allocated_bytes_change":900i64,"apparent_bytes_change":900i64,
+                        "current_allocated_bytes":1900i64,"comparison_allocated_bytes":1000i64,
+                        "current_apparent_bytes":1900i64,"comparison_apparent_bytes":1000i64,
+                        "baseline_status":"known","temporal_status":"current_interval"
+                    },
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/home/acemagic/.ollama/blobs/sha256-old",
+                        "allocated_bytes_change":700i64,"apparent_bytes_change":700i64,
+                        "current_allocated_bytes":1700i64,"comparison_allocated_bytes":1000i64,
+                        "current_apparent_bytes":1700i64,"comparison_apparent_bytes":1000i64,
+                        "baseline_status":"known","temporal_status":"comparison_interval"
+                    },
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/var/lib/old.img",
+                        "allocated_bytes_change":500i64,"apparent_bytes_change":500i64,
+                        "current_allocated_bytes":1500i64,"comparison_allocated_bytes":1000i64,
+                        "current_apparent_bytes":1500i64,"comparison_apparent_bytes":1000i64,
+                        "baseline_status":"known","temporal_status":"before_comparison"
+                    },
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/var/lib/unknown.img",
+                        "allocated_bytes_change":400i64,"apparent_bytes_change":400i64,
+                        "current_allocated_bytes":400i64,"comparison_allocated_bytes":0i64,
+                        "current_apparent_bytes":400i64,"comparison_apparent_bytes":0i64,
+                        "baseline_status":"unknown","temporal_status":"unknown"
+                    }
+                ],
+                "path_attribution_status":"available",
+                "limitations":["File sample is bounded"]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        let summary = deterministic_storage_summary(&facts);
+
+        assert!(
+            summary.contains("largest first-level directory attribution is /var (+1000 bytes)")
+        );
+        assert!(summary.contains(
+            "non-overlapping first-level attribution aggregate is +1010 bytes against the exact root delta +1200 bytes"
+        ));
+        assert!(summary.contains(
+            "largest nested detail is /var/lib/libvirt/images (+900 bytes); it is inside the first-level attribution and is not additional growth"
+        ));
+        assert!(summary.contains(
+            "current-period candidates; timestamp evidence supports change during the current interval"
+        ));
+        assert!(summary.contains(
+            "/var/lib/libvirt/images/minecraft-rpg.qcow2 (temporal_status=current_interval; baseline_status=known; allocated_change=+900 bytes)"
+        ));
+        assert!(summary.contains(
+            "comparison-period candidates; these are historical context, not current-period causation"
+        ));
+        assert!(summary.contains("temporal_status=comparison_interval"));
+        assert!(summary.contains("pre-window candidates; timestamps predate both intervals"));
+        assert!(summary.contains(
+            "timing-unknown candidates; timestamps do not establish when the change occurred"
+        ));
+        assert!(summary.contains(
+            "File-baseline confidence: 3 matched comparison sample(s), 0 growth-from-zero candidate(s), and 1 candidate(s) with unknown or incomplete baseline"
+        ));
+        assert!(summary.contains("File paths overlap their containing directory and mount totals; never add them to directory attribution."));
     }
 
     #[test]
