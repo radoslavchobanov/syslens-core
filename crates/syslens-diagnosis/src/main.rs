@@ -202,10 +202,14 @@ fn service(args: &[&str]) -> Result<(), String> {
     }
 }
 fn require_root(operation: &str) -> Result<(), String> {
+    let command = operation.replace('_', "-");
+    require_root_with_command(operation, &command)
+}
+fn require_root_with_command(operation: &str, command: &str) -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(format!(
             "{operation} requires root; run `sudo syslens-diagnosis {}` (user services are unchanged)",
-            operation.replace('_', "-")
+            command
         ));
     }
     Ok(())
@@ -237,9 +241,12 @@ fn scan_storage(
 ) -> Result<(), String> {
     let system_config = diagnosis::system_config_path();
     let system_database = diagnosis::system_database_path();
+    let system_database_requested = database
+        .as_ref()
+        .is_some_and(|path| path == &system_database);
     let database_was_explicit = database.is_some();
     let config = config.unwrap_or_else(|| {
-        if system {
+        if system || system_database_requested {
             system_config.clone()
         } else {
             diagnosis::config_path()
@@ -248,7 +255,7 @@ fn scan_storage(
     let database = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
     let system_mode = system || config == system_config || database == system_database;
     if system_mode {
-        require_root("scan-storage")?;
+        require_root_with_command("scan-storage --system", "scan-storage --system")?;
         diagnosis::validate_config_permissions(&config)?;
     } else if !database_was_explicit && !config.exists() {
         return Err(format!(

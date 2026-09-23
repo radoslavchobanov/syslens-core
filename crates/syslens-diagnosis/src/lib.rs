@@ -1270,6 +1270,7 @@ pub fn request_storage_scan(path: &Path) -> Result<(), String> {
     .map_err(|e| format!("cannot request storage scan: {e}"))?;
     tx.commit()
         .map_err(|e| format!("cannot commit storage scan request: {e}"))?;
+    secure_database_files(path)?;
     Ok(())
 }
 
