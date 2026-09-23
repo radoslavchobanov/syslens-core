@@ -14,6 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
+    time::Duration,
 };
 use syslens_gateway::{
     ai::ChatRequest,
@@ -396,6 +397,11 @@ async fn inferred_storage_uses_bounded_facts_only_model_request() {
             let calls = calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
+                // The generic AI timeout is intentionally one second in this
+                // test. Storage inference must use its dedicated transport
+                // client, whose 20-second bound allows this bounded local
+                // completion to finish.
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 assert!(body["tools"].is_null());
                 assert!(body["tool_choice"].is_null());
                 assert_eq!(body["temperature"], 0);
@@ -419,6 +425,7 @@ async fn inferred_storage_uses_bounded_facts_only_model_request() {
     let mut config = app_config(&f);
     config.ai.enabled = true;
     config.ai.allow_insecure_http = true;
+    config.ai.request_timeout_seconds = 1;
     config.ai.endpoint_url = format!("http://{address}/v1/chat/completions");
     config.ai.model = "test-model".into();
     let app = App::new(config).unwrap();

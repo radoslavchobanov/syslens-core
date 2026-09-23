@@ -258,6 +258,11 @@ pub fn tools() -> Value {
 #[derive(Clone)]
 pub struct Model {
     client: reqwest::Client,
+    // Storage inference has a deliberately larger transport timeout than the
+    // general tool loop.  The latter is tuned for interactive requests and
+    // may be set as low as five seconds; a local model can legitimately need
+    // a few more seconds to interpret the already-bounded facts.
+    storage_client: reqwest::Client,
     config: Ai,
 }
 impl Model {
@@ -266,13 +271,22 @@ impl Model {
             return Err("AI is disabled; deterministic diagnosis remains available".into());
         }
         crate::config::endpoint(&c.endpoint_url, c.allow_insecure_http)?;
+        let client = client::tls_client(
+            c.ca.as_deref(),
+            c.client_cert.as_deref(),
+            c.client_key.as_deref(),
+            c.request_timeout_seconds,
+        )?;
+        let storage_client = client::tls_client(
+            c.ca.as_deref(),
+            c.client_cert.as_deref(),
+            c.client_key.as_deref(),
+            c.request_timeout_seconds
+                .max(STORAGE_COMPLETION_TIMEOUT.as_secs()),
+        )?;
         Ok(Self {
-            client: client::tls_client(
-                c.ca.as_deref(),
-                c.client_cert.as_deref(),
-                c.client_key.as_deref(),
-                c.request_timeout_seconds,
-            )?,
+            client,
+            storage_client,
             config: c.clone(),
         })
     }
@@ -366,7 +380,7 @@ impl Model {
         let response = tokio::time::timeout(
             STORAGE_COMPLETION_TIMEOUT,
             self.authenticated(
-                self.client
+                self.storage_client
                     .post(&self.config.endpoint_url)
                     .timeout(STORAGE_COMPLETION_TIMEOUT)
                     .json(&payload),
@@ -380,10 +394,16 @@ impl Model {
             return Err("AI endpoint rejected the storage request".into());
         }
         let value = client::bounded_json(response).await?;
-        let content = value["choices"]
+        let message = value["choices"]
             .as_array()
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice["message"]["content"].as_str())
+            .and_then(|choice| choice.get("message"))
+            .ok_or("storage model returned no assistant message")?;
+        if message["role"].as_str() != Some("assistant") {
+            return Err("invalid storage model message role".into());
+        }
+        let content = message["content"]
+            .as_str()
             .map(str::trim)
             .filter(|content| !content.is_empty())
             .ok_or("storage model returned no bounded answer")?;
