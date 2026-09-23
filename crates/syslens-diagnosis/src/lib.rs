@@ -4669,9 +4669,62 @@ pub struct FileFinding {
     pub current_ctime_utc: Option<String>,
     #[serde(default)]
     pub comparison_ctime_utc: Option<String>,
+    /// Coarse timestamp evidence for when this sampled file was created or
+    /// changed relative to the requested windows. This is not process
+    /// attribution and must not be read as proof of causation.
+    ///
+    /// Values are `current_interval`, `comparison_interval`,
+    /// `before_comparison`, or `unknown`. The field is additive so older
+    /// gateway responses deserialize as `unknown`.
+    #[serde(default = "default_file_temporal_status")]
+    pub temporal_status: String,
 }
 fn default_file_baseline_status() -> String {
     "unknown".into()
+}
+fn default_file_temporal_status() -> String {
+    "unknown".into()
+}
+
+/// Classify the available file timestamps against the selected windows.
+///
+/// A file can have an mtime and ctime in different windows, so current-window
+/// evidence takes precedence, followed by comparison-window evidence. This
+/// keeps a recent ctime (for example, a permission or ownership change) from
+/// being hidden by an older mtime. A timestamp in the gap between non-adjacent
+/// windows is deliberately `unknown`: it does not establish either interval.
+fn classify_file_temporal_status(
+    timestamps: [Option<i64>; 4],
+    start: i64,
+    end: i64,
+    comparison_start: i64,
+    comparison_end: i64,
+) -> &'static str {
+    let in_window = |timestamp: i64, window_start: i64, window_end: i64| {
+        timestamp >= window_start && timestamp <= window_end
+    };
+    if timestamps
+        .iter()
+        .flatten()
+        .any(|timestamp| in_window(*timestamp, start, end))
+    {
+        return "current_interval";
+    }
+    if timestamps
+        .iter()
+        .flatten()
+        .any(|timestamp| in_window(*timestamp, comparison_start, comparison_end))
+    {
+        return "comparison_interval";
+    }
+    if timestamps
+        .iter()
+        .flatten()
+        .any(|timestamp| *timestamp < comparison_start && *timestamp < start)
+    {
+        return "before_comparison";
+    }
+    "unknown"
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CurrentDirectorySnapshot {
@@ -5145,6 +5198,19 @@ pub fn diagnose_storage_windows(
                         .single()
                         .map(|time| time.to_rfc3339())
                 }),
+                temporal_status: classify_file_temporal_status(
+                    [
+                        current_mtime,
+                        comparison_mtime,
+                        current_ctime,
+                        comparison_ctime,
+                    ],
+                    start.timestamp(),
+                    end.timestamp(),
+                    cs.timestamp(),
+                    ce.timestamp(),
+                )
+                .into(),
             },
         )
         .collect();
@@ -5301,10 +5367,11 @@ pub fn render_storage_diagnosis(d: &StorageDiagnosis) -> String {
     }
     for x in &d.file_findings {
         s.push_str(&format!(
-            "- File finding {} (root {}): baseline {}; {:+} MiB allocated, {:+} MiB apparent; current {} allocated / {} apparent bytes (mtime {:?}, ctime {:?})\n",
+            "- File finding {} (root {}): baseline {}; temporal status {}; {:+} MiB allocated, {:+} MiB apparent; current {} allocated / {} apparent bytes (mtime {:?}, ctime {:?})\n",
             x.path,
             x.root,
             x.baseline_status,
+            x.temporal_status,
             x.allocated_bytes_change / 1048576,
             x.apparent_bytes_change / 1048576,
             x.current_allocated_bytes,
@@ -7057,6 +7124,7 @@ mod tests {
         assert_eq!(out.file_findings[0].path, "/var/lib/minecraft.qcow2");
         assert_eq!(out.file_findings[0].comparison_allocated_bytes, 0);
         assert_eq!(out.file_findings[0].allocated_bytes_change, 300);
+        assert_eq!(out.file_findings[0].temporal_status, "current_interval");
         assert!(out.file_findings[0].current_mtime_utc.is_some());
         assert_eq!(out.mounts[0].attributable_bytes, 0);
         assert!(render_storage_diagnosis(&out).contains("File finding /var/lib/minecraft.qcow2"));
@@ -7088,13 +7156,22 @@ mod tests {
                 now - 60,
                 500_i64,
                 "complete",
-                vec![FileSample {
-                    path: "/var/lib/new.img".into(),
-                    allocated_bytes: 300,
-                    apparent_bytes: 300,
-                    mtime: None,
-                    ctime: None,
-                }],
+                vec![
+                    FileSample {
+                        path: "/var/lib/new.img".into(),
+                        allocated_bytes: 300,
+                        apparent_bytes: 300,
+                        mtime: Some(now - 7 * 86400 - 30),
+                        ctime: Some(now - 7 * 86400 - 30),
+                    },
+                    FileSample {
+                        path: "/var/lib/unknown.img".into(),
+                        allocated_bytes: 200,
+                        apparent_bytes: 200,
+                        mtime: None,
+                        ctime: None,
+                    },
+                ],
             ),
         ] {
             insert_mounts(
@@ -7132,14 +7209,70 @@ mod tests {
             .unwrap();
         }
         let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
-        assert_eq!(out.file_findings.len(), 1);
+        assert_eq!(out.file_findings.len(), 2);
         assert_eq!(out.file_findings[0].baseline_status, "unknown");
+        assert_eq!(out.file_findings[0].temporal_status, "comparison_interval");
+        assert_eq!(out.file_findings[1].temporal_status, "unknown");
         assert!(
             out.limitations
                 .iter()
                 .any(|limitation| limitation.contains("unknown comparison baseline"))
         );
         assert!(render_storage_diagnosis(&out).contains("baseline unknown"));
+    }
+
+    #[test]
+    fn file_temporal_status_prioritizes_current_then_comparison_and_marks_old_or_missing() {
+        let current = 1000;
+        let end = 2000;
+        let comparison_start = 0;
+        let comparison_end = 500;
+        assert_eq!(
+            classify_file_temporal_status(
+                [Some(1200), Some(400), None, None],
+                current,
+                end,
+                comparison_start,
+                comparison_end,
+            ),
+            "current_interval"
+        );
+        assert_eq!(
+            classify_file_temporal_status(
+                [Some(400), None, None, None],
+                current,
+                end,
+                comparison_start,
+                comparison_end,
+            ),
+            "comparison_interval"
+        );
+        assert_eq!(
+            classify_file_temporal_status(
+                [Some(-1), None, None, None],
+                current,
+                end,
+                comparison_start,
+                comparison_end,
+            ),
+            "before_comparison"
+        );
+        assert_eq!(
+            classify_file_temporal_status(
+                [Some(700), None, None, None],
+                current,
+                end,
+                comparison_start,
+                comparison_end,
+            ),
+            "unknown"
+        );
+        // With a comparison window after the current window, 700 is in the
+        // gap between them. It is not evidence from before the comparison.
+        assert_eq!(
+            classify_file_temporal_status([Some(700), None, None, None], 0, 500, 1000, 1500,),
+            "unknown"
+        );
     }
 
     #[test]

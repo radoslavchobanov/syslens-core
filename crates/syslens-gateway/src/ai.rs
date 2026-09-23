@@ -630,6 +630,10 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
                 .get("baseline_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let temporal_status = file
+                .get("temporal_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let current_mtime = file
                 .get("current_mtime_utc")
                 .and_then(Value::as_str)
@@ -647,9 +651,10 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             let formatted = format!(
-                "{} baseline_status={} allocated_change={allocated:+} bytes apparent_change={apparent:+} bytes current_allocated={current_allocated} bytes comparison_allocated={comparison_allocated} bytes current_apparent={current_apparent} bytes comparison_apparent={comparison_apparent} bytes current_mtime_utc={} comparison_mtime_utc={} current_ctime_utc={} comparison_ctime_utc={}",
+                "{} baseline_status={} temporal_status={} allocated_change={allocated:+} bytes apparent_change={apparent:+} bytes current_allocated={current_allocated} bytes comparison_allocated={comparison_allocated} bytes current_apparent={current_apparent} bytes comparison_apparent={comparison_apparent} bytes current_mtime_utc={} comparison_mtime_utc={} current_ctime_utc={} comparison_ctime_utc={}",
                 bounded_text(path, 512),
                 bounded_text(baseline_status, 64),
+                bounded_text(temporal_status, 64),
                 bounded_text(current_mtime, 128),
                 bounded_text(comparison_mtime, 128),
                 bounded_text(current_ctime, 128),
@@ -849,7 +854,7 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
     }
     if !facts.file_findings.is_empty() {
         summary.push_str(
-            "Concrete sampled file findings (overlapping and non-additive; do not sum with directory or mount deltas): ",
+            "Concrete sampled file findings (overlapping and non-additive; do not sum with directory or mount deltas). Temporal status is timestamp evidence only: current_interval supports a file change during the current window, comparison_interval points to a change during the comparison window and is not current-period causation, before_comparison predates both windows, and unknown does not establish timing. Candidates: ",
         );
         summary.push_str(&facts.file_findings.join("; "));
         summary.push_str(". ");
@@ -2069,7 +2074,8 @@ mod tests {
                         "comparison_mtime_utc":"2026-09-22T12:00:00Z",
                         "current_ctime_utc":"2026-09-23T11:00:00Z",
                         "comparison_ctime_utc":"2026-09-22T11:00:00Z",
-                        "baseline_status":"known"
+                        "baseline_status":"known",
+                        "temporal_status":"current_interval"
                     },
                     {
                         "mount_id":"root-mount",
@@ -2104,12 +2110,17 @@ mod tests {
         assert!(facts.file_findings[0].contains("minecraft.qcow2"));
         assert!(facts.file_findings[0].contains("current_mtime_utc=2026-09-23"));
         assert!(facts.file_findings[0].contains("current_ctime_utc=2026-09-23"));
+        assert!(facts.file_findings[0].contains("temporal_status=current_interval"));
         assert!(facts.file_findings[1].contains("baseline_status=unknown"));
+        assert!(facts.file_findings[1].contains("temporal_status=unknown"));
         let canonical: Value = serde_json::from_str(&canonical_storage_facts(&facts)).unwrap();
         assert_eq!(canonical["file_findings"].as_array().unwrap().len(), 2);
         let summary = deterministic_storage_summary(&facts);
         assert!(summary.contains("Concrete sampled file findings"));
         assert!(summary.contains("non-additive"));
+        assert!(
+            summary.contains("comparison_interval points to a change during the comparison window")
+        );
         assert!(summary.contains("minecraft.qcow2"));
     }
 
