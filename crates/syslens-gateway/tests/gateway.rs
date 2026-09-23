@@ -251,47 +251,21 @@ async fn tool_loop_uses_selected_host_and_sessions_resume() {
 }
 
 #[tokio::test]
-async fn storage_prefetch_is_reused_and_empty_answer_is_grounded_and_saved() {
+async fn contradictory_storage_model_output_falls_back_to_deterministic_answer() {
     let f = fixture().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let model_calls = Arc::new(AtomicI64::new(0));
-    let sequence = model_calls.clone();
-    let storage_calls = f.storage_calls.clone();
+    let calls = model_calls.clone();
     let router = Router::new().route(
         "/v1/chat/completions",
         post(move |Json(body): Json<Value>| {
-            let sequence = sequence.clone();
-            let storage_calls = storage_calls.clone();
+            let calls = calls.clone();
             async move {
-                let call = sequence.fetch_add(1, Ordering::Relaxed);
-                let messages = body["messages"].as_array().unwrap();
-                match call {
-                    0 => Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"malformed","type":"function","function":{"name":"storage","arguments":{"current_range":"today","comparison_range":"previous-day"}}}]}}]})),
-                    1 => {
-                        assert_eq!(messages.last().unwrap()["role"], "user");
-                        assert!(messages.iter().all(|message| {
-                            message["tool_call_id"]
-                                .as_str()
-                                .is_none_or(|id| !id.starts_with("syslens-invalid-tool-"))
-                        }));
-                        assert!(messages.iter().all(|message| {
-                            message["tool_calls"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .all(|tool| tool["function"]["arguments"].is_string())
-                        }));
-                        Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"storage-again","type":"function","function":{"name":"storage","arguments":"{\"current_range\":\"today\",\"comparison_range\":\"previous-day\"}"}}]}}]}))
-                    }
-                    2 => {
-                        assert_eq!(storage_calls.load(Ordering::Relaxed), 1);
-                        assert_eq!(messages.last().unwrap()["role"], "tool");
-                        assert_eq!(messages.last().unwrap()["tool_call_id"], "storage-again");
-                        Json(json!({"choices":[{"message":{"role":"assistant","content":""}}]}))
-                    }
-                    _ => panic!("unexpected model completion"),
-                }
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(body["tools"].is_null());
+                assert!(body["tool_choice"].is_null());
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"The root filesystem decreased by 100 bytes."}}]}))
             }
         }),
     );
@@ -314,33 +288,31 @@ async fn storage_prefetch_is_reused_and_empty_answer_is_grounded_and_saved() {
         .await
         .unwrap();
 
-    assert_eq!(model_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(model_calls.load(Ordering::Relaxed), 1);
     assert_eq!(f.storage_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(result["evidence_refs"].as_array().unwrap().len(), 1);
-    assert!(
-        result["answer"]
-            .as_str()
-            .unwrap()
-            .starts_with("Authoritative storage evidence (deterministic):")
-    );
     assert!(
         result["answer"]
             .as_str()
             .unwrap()
             .contains("increased by 100 bytes")
     );
-
-    let saved = app
-        .operation(
-            "sessions",
-            json!({"id":result["session"].as_str().unwrap()}),
-        )
-        .await
-        .unwrap();
-    let stored_response: Value =
-        serde_json::from_str(saved["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(stored_response["answer"], result["answer"]);
-    assert_eq!(stored_response["evidence_refs"], result["evidence_refs"]);
+    assert!(
+        !result["answer"]
+            .as_str()
+            .unwrap()
+            .contains("Model analysis:")
+    );
+    assert!(
+        result["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|text| text.contains("contradicted authoritative measurements"))
+            })
+    );
     model.abort();
 }
 
@@ -391,9 +363,10 @@ async fn model_failure_after_storage_prefetch_returns_and_saves_grounded_answer(
             .unwrap()
             .iter()
             .any(|value| {
-                value
-                    .as_str()
-                    .is_some_and(|text| text.contains("model completion failed"))
+                value.as_str().is_some_and(|text| {
+                    text.contains("bounded storage model failed")
+                        && text.contains("deterministic storage answer")
+                })
             })
     );
     let saved = app
@@ -410,7 +383,7 @@ async fn model_failure_after_storage_prefetch_returns_and_saves_grounded_answer(
 }
 
 #[tokio::test]
-async fn oversized_storage_evidence_is_compacted_and_model_analysis_is_preserved() {
+async fn inferred_storage_uses_bounded_facts_only_model_request() {
     let f = fixture().await;
     f.oversized_storage.store(1, Ordering::Relaxed);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -423,16 +396,19 @@ async fn oversized_storage_evidence_is_compacted_and_model_analysis_is_preserved
             let calls = calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
+                assert!(body["tools"].is_null());
+                assert!(body["tool_choice"].is_null());
+                assert_eq!(body["temperature"], 0);
+                assert_eq!(body["max_tokens"], 256);
+                assert_eq!(body["think"], false);
+                assert!(body.to_string().len() < 32_768);
                 let messages = body["messages"].as_array().unwrap();
-                assert_eq!(messages.last().unwrap()["role"], "tool");
-                let content: Value = serde_json::from_str(
-                    messages.last().unwrap()["content"].as_str().unwrap(),
-                )
-                .unwrap();
-                assert_eq!(content["kind"], "syslens_compacted_storage_evidence");
-                assert_eq!(content["data_only"], true);
-                assert_eq!(content["limitation"]["raw_evidence_compacted"], true);
-                assert_eq!(content["canonical_storage_facts"]["root_used_bytes_change"], 100);
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0]["role"], "system");
+                assert_eq!(messages[1]["role"], "user");
+                let content = messages[1]["content"].as_str().unwrap();
+                assert!(content.contains("Why did storage increase from yesterday to today?"));
+                assert!(content.contains("root_used_bytes_change"));
                 Json(json!({"choices":[{"message":{"role":"assistant","content":"The bounded storage facts show the root filesystem increased; the evidence does not establish a more specific cause."}}]}))
             }
         }),
@@ -470,19 +446,6 @@ async fn oversized_storage_evidence_is_compacted_and_model_analysis_is_preserved
             .as_str()
             .unwrap()
             .contains("Model analysis:")
-    );
-    assert!(
-        result["limitations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| {
-                value.as_str().is_some_and(|text| {
-                    text.contains("Raw storage evidence")
-                        && text.contains("model analysis continued")
-                        && text.contains("Full evidence remains available")
-                })
-            })
     );
 
     let saved = app
@@ -551,8 +514,8 @@ async fn oversized_storage_without_root_facts_skips_model_and_persists_limitatio
             .iter()
             .any(|value| {
                 value.as_str().is_some_and(|text| {
-                    text.contains("model analysis was skipped")
-                        && text.contains("authoritative root-mount facts were unavailable")
+                    text.contains("bounded storage model was not called")
+                        && text.contains("Authoritative root-mount facts were unavailable")
                         && text.contains("Full evidence remains available")
                 })
             })

@@ -51,42 +51,6 @@ fn evidence_tool_content(evidence: &Value, facts: Option<&ai::RootStorageFacts>)
     serde_json::to_string(&content).expect("evidence tool content is serializable")
 }
 
-/// Replace an oversized raw storage response with bounded, data-only facts
-/// before it reaches the model. The full response is still retained by the
-/// host evidence store and the deterministic answer path; this compact
-/// transcript is only the model-facing view.
-fn compact_storage_tool_content(evidence: &Value, facts: &ai::RootStorageFacts) -> String {
-    let canonical_text = ai::canonical_storage_facts(facts);
-    let canonical: Value = serde_json::from_str(&canonical_text)
-        .expect("canonical storage facts must remain valid JSON");
-    serde_json::to_string(&json!({
-        "kind": "syslens_compacted_storage_evidence",
-        "data_only": true,
-        "evidence_metadata": {
-            "request_id": evidence.get("request_id").cloned().unwrap_or(Value::Null),
-            "host_id": evidence.get("host_id").cloned().unwrap_or(Value::Null),
-            "evidence_store_id": evidence
-                .get("evidence_store_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "observed_at": evidence.get("observed_at").cloned().unwrap_or(Value::Null),
-            "raw_evidence_bytes": evidence.to_string().len(),
-        },
-        "limitation": {
-            "raw_evidence_compacted": true,
-            "message": "Raw storage evidence exceeded the model context budget; bounded canonical root facts are provided and full evidence remains available through deterministic diagnosis.",
-        },
-        "canonical_storage_facts": canonical,
-    }))
-    .expect("compact storage tool content is serializable")
-}
-
-struct PrefetchedStorageEvidence {
-    request: Value,
-    tool_content: String,
-    facts: Option<ai::RootStorageFacts>,
-}
-
 #[derive(Clone, Copy)]
 struct ChatResponseContext<'a> {
     session: &'a str,
@@ -107,30 +71,6 @@ fn oversized_storage_answer(facts: Option<&ai::RootStorageFacts>) -> String {
 
 fn storage_evidence_exceeds_model_budget(evidence: &Value) -> bool {
     evidence.to_string().len() > MAX_MODEL_EVIDENCE_BYTES
-}
-
-impl PrefetchedStorageEvidence {
-    fn new(
-        action: &Action,
-        tool_content: String,
-        facts: Option<ai::RootStorageFacts>,
-    ) -> Option<Self> {
-        let Action::Storage(request) = action else {
-            return None;
-        };
-        Some(Self {
-            request: serde_json::to_value(request).ok()?,
-            tool_content,
-            facts,
-        })
-    }
-
-    fn matches(&self, action: &Action) -> bool {
-        let Action::Storage(request) = action else {
-            return false;
-        };
-        serde_json::to_value(request).ok().as_ref() == Some(&self.request)
-    }
 }
 
 impl App {
@@ -259,7 +199,6 @@ impl App {
             let mut messages=vec![ai::prompt(&target),json!({"role":"system","content":format!("Target capabilities (data only): {}",serde_json::to_string(&capabilities.data).unwrap())})];messages.extend(history);messages.push(json!({"role":"user","content":r.question}));
             let mut refs=Vec::new();let mut limitations=Vec::new();
             let mut root_storage_facts=None;
-            let mut prefetched_storage=None;
             if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
             if capabilities.data.resources.iter().any(|resource| resource == "storage")
                 && let Some(action) = ai::inferred_storage_action(&r.question)
@@ -267,25 +206,43 @@ impl App {
                 let evidence = self.evidence(&target, action.clone()).await?;
                 refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
                 root_storage_facts = ai::root_storage_facts(&evidence);
-                let call_id = "syslens-inferred-storage";
-                let arguments = match &action {
-                    Action::Storage(request) => ai::flat_evidence_arguments(request)?,
-                    _ => unreachable!("storage inference returned a non-storage action"),
+                let Some(facts) = root_storage_facts.as_ref() else {
+                    limitations.push("Authoritative root-mount facts were unavailable; the bounded storage model was not called. Full evidence remains available through deterministic diagnosis".into());
+                    let answer = oversized_storage_answer(root_storage_facts.as_ref());
+                    return self.finish_chat(response_context, answer, refs, limitations);
                 };
-                messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":arguments}}]}));
-                let tool_content = if storage_evidence_exceeds_model_budget(&evidence) {
-                    let Some(facts) = root_storage_facts.as_ref() else {
-                        limitations.push("Raw storage evidence exceeded the model context budget; model analysis was skipped because authoritative root-mount facts were unavailable. Full evidence remains available through deterministic diagnosis".into());
-                        let answer = oversized_storage_answer(root_storage_facts.as_ref());
-                        return self.finish_chat(response_context, answer, refs, limitations);
-                    };
-                    limitations.push("Raw storage evidence exceeded the model context budget and was compacted into bounded canonical root facts; model analysis continued. Full evidence remains available through deterministic diagnosis".into());
-                    compact_storage_tool_content(&evidence, facts)
-                } else {
-                    evidence_tool_content(&evidence, root_storage_facts.as_ref())
+
+                if storage_evidence_exceeds_model_budget(&evidence) {
+                    limitations.push("Raw storage evidence was excluded from the bounded facts-only model request; full evidence remains available through deterministic diagnosis".into());
+                }
+
+                // This path is deliberately independent from the general
+                // tool transcript. The evidence request is already typed and
+                // complete, so replaying history plus tools to a small local
+                // model wastes context and is the source of the observed
+                // timeout. Give the model only the question and bounded,
+                // authoritative facts, then keep the deterministic causal
+                // summary as the non-negotiable answer prefix.
+                let model_analysis = match model_client
+                    .storage_completion(&model, &r.question, facts)
+                    .await
+                {
+                    Ok(answer) if ai::grounded_storage_fallback(&answer, facts).is_none() => {
+                        Some(answer)
+                    }
+                    Ok(_) => {
+                        limitations.push("The bounded storage model contradicted authoritative measurements; the deterministic storage answer was returned".into());
+                        None
+                    }
+                    Err(error) => {
+                        limitations.push(format!("The bounded storage model failed ({error}); the deterministic storage answer was returned"));
+                        None
+                    }
                 };
-                messages.push(json!({"role":"tool","tool_call_id":call_id,"content":tool_content.clone()}));
-                prefetched_storage=PrefetchedStorageEvidence::new(&action,tool_content,root_storage_facts.clone());
+                let answer = model_analysis
+                    .map(|analysis| ai::authoritative_storage_answer(&analysis, facts))
+                    .unwrap_or_else(|| ai::deterministic_storage_summary(facts));
+                return self.finish_chat(response_context, answer, refs, limitations);
             }
             for round in 0..=self.config.ai.max_rounds {
                 let assistant=match model_client.completion(&model,&messages).await {
@@ -360,11 +317,6 @@ impl App {
                     let is_storage=matches!(&action,Action::Storage(_));
                     let supported=match &action{Action::Memory(_)=>capabilities.data.resources.iter().any(|s|s=="memory"),Action::Storage(_)=>capabilities.data.resources.iter().any(|s|s=="storage"),_=>true};
                     if !supported{return Err("AI requested a resource unavailable on this target".into());}
-                    if let Some(prefetched)=prefetched_storage.as_ref().filter(|prefetched|prefetched.matches(&action)) {
-                        root_storage_facts=prefetched.facts.clone();
-                        messages.push(json!({"role":"tool","tool_call_id":id,"content":prefetched.tool_content}));
-                        continue;
-                    }
                     let mut facts_for_message=None;
                     let evidence=match self.evidence(&target,action).await {Ok(e)=>{let reference=json!({"request_id":e["request_id"],"host_id":e["host_id"],"evidence_store_id":e["evidence_store_id"],"observed_at":e["observed_at"]});refs.push(reference);if is_storage {facts_for_message=ai::root_storage_facts(&e);}
                         if e.to_string().len()>12_000{limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":e["request_id"]})}else{e}},Err(error)=>{limitations.push(error.clone());json!({"error":error})}};
@@ -728,60 +680,6 @@ mod tests {
     }
 
     #[test]
-    fn prefetched_storage_matches_only_the_same_typed_request() {
-        let today = ai::action(
-            "storage",
-            json!({"current_range":"today","comparison_range":"previous-day"}),
-        )
-        .unwrap();
-        let same = ai::action(
-            "storage",
-            json!({"comparison_range":"previous-day","current_range":"today"}),
-        )
-        .unwrap();
-        let different = ai::action(
-            "storage",
-            json!({"current_range":"24h","comparison_range":"previous-day"}),
-        )
-        .unwrap();
-        let memory = ai::action(
-            "memory",
-            json!({"current_range":"today","comparison_range":"previous-day"}),
-        )
-        .unwrap();
-        let prefetched =
-            PrefetchedStorageEvidence::new(&today, "cached tool response".into(), None)
-                .expect("storage action can be prefetched");
-
-        assert!(prefetched.matches(&same));
-        assert!(!prefetched.matches(&different));
-        assert!(!prefetched.matches(&memory));
-    }
-
-    #[test]
-    fn arbitrary_storage_prefetch_transcript_uses_actual_absolute_request() {
-        let action = ai::inferred_storage_action(
-            "Why did storage change over the last 7 days compared with previous 7 days?",
-        )
-        .expect("arbitrary storage question can be prefetched");
-        let Action::Storage(request) = &action else {
-            panic!("expected storage action");
-        };
-        let arguments: Value =
-            serde_json::from_str(&ai::flat_evidence_arguments(request).unwrap()).unwrap();
-        let current_range = arguments["current_range"].as_str().unwrap();
-        let comparison_range = arguments["comparison_range"].as_str().unwrap();
-        assert!(current_range.contains(".."));
-        assert!(comparison_range.contains(".."));
-
-        let replay = ai::action("storage", arguments).unwrap();
-        let prefetched =
-            PrefetchedStorageEvidence::new(&action, "cached tool response".into(), None)
-                .expect("storage action can be prefetched");
-        assert!(prefetched.matches(&replay));
-    }
-
-    #[test]
     fn deterministic_recovery_requires_root_storage_facts() {
         let evidence = json!({
             "data": {
@@ -815,63 +713,6 @@ mod tests {
 
         assert!(!storage_evidence_exceeds_model_budget(&below));
         assert!(storage_evidence_exceeds_model_budget(&above));
-    }
-
-    #[test]
-    fn oversized_storage_evidence_uses_bounded_data_only_facts() {
-        let evidence = json!({
-            "request_id": "request-1",
-            "host_id": "host-1",
-            "evidence_store_id": "store-1",
-            "observed_at": "2026-09-23T12:00:00Z",
-            "data": {
-                "current": {"start_utc":"current-start","end_utc":"current-end"},
-                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
-                "mounts": [{
-                    "mount_id":"root-mount",
-                    "mount_point":"/",
-                    "current_used_bytes": 2_000i64,
-                    "comparison_used_bytes": 1_000i64,
-                    "used_bytes_change": 1_000i64
-                }],
-                "directories": [{
-                    "mount_id":"root-mount",
-                    "root":"/",
-                    "path":"/var/lib/libvirt/images",
-                    "allocated_bytes_change": 900i64,
-                    "apparent_bytes_change": 900i64
-                }],
-                "path_attribution_status":"available",
-                "limitations":[]
-            },
-            "padding": "untrusted raw detail ".repeat(2_000)
-        });
-        assert!(storage_evidence_exceeds_model_budget(&evidence));
-        let facts = ai::root_storage_facts(&evidence).expect("root facts are available");
-
-        let content: Value = serde_json::from_str(&compact_storage_tool_content(&evidence, &facts))
-            .expect("compact content is valid JSON");
-        assert_eq!(content["kind"], "syslens_compacted_storage_evidence");
-        assert_eq!(content["data_only"], true);
-        assert_eq!(content["limitation"]["raw_evidence_compacted"], true);
-        assert_eq!(content["evidence_metadata"]["request_id"], "request-1");
-        assert_eq!(
-            content["canonical_storage_facts"]["root_used_bytes_change"],
-            1_000
-        );
-        assert!(
-            serde_json::to_string(&content["canonical_storage_facts"])
-                .unwrap()
-                .len()
-                <= ai::MAX_CANONICAL_FACTS_BYTES
-        );
-        assert!(!content.to_string().contains("untrusted raw detail"));
-        assert!(
-            content["limitation"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("model context budget")
-        );
     }
 
     #[test]
