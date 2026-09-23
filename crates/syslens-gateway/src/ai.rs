@@ -462,7 +462,7 @@ pub struct ChatRequest {
     pub session: Option<String>,
 }
 
-const MAX_CANONICAL_FACTS_BYTES: usize = 4096;
+pub(crate) const MAX_CANONICAL_FACTS_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RootStorageFacts {

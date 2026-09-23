@@ -410,7 +410,7 @@ async fn model_failure_after_storage_prefetch_returns_and_saves_grounded_answer(
 }
 
 #[tokio::test]
-async fn oversized_storage_evidence_skips_model_and_persists_authoritative_answer() {
+async fn oversized_storage_evidence_is_compacted_and_model_analysis_is_preserved() {
     let f = fixture().await;
     f.oversized_storage.store(1, Ordering::Relaxed);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -419,11 +419,21 @@ async fn oversized_storage_evidence_skips_model_and_persists_authoritative_answe
     let calls = model_calls.clone();
     let router = Router::new().route(
         "/v1/chat/completions",
-        post(move || {
+        post(move |Json(body): Json<Value>| {
             let calls = calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
-                Json(json!({"choices":[{"message":{"role":"assistant","content":"unexpected model call"}}]}))
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(messages.last().unwrap()["role"], "tool");
+                let content: Value = serde_json::from_str(
+                    messages.last().unwrap()["content"].as_str().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(content["kind"], "syslens_compacted_storage_evidence");
+                assert_eq!(content["data_only"], true);
+                assert_eq!(content["limitation"]["raw_evidence_compacted"], true);
+                assert_eq!(content["canonical_storage_facts"]["root_used_bytes_change"], 100);
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"The bounded storage facts show the root filesystem increased; the evidence does not establish a more specific cause."}}]}))
             }
         }),
     );
@@ -446,7 +456,7 @@ async fn oversized_storage_evidence_skips_model_and_persists_authoritative_answe
         .await
         .unwrap();
 
-    assert_eq!(model_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model_calls.load(Ordering::Relaxed), 1);
     assert_eq!(f.storage_calls.load(Ordering::Relaxed), 1);
     assert_eq!(result["evidence_refs"].as_array().unwrap().len(), 1);
     assert!(
@@ -456,13 +466,20 @@ async fn oversized_storage_evidence_skips_model_and_persists_authoritative_answe
             .contains("increased by 100 bytes")
     );
     assert!(
+        result["answer"]
+            .as_str()
+            .unwrap()
+            .contains("Model analysis:")
+    );
+    assert!(
         result["limitations"]
             .as_array()
             .unwrap()
             .iter()
             .any(|value| {
                 value.as_str().is_some_and(|text| {
-                    text.contains("model analysis was skipped")
+                    text.contains("Raw storage evidence")
+                        && text.contains("model analysis continued")
                         && text.contains("Full evidence remains available")
                 })
             })

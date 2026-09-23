@@ -51,6 +51,36 @@ fn evidence_tool_content(evidence: &Value, facts: Option<&ai::RootStorageFacts>)
     serde_json::to_string(&content).expect("evidence tool content is serializable")
 }
 
+/// Replace an oversized raw storage response with bounded, data-only facts
+/// before it reaches the model. The full response is still retained by the
+/// host evidence store and the deterministic answer path; this compact
+/// transcript is only the model-facing view.
+fn compact_storage_tool_content(evidence: &Value, facts: &ai::RootStorageFacts) -> String {
+    let canonical_text = ai::canonical_storage_facts(facts);
+    let canonical: Value = serde_json::from_str(&canonical_text)
+        .expect("canonical storage facts must remain valid JSON");
+    serde_json::to_string(&json!({
+        "kind": "syslens_compacted_storage_evidence",
+        "data_only": true,
+        "evidence_metadata": {
+            "request_id": evidence.get("request_id").cloned().unwrap_or(Value::Null),
+            "host_id": evidence.get("host_id").cloned().unwrap_or(Value::Null),
+            "evidence_store_id": evidence
+                .get("evidence_store_id")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "observed_at": evidence.get("observed_at").cloned().unwrap_or(Value::Null),
+            "raw_evidence_bytes": evidence.to_string().len(),
+        },
+        "limitation": {
+            "raw_evidence_compacted": true,
+            "message": "Raw storage evidence exceeded the model context budget; bounded canonical root facts are provided and full evidence remains available through deterministic diagnosis.",
+        },
+        "canonical_storage_facts": canonical,
+    }))
+    .expect("compact storage tool content is serializable")
+}
+
 struct PrefetchedStorageEvidence {
     request: Value,
     tool_content: String,
@@ -71,7 +101,7 @@ fn deterministic_recovery_answer(facts: Option<&ai::RootStorageFacts>) -> Option
 
 fn oversized_storage_answer(facts: Option<&ai::RootStorageFacts>) -> String {
     deterministic_recovery_answer(facts).unwrap_or_else(|| {
-        "Authoritative storage evidence (deterministic): usable root-mount facts were unavailable, so no authoritative root filesystem delta can be reported. Model analysis was skipped because the full storage evidence exceeded the model context budget. Full evidence remains available through deterministic diagnosis.".into()
+        "Authoritative storage evidence (deterministic): usable root-mount facts were unavailable, so no authoritative root filesystem delta can be reported. Model analysis was skipped because the full storage evidence exceeded the model context budget and no compact root-mount facts were available. Full evidence remains available through deterministic diagnosis.".into()
     })
 }
 
@@ -243,18 +273,17 @@ impl App {
                     _ => unreachable!("storage inference returned a non-storage action"),
                 };
                 messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":arguments}}]}));
-                if storage_evidence_exceeds_model_budget(&evidence) {
-                    let limitation = if root_storage_facts.is_some() {
-                        "Evidence exceeded the model context budget; model analysis was skipped and a deterministic answer was returned from authoritative storage facts. Full evidence remains available through deterministic diagnosis"
-                    } else {
-                        "Evidence exceeded the model context budget; model analysis was skipped because authoritative root-mount facts were unavailable. Full evidence remains available through deterministic diagnosis"
+                let tool_content = if storage_evidence_exceeds_model_budget(&evidence) {
+                    let Some(facts) = root_storage_facts.as_ref() else {
+                        limitations.push("Raw storage evidence exceeded the model context budget; model analysis was skipped because authoritative root-mount facts were unavailable. Full evidence remains available through deterministic diagnosis".into());
+                        let answer = oversized_storage_answer(root_storage_facts.as_ref());
+                        return self.finish_chat(response_context, answer, refs, limitations);
                     };
-                    limitations.push(limitation.into());
-                    let answer = oversized_storage_answer(root_storage_facts.as_ref());
-                    return self.finish_chat(response_context, answer, refs, limitations);
-                }
-                let model_evidence = evidence.clone();
-                let tool_content=evidence_tool_content(&model_evidence,root_storage_facts.as_ref());
+                    limitations.push("Raw storage evidence exceeded the model context budget and was compacted into bounded canonical root facts; model analysis continued. Full evidence remains available through deterministic diagnosis".into());
+                    compact_storage_tool_content(&evidence, facts)
+                } else {
+                    evidence_tool_content(&evidence, root_storage_facts.as_ref())
+                };
                 messages.push(json!({"role":"tool","tool_call_id":call_id,"content":tool_content.clone()}));
                 prefetched_storage=PrefetchedStorageEvidence::new(&action,tool_content,root_storage_facts.clone());
             }
@@ -786,6 +815,88 @@ mod tests {
 
         assert!(!storage_evidence_exceeds_model_budget(&below));
         assert!(storage_evidence_exceeds_model_budget(&above));
+    }
+
+    #[test]
+    fn oversized_storage_evidence_uses_bounded_data_only_facts() {
+        let evidence = json!({
+            "request_id": "request-1",
+            "host_id": "host-1",
+            "evidence_store_id": "store-1",
+            "observed_at": "2026-09-23T12:00:00Z",
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes": 2_000i64,
+                    "comparison_used_bytes": 1_000i64,
+                    "used_bytes_change": 1_000i64
+                }],
+                "directories": [{
+                    "mount_id":"root-mount",
+                    "root":"/",
+                    "path":"/var/lib/libvirt/images",
+                    "allocated_bytes_change": 900i64,
+                    "apparent_bytes_change": 900i64
+                }],
+                "path_attribution_status":"available",
+                "limitations":[]
+            },
+            "padding": "untrusted raw detail ".repeat(2_000)
+        });
+        assert!(storage_evidence_exceeds_model_budget(&evidence));
+        let facts = ai::root_storage_facts(&evidence).expect("root facts are available");
+
+        let content: Value = serde_json::from_str(&compact_storage_tool_content(&evidence, &facts))
+            .expect("compact content is valid JSON");
+        assert_eq!(content["kind"], "syslens_compacted_storage_evidence");
+        assert_eq!(content["data_only"], true);
+        assert_eq!(content["limitation"]["raw_evidence_compacted"], true);
+        assert_eq!(content["evidence_metadata"]["request_id"], "request-1");
+        assert_eq!(
+            content["canonical_storage_facts"]["root_used_bytes_change"],
+            1_000
+        );
+        assert!(
+            serde_json::to_string(&content["canonical_storage_facts"])
+                .unwrap()
+                .len()
+                <= ai::MAX_CANONICAL_FACTS_BYTES
+        );
+        assert!(!content.to_string().contains("untrusted raw detail"));
+        assert!(
+            content["limitation"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("model context budget")
+        );
+    }
+
+    #[test]
+    fn oversized_storage_fallback_stays_deterministic_when_model_fails() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes": 2_000i64,
+                    "comparison_used_bytes": 1_000i64,
+                    "used_bytes_change": 1_000i64
+                }],
+                "directories": [],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = ai::root_storage_facts(&evidence).expect("root facts are available");
+        let expected = ai::deterministic_storage_summary(&facts);
+
+        assert_eq!(oversized_storage_answer(Some(&facts)), expected);
+        assert!(expected.contains("increased by 1000 bytes"));
     }
 
     #[test]
