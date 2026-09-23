@@ -253,12 +253,7 @@ impl App {
                     let answer = oversized_storage_answer(root_storage_facts.as_ref());
                     return self.finish_chat(response_context, answer, refs, limitations);
                 }
-                let model_evidence = if storage_evidence_exceeds_model_budget(&evidence) {
-                    limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());
-                    json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":evidence["request_id"]})
-                } else {
-                    evidence.clone()
-                };
+                let model_evidence = evidence.clone();
                 let tool_content=evidence_tool_content(&model_evidence,root_storage_facts.as_ref());
                 messages.push(json!({"role":"tool","tool_call_id":call_id,"content":tool_content.clone()}));
                 prefetched_storage=PrefetchedStorageEvidence::new(&action,tool_content,root_storage_facts.clone());
