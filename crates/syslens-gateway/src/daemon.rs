@@ -69,6 +69,12 @@ fn deterministic_recovery_answer(facts: Option<&ai::RootStorageFacts>) -> Option
     facts.map(ai::deterministic_storage_summary)
 }
 
+fn oversized_storage_answer(facts: Option<&ai::RootStorageFacts>) -> String {
+    deterministic_recovery_answer(facts).unwrap_or_else(|| {
+        "Authoritative storage evidence (deterministic): usable root-mount facts were unavailable, so no authoritative root filesystem delta can be reported. Model analysis was skipped because the full storage evidence exceeded the model context budget. Full evidence remains available through deterministic diagnosis.".into()
+    })
+}
+
 fn storage_evidence_exceeds_model_budget(evidence: &Value) -> bool {
     evidence.to_string().len() > MAX_MODEL_EVIDENCE_BYTES
 }
@@ -237,12 +243,14 @@ impl App {
                     _ => unreachable!("storage inference returned a non-storage action"),
                 };
                 messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":arguments}}]}));
-                if storage_evidence_exceeds_model_budget(&evidence)
-                    && root_storage_facts.is_some()
-                {
-                    limitations.push("Evidence exceeded the model context budget; model analysis was skipped and a deterministic answer was returned from authoritative storage facts. Full evidence remains available through deterministic diagnosis".into());
-                    let answer = deterministic_recovery_answer(root_storage_facts.as_ref())
-                        .ok_or("oversized storage evidence has no authoritative root facts")?;
+                if storage_evidence_exceeds_model_budget(&evidence) {
+                    let limitation = if root_storage_facts.is_some() {
+                        "Evidence exceeded the model context budget; model analysis was skipped and a deterministic answer was returned from authoritative storage facts. Full evidence remains available through deterministic diagnosis"
+                    } else {
+                        "Evidence exceeded the model context budget; model analysis was skipped because authoritative root-mount facts were unavailable. Full evidence remains available through deterministic diagnosis"
+                    };
+                    limitations.push(limitation.into());
+                    let answer = oversized_storage_answer(root_storage_facts.as_ref());
                     return self.finish_chat(response_context, answer, refs, limitations);
                 }
                 let model_evidence = if storage_evidence_exceeds_model_budget(&evidence) {
@@ -783,5 +791,15 @@ mod tests {
 
         assert!(!storage_evidence_exceeds_model_budget(&below));
         assert!(storage_evidence_exceeds_model_budget(&above));
+    }
+
+    #[test]
+    fn oversized_storage_answer_is_truthful_without_root_facts() {
+        let answer = oversized_storage_answer(None);
+
+        assert!(answer.contains("usable root-mount facts were unavailable"));
+        assert!(answer.contains("Model analysis was skipped"));
+        assert!(answer.contains("Full evidence remains available"));
+        assert!(answer.len() <= ai::MAX_FINAL_ANSWER_BYTES);
     }
 }

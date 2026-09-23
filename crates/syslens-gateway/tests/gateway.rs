@@ -100,6 +100,9 @@ async fn fixture() -> Fixture {
             });
             if oversized.load(Ordering::Relaxed) != 0 {
                 data["limitations"] = json!(vec!["bounded evidence padding ".repeat(128); 16]);
+                if oversized.load(Ordering::Relaxed) == 2 {
+                    data["mounts"] = json!([]);
+                }
             }
             Json(envelope(data))
         }}));
@@ -460,6 +463,79 @@ async fn oversized_storage_evidence_skips_model_and_persists_authoritative_answe
             .any(|value| {
                 value.as_str().is_some_and(|text| {
                     text.contains("model analysis was skipped")
+                        && text.contains("Full evidence remains available")
+                })
+            })
+    );
+
+    let saved = app
+        .operation(
+            "sessions",
+            json!({"id":result["session"].as_str().unwrap()}),
+        )
+        .await
+        .unwrap();
+    let stored_response: Value =
+        serde_json::from_str(saved["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(stored_response["answer"], result["answer"]);
+    assert_eq!(stored_response["evidence_refs"], result["evidence_refs"]);
+    model.abort();
+}
+
+#[tokio::test]
+async fn oversized_storage_without_root_facts_skips_model_and_persists_limitation() {
+    let f = fixture().await;
+    f.oversized_storage.store(2, Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let model_calls = Arc::new(AtomicI64::new(0));
+    let calls = model_calls.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"unexpected model call"}}]}))
+            }
+        }),
+    );
+    let model = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut config = app_config(&f);
+    config.ai.enabled = true;
+    config.ai.allow_insecure_http = true;
+    config.ai.endpoint_url = format!("http://{address}/v1/chat/completions");
+    config.ai.model = "test-model".into();
+    let app = App::new(config).unwrap();
+
+    let result = app
+        .chat(ChatRequest {
+            question: "Why did storage increase from yesterday to today?".into(),
+            host: Some("pi".into()),
+            session: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(model_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(result["evidence_refs"].as_array().unwrap().len(), 1);
+    assert!(
+        result["answer"]
+            .as_str()
+            .unwrap()
+            .contains("usable root-mount facts were unavailable")
+    );
+    assert!(
+        result["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| {
+                value.as_str().is_some_and(|text| {
+                    text.contains("model analysis was skipped")
+                        && text.contains("authoritative root-mount facts were unavailable")
                         && text.contains("Full evidence remains available")
                 })
             })
