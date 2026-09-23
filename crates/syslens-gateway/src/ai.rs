@@ -849,7 +849,6 @@ fn has_temporal_ambiguity_in(words: &[&str], start: usize, end: usize) -> bool {
         "vs",
         "compared",
     ];
-    const CLAUSE_MARKERS: [&str; 5] = ["and", "or", "also", "not", "against"];
     const TIME_UNITS: [&str; 9] = [
         "h", "hour", "hours", "d", "day", "days", "w", "week", "weeks",
     ];
@@ -861,12 +860,6 @@ fn has_temporal_ambiguity_in(words: &[&str], start: usize, end: usize) -> bool {
         .take(end.saturating_sub(start))
         .any(|(index, word)| {
             if TEMPORAL_MARKERS.contains(word) || *word == "against" {
-                return true;
-            }
-            // A connector after the selected comparison starts a second clause;
-            // reject it conservatively even when its temporal expression is
-            // malformed or too large for retention.
-            if CLAUSE_MARKERS.contains(word) {
                 return true;
             }
             // Catch a trailing bare numeric period and oversized values that
@@ -2026,6 +2019,10 @@ mod tests {
     fn inferred_storage_action_resolves_explicit_adjacent_periods() {
         assert_absolute_storage_period(
             "Why did storage change over the last 7 days compared with previous 7 days?",
+            7 * 24 * 60 * 60,
+        );
+        assert_absolute_storage_period(
+            "Why did storage increase over the last 7 days compared with the previous 7 days? Explain the largest nested directories and do not add overlapping paths together.",
             7 * 24 * 60 * 60,
         );
         assert_absolute_storage_period(
