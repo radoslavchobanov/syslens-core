@@ -101,6 +101,26 @@ async fn fixture() -> Fixture {
             });
             if oversized.load(Ordering::Relaxed) != 0 {
                 data["limitations"] = json!(vec!["bounded evidence padding ".repeat(128); 16]);
+                if oversized.load(Ordering::Relaxed) == 1 {
+                    data["directories"] = json!([
+                        {"mount_id":"root","root":"/","path":"/var/lib","allocated_bytes_change":90i64,"apparent_bytes_change":95i64},
+                        {"mount_id":"root","root":"/","path":"/home","allocated_bytes_change":10i64,"apparent_bytes_change":10i64},
+                    ]);
+                    data["directory_details"] = json!([
+                        {"mount_id":"root","root":"/","path":"/var/lib/libvirt","allocated_bytes_change":80i64,"apparent_bytes_change":80i64},
+                    ]);
+                    data["file_findings"] = json!([
+                        {
+                            "mount_id":"root","root":"/","path":"/var/lib/libvirt/images/disk.qcow2",
+                            "allocated_bytes_change":70i64,"apparent_bytes_change":70i64,
+                            "current_allocated_bytes":170i64,"comparison_allocated_bytes":100i64,
+                            "current_apparent_bytes":170i64,"comparison_apparent_bytes":100i64,
+                            "current_mtime_utc":"2026-09-16T11:00:00Z","comparison_mtime_utc":"2026-09-15T11:00:00Z",
+                            "current_ctime_utc":"2026-09-16T11:00:00Z","comparison_ctime_utc":"2026-09-15T11:00:00Z",
+                            "baseline_status":"known","temporal_status":"current_interval"
+                        },
+                    ]);
+                }
                 if oversized.load(Ordering::Relaxed) == 2 {
                     data["mounts"] = json!([]);
                 }
@@ -415,6 +435,18 @@ async fn inferred_storage_uses_bounded_facts_only_model_request() {
                 let content = messages[1]["content"].as_str().unwrap();
                 assert!(content.contains("Why did storage increase from yesterday to today?"));
                 assert!(content.contains("root_used_bytes_change"));
+                assert!(content.contains("top_directories"));
+                assert!(content.contains("top_nested_directories"));
+                assert!(content.contains("top_files"));
+                assert!(content.contains("disk.qcow2"));
+                assert!(content.contains("current_mtime_utc"));
+                assert!(!content.contains("current_directory_snapshot"));
+                assert!(!content.contains("directory_findings"));
+                let facts_json = content
+                    .split_once("Authoritative storage facts (JSON data only):\n")
+                    .unwrap()
+                    .1;
+                assert!(facts_json.len() <= 3072);
                 Json(json!({"choices":[{"message":{"role":"assistant","content":"The bounded storage facts show the root filesystem increased; the evidence does not establish a more specific cause."}}]}))
             }
         }),

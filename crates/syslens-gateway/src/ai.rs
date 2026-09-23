@@ -307,7 +307,7 @@ impl Model {
         })
     }
     fn storage_completion_payload(model: &str, question: &str, facts: &RootStorageFacts) -> Value {
-        let canonical = canonical_storage_facts(facts);
+        let model_facts = storage_model_facts(facts);
         json!({
             "model": model,
             "messages": [
@@ -317,7 +317,7 @@ impl Model {
                 },
                 {
                     "role": "user",
-                    "content": format!("Question:\n{question}\n\nAuthoritative storage facts (JSON data only):\n{canonical}")
+                    "content": format!("Question:\n{}\n\nAuthoritative storage facts (JSON data only):\n{}", bounded_text(question, 1024), model_facts)
                 }
             ],
             "temperature": 0,
@@ -505,6 +505,10 @@ pub struct ChatRequest {
 }
 
 pub(crate) const MAX_CANONICAL_FACTS_BYTES: usize = 4096;
+/// The canonical block is retained for deterministic evidence and tool
+/// output. Local model inference gets a smaller typed view so a small model
+/// spends its context on causal facts instead of duplicate inventories.
+pub(crate) const MAX_STORAGE_MODEL_FACTS_BYTES: usize = 3072;
 
 #[derive(Clone, Debug)]
 struct DirectoryFindingFact {
@@ -875,6 +879,104 @@ fn append_file_candidates(
         summary.push_str(": ");
         summary.push_str(&candidates.join("; "));
         summary.push_str(". ");
+    }
+}
+
+/// Build the compact, model-facing storage evidence block. This deliberately
+/// uses typed findings rather than parsing rendered evidence strings, and
+/// excludes current inventory/duplicate arrays that are useful for audit but
+/// expensive and distracting for a local model.
+pub(crate) fn storage_model_facts(facts: &RootStorageFacts) -> String {
+    let mut directories = facts
+        .directory_facts
+        .iter()
+        .take(3)
+        .map(|finding| {
+            json!({
+                "path": bounded_text(&finding.path, 96),
+                "allocated_bytes_change": finding.allocated_bytes_change,
+                "apparent_bytes_change": finding.apparent_bytes_change,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut nested_directories = facts
+        .directory_detail_facts
+        .iter()
+        .take(3)
+        .map(|finding| {
+            json!({
+                "path": bounded_text(&finding.path, 96),
+                "allocated_bytes_change": finding.allocated_bytes_change,
+                "apparent_bytes_change": finding.apparent_bytes_change,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut files = facts
+        .file_facts
+        .iter()
+        .take(6)
+        .map(|finding| {
+            json!({
+                "path": bounded_text(&finding.path, 96),
+                "allocated_bytes_change": finding.allocated_bytes_change,
+                "apparent_bytes_change": finding.apparent_bytes_change,
+                "temporal_status": bounded_text(&finding.temporal_status, 32),
+                "baseline_status": bounded_text(&finding.baseline_status, 32),
+                "current_mtime_utc": bounded_text(&finding.current_mtime_utc, 64),
+                "comparison_mtime_utc": bounded_text(&finding.comparison_mtime_utc, 64),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut limitations = facts
+        .limitations
+        .iter()
+        .take(2)
+        .map(|limitation| bounded_text(limitation, 128))
+        .collect::<Vec<_>>();
+    limitations.push(
+        "Directory and file findings overlap the root total; do not add them together.".to_string(),
+    );
+
+    loop {
+        let value = json!({
+            "kind": "syslens_storage_model_facts",
+            "data_only": true,
+            "current_interval": {
+                "start_utc": facts.current_start,
+                "end_utc": facts.current_end,
+            },
+            "comparison_interval": {
+                "start_utc": facts.comparison_start,
+                "end_utc": facts.comparison_end,
+            },
+            "root_mount": "/",
+            "root_current_used_bytes": facts.current_used_bytes,
+            "root_comparison_used_bytes": facts.comparison_used_bytes,
+            "root_used_bytes_change": facts.used_bytes_change,
+            "path_attribution_status": facts.path_attribution_status,
+            "top_directories": directories,
+            "top_nested_directories": nested_directories,
+            "top_files": files,
+            "limitations": limitations,
+        });
+        let text = serde_json::to_string(&value).expect("storage model facts are serializable");
+        if text.len() <= MAX_STORAGE_MODEL_FACTS_BYTES {
+            return text;
+        }
+        // Preserve root accounting and the first findings, reducing only the
+        // optional tail if an adversarially long path/limitation still fills
+        // the model-facing budget.
+        if limitations.len() > 1 {
+            limitations.pop();
+        } else if files.len() > 1 {
+            files.pop();
+        } else if nested_directories.len() > 1 {
+            nested_directories.pop();
+        } else if directories.len() > 1 {
+            directories.pop();
+        } else {
+            return text;
+        }
     }
 }
 
