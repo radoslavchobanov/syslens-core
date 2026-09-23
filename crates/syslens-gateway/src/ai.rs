@@ -12,8 +12,12 @@ const MAX_COMPLETION_TOKENS: u64 = 512;
 /// already been collected and validated, so sending the whole conversation,
 /// tool schema, and synthetic tool transcript only adds latency and invites a
 /// local model to spend its context on protocol bookkeeping.
-const MAX_STORAGE_COMPLETION_TOKENS: u64 = 64;
-const STORAGE_COMPLETION_TIMEOUT: StdDuration = StdDuration::from_secs(20);
+const MAX_STORAGE_COMPLETION_TOKENS: u64 = 96;
+const MAX_STORAGE_COMPLETION_WORDS: usize = 45;
+// A local model may need to load a cold model before it can generate the
+// answer. Keep a hard upper bound, but do not let the generic gateway timeout
+// turn a valid local completion into a deterministic-only response.
+const STORAGE_COMPLETION_TIMEOUT: StdDuration = StdDuration::from_secs(60);
 /// Maximum answer size persisted in a chat exchange and returned by the
 /// gateway. The deterministic storage prefix is bounded separately to 8 KiB,
 /// leaving room for a truncated model analysis.
@@ -313,7 +317,7 @@ impl Model {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a concise SysLens storage analyst. Use only the authoritative JSON facts. State the measured change, strongest directory/file candidates, temporal status, and key limitation. Do not invent causes. Return plain English in at most 60 words."
+                    "content": "You are a concise SysLens storage analyst. Use only the authoritative JSON facts. State the measured change, strongest directory/file candidates, temporal status, and key limitation. Do not invent causes. Return plain English in at most 45 words."
                 },
                 {
                     "role": "user",
@@ -409,6 +413,13 @@ impl Model {
             .ok_or("storage model returned no bounded answer")?;
         if content.len() > 16_384 {
             return Err("storage model answer exceeds size limit".into());
+        }
+        // Do not reject a response solely because Ollama reports
+        // finish_reason=length: max_tokens already bounds it and a concise
+        // partial answer can still add useful analysis after the authoritative
+        // deterministic prefix. Enforce the user-facing word budget instead.
+        if content.split_whitespace().count() > MAX_STORAGE_COMPLETION_WORDS {
+            return Err("storage model answer exceeds word limit".into());
         }
         Ok(content.to_owned())
     }

@@ -425,7 +425,7 @@ async fn inferred_storage_uses_bounded_facts_only_model_request() {
                 assert!(body["tools"].is_null());
                 assert!(body["tool_choice"].is_null());
                 assert_eq!(body["temperature"], 0);
-                assert_eq!(body["max_tokens"], 64);
+                assert_eq!(body["max_tokens"], 96);
                 assert_eq!(body["think"], false);
                 assert!(body.to_string().len() < 32_768);
                 let messages = body["messages"].as_array().unwrap();
