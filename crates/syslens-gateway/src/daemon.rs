@@ -226,7 +226,11 @@ impl App {
                 refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
                 root_storage_facts = ai::root_storage_facts(&evidence);
                 let call_id = "syslens-inferred-storage";
-                messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":"{\"current_range\":\"today\",\"comparison_range\":\"previous-day\"}"}}]}));
+                let arguments = match &action {
+                    Action::Storage(request) => ai::flat_evidence_arguments(request)?,
+                    _ => unreachable!("storage inference returned a non-storage action"),
+                };
+                messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":arguments}}]}));
                 let model_evidence = if evidence.to_string().len() > 12_000 {
                     limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());
                     json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":evidence["request_id"]})
@@ -706,6 +710,29 @@ mod tests {
         assert!(prefetched.matches(&same));
         assert!(!prefetched.matches(&different));
         assert!(!prefetched.matches(&memory));
+    }
+
+    #[test]
+    fn arbitrary_storage_prefetch_transcript_uses_actual_absolute_request() {
+        let action = ai::inferred_storage_action(
+            "Why did storage change over the last 7 days compared with previous 7 days?",
+        )
+        .expect("arbitrary storage question can be prefetched");
+        let Action::Storage(request) = &action else {
+            panic!("expected storage action");
+        };
+        let arguments: Value =
+            serde_json::from_str(&ai::flat_evidence_arguments(request).unwrap()).unwrap();
+        let current_range = arguments["current_range"].as_str().unwrap();
+        let comparison_range = arguments["comparison_range"].as_str().unwrap();
+        assert!(current_range.contains(".."));
+        assert!(comparison_range.contains(".."));
+
+        let replay = ai::action("storage", arguments).unwrap();
+        let prefetched =
+            PrefetchedStorageEvidence::new(&action, "cached tool response".into(), None)
+                .expect("storage action can be prefetched");
+        assert!(prefetched.matches(&replay));
     }
 
     #[test]

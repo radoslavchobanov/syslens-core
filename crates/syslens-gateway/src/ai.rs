@@ -1,4 +1,5 @@
 use crate::{Result, client, config::Ai};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use syslens_protocol::{
@@ -62,8 +63,13 @@ fn evidence_request(args: Value) -> Result<EvidenceRequest> {
             .comparison_range
             .as_deref()
             .ok_or("comparison_range is required")?;
-        if comparison_value == "previous-day" {
-            return request(current, None, ComparisonMode::PreviousDay);
+        match comparison_value {
+            "previous-day" => return request(current, None, ComparisonMode::PreviousDay),
+            "previous-week" => return request(current, None, ComparisonMode::PreviousWeek),
+            "preceding-week-average" => {
+                return request(current, None, ComparisonMode::PrecedingWeekAverage);
+            }
+            _ => {}
         }
         let comparison = parse_range(comparison_value)?;
         return request(current, Some(comparison), ComparisonMode::PreviousWeek);
@@ -230,6 +236,56 @@ fn request(
         .validate(185)
         .map_err(|_| "invalid evidence interval")?;
     Ok(request)
+}
+
+fn flat_window_range(
+    relative: Option<&RelativeRange>,
+    start: Option<&DateTime<Utc>>,
+    end: Option<&DateTime<Utc>>,
+) -> Result<String> {
+    match (relative, start, end) {
+        (Some(relative), None, None) => match relative.unit {
+            RelativeUnit::Today if relative.value == 1 => Ok("today".into()),
+            RelativeUnit::Today => Err("invalid relative today interval".into()),
+            RelativeUnit::Hours => Ok(format!("{}h", relative.value)),
+            RelativeUnit::Days if relative.value % 7 == 0 => Ok(format!("{}w", relative.value / 7)),
+            RelativeUnit::Days => Ok(format!("{}d", relative.value)),
+        },
+        (None, Some(start), Some(end)) => {
+            Ok(format!("{}..{}", start.to_rfc3339(), end.to_rfc3339()))
+        }
+        _ => Err("invalid evidence interval".into()),
+    }
+}
+
+/// Serialize the canonical evidence request into the flat tool arguments
+/// used in the model transcript. Prefetches must use these actual bounds so a
+/// later model tool call can be compared with the cached request exactly.
+pub(crate) fn flat_evidence_arguments(request: &EvidenceRequest) -> Result<String> {
+    let current_range = flat_window_range(
+        request.window.relative.as_ref(),
+        request.window.start.as_ref(),
+        request.window.end.as_ref(),
+    )?;
+    let comparison_range = if let Some(comparison) = &request.comparison {
+        flat_window_range(
+            comparison.relative.as_ref(),
+            comparison.start.as_ref(),
+            comparison.end.as_ref(),
+        )?
+    } else {
+        match request.window.comparison {
+            ComparisonMode::PreviousDay => "previous-day",
+            ComparisonMode::PreviousWeek => "previous-week",
+            ComparisonMode::PrecedingWeekAverage => "preceding-week-average",
+        }
+        .into()
+    };
+    serde_json::to_string(&json!({
+        "current_range": current_range,
+        "comparison_range": comparison_range,
+    }))
+    .map_err(|_| "invalid evidence arguments".into())
 }
 pub fn tools() -> Value {
     // Keep evidence arguments flat for compatibility with small local models;
@@ -721,8 +777,159 @@ pub(crate) fn authoritative_storage_answer(answer: &str, facts: &RootStorageFact
     }
 }
 
-/// Infer only the narrow, unambiguous everyday storage question. Arbitrary
-/// periods still require the model's typed evidence action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoragePeriod {
+    duration: Duration,
+}
+
+fn parse_storage_period(words: &[&str], index: usize) -> Option<(StoragePeriod, usize)> {
+    let value = words.get(index)?.parse::<i64>().ok()?;
+    if value <= 0 {
+        return None;
+    }
+    let unit = *words.get(index + 1)?;
+    // Bound the input before constructing a chrono duration. The evidence
+    // request validation below applies the stricter 185-day retention bound
+    // to the resulting pair of adjacent windows. Keeping this explicit also
+    // prevents an untrusted huge integer from overflowing chrono's helpers.
+    // Two adjacent windows must fit inside the host's 185-day retention
+    // horizon, so an inferred rolling period is capped at 92 days. This
+    // leaves one day of headroom for the strict two-window boundary.
+    const MAX_SECONDS: i64 = 92 * 24 * 60 * 60;
+    let seconds = match unit {
+        "h" | "hour" | "hours" => value.checked_mul(60 * 60)?,
+        "d" | "day" | "days" => value.checked_mul(24 * 60 * 60)?,
+        "w" | "week" | "weeks" => value.checked_mul(7)?.checked_mul(24 * 60 * 60)?,
+        _ => return None,
+    };
+    if seconds > MAX_SECONDS {
+        return None;
+    }
+    let duration = Duration::seconds(seconds);
+    Some((StoragePeriod { duration }, index + 2))
+}
+
+fn explicit_comparison_period(
+    words: &[&str],
+    marker: usize,
+) -> Option<(Option<StoragePeriod>, usize)> {
+    let mut index = marker + 1;
+    while matches!(
+        words.get(index),
+        Some(&"with" | &"to" | &"against" | &"the")
+    ) {
+        index += 1;
+    }
+    if !matches!(
+        words.get(index),
+        Some(&"previous" | &"preceding" | &"prior")
+    ) {
+        return None;
+    }
+    index += 1;
+    while matches!(words.get(index), Some(&"the")) {
+        index += 1;
+    }
+    if matches!(words.get(index), Some(&"period")) {
+        return Some((None, index + 1));
+    }
+    parse_storage_period(words, index).map(|(period, end)| (Some(period), end))
+}
+
+fn has_temporal_ambiguity_in(words: &[&str], start: usize, end: usize) -> bool {
+    const TEMPORAL_MARKERS: [&str; 10] = [
+        "last",
+        "past",
+        "previous",
+        "preceding",
+        "prior",
+        "today",
+        "yesterday",
+        "versus",
+        "vs",
+        "compared",
+    ];
+    const CLAUSE_MARKERS: [&str; 5] = ["and", "or", "also", "not", "against"];
+    const TIME_UNITS: [&str; 9] = [
+        "h", "hour", "hours", "d", "day", "days", "w", "week", "weeks",
+    ];
+
+    words
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .any(|(index, word)| {
+            if TEMPORAL_MARKERS.contains(word) || *word == "against" {
+                return true;
+            }
+            // A connector after the selected comparison starts a second clause;
+            // reject it conservatively even when its temporal expression is
+            // malformed or too large for retention.
+            if CLAUSE_MARKERS.contains(word) {
+                return true;
+            }
+            // Catch a trailing bare numeric period and oversized values that
+            // parse_storage_period rejects.
+            word.parse::<i64>().is_ok()
+                && words
+                    .get(index + 1)
+                    .is_some_and(|unit| TIME_UNITS.contains(unit))
+        })
+}
+
+fn has_temporal_ambiguity_after(words: &[&str], start: usize) -> bool {
+    has_temporal_ambiguity_in(words, start, words.len())
+}
+
+fn has_real_today_yesterday_comparison(words: &[&str]) -> bool {
+    let today = words.iter().position(|word| *word == "today");
+    let yesterday = words.iter().position(|word| *word == "yesterday");
+    let (Some(today), Some(yesterday)) = (today, yesterday) else {
+        return false;
+    };
+    const COMPARATORS: [&str; 3] = ["versus", "vs", "against"];
+    if today < yesterday {
+        let between = &words[today + 1..yesterday];
+        (between.len() == 1 && COMPARATORS.contains(&between[0]))
+            || (between.len() == 1 && between[0] == "with")
+            || (between.len() == 2
+                && between[0] == "compared"
+                && matches!(between[1], "with" | "to"))
+    } else {
+        let between = &words[yesterday + 1..today];
+        words.get(yesterday.wrapping_sub(1)) == Some(&"from")
+            && between.iter().filter(|&&word| word == "to").count() == 1
+            && between.iter().all(|&word| word == "to")
+    }
+}
+
+fn absolute_adjacent_storage_request(duration: Duration) -> Option<Action> {
+    // These are rolling UTC windows, not local calendar-day boundaries. The
+    // current window ends at this gateway timestamp and the comparison ends
+    // exactly where the current one starts, so the ranges never overlap.
+    let now = Utc::now();
+    let comparison_start = now.checked_sub_signed(duration.checked_mul(2)?)?;
+    let current_start = now.checked_sub_signed(duration)?;
+    let current = WindowRange {
+        relative: None,
+        start: Some(current_start),
+        end: Some(now),
+    };
+    let comparison = WindowRange {
+        relative: None,
+        start: Some(comparison_start),
+        end: Some(current_start),
+    };
+    request(current, Some(comparison), ComparisonMode::PreviousWeek)
+        .ok()
+        .map(Action::Storage)
+}
+
+/// Infer unambiguous storage comparisons. Exact adjacent periods are resolved
+/// here so the local model does not need to invent timestamps. A bare period
+/// such as "last week" remains ambiguous and is intentionally left to the
+/// typed model action.
 pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
     let lower = question.to_ascii_lowercase();
     let words = lower
@@ -733,7 +940,29 @@ pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
         .iter()
         .any(|term| words.contains(term))
         || words.windows(2).any(|pair| pair == ["file", "system"]);
+    let competing_resource = [
+        "memory",
+        "ram",
+        "cpu",
+        "processor",
+        "gpu",
+        "network",
+        "swap",
+        "temperature",
+        "load",
+        "process",
+        "processes",
+    ]
+    .iter()
+    .any(|term| words.contains(term));
+    if resource && competing_resource {
+        return None;
+    }
     let equivalent_day = words.contains(&"today") && words.contains(&"yesterday");
+    let explicit_period_marker = words.iter().any(|word| *word == "last" || *word == "past");
+    if explicit_period_marker && (words.contains(&"today") || words.contains(&"yesterday")) {
+        return None;
+    }
     let comparison_or_diagnosis = [
         "compare",
         "compared",
@@ -764,20 +993,77 @@ pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
     ]
     .iter()
     .any(|term| words.contains(term));
-    if !resource || !equivalent_day || !comparison_or_diagnosis {
+    if resource && equivalent_day && (comparison_or_diagnosis || words.contains(&"against")) {
+        let today_count = words.iter().filter(|word| **word == "today").count();
+        let yesterday_count = words.iter().filter(|word| **word == "yesterday").count();
+        if today_count != 1
+            || yesterday_count != 1
+            || words
+                .iter()
+                .any(|word| matches!(*word, "last" | "past" | "previous" | "preceding" | "prior"))
+        {
+            return None;
+        }
+        if !has_real_today_yesterday_comparison(&words) {
+            return None;
+        }
+        let pair_end = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, word)| (*word == "today" || *word == "yesterday").then_some(index))
+            .max()
+            .map_or(0, |index| index + 1);
+        if has_temporal_ambiguity_after(&words, pair_end) {
+            return None;
+        }
+        let current = WindowRange {
+            relative: Some(RelativeRange {
+                value: 1,
+                unit: RelativeUnit::Today,
+            }),
+            start: None,
+            end: None,
+        };
+        return request(current, None, ComparisonMode::PreviousDay)
+            .ok()
+            .map(Action::Storage);
+    }
+    if !resource {
         return None;
     }
-    let current = WindowRange {
-        relative: Some(RelativeRange {
-            value: 1,
-            unit: RelativeUnit::Today,
-        }),
-        start: None,
-        end: None,
-    };
-    request(current, None, ComparisonMode::PreviousDay)
-        .ok()
-        .map(Action::Storage)
+
+    let current_marker = words
+        .iter()
+        .position(|word| *word == "last" || *word == "past")?;
+    let (current_period, current_end) = parse_storage_period(&words, current_marker + 1)?;
+    let comparison_marker =
+        words
+            .iter()
+            .enumerate()
+            .skip(current_end)
+            .find_map(|(index, word)| {
+                (*word == "compared"
+                    || *word == "versus"
+                    || *word == "vs"
+                    || *word == "against"
+                    || *word == "to"
+                    || *word == "with")
+                    .then_some(index)
+            })?;
+    if has_temporal_ambiguity_in(&words, current_end, comparison_marker) {
+        return None;
+    }
+    let (comparison_period, comparison_end) =
+        explicit_comparison_period(&words, comparison_marker)?;
+    if has_temporal_ambiguity_after(&words, comparison_end) {
+        return None;
+    }
+    if let Some(comparison_period) = comparison_period
+        && comparison_period.duration != current_period.duration
+    {
+        return None;
+    }
+    absolute_adjacent_storage_request(current_period.duration)
 }
 
 fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> bool {
@@ -1261,6 +1547,59 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn flat_evidence_arguments_preserve_relative_and_absolute_requests() {
+        let relative = window("7d", "previous-week").unwrap();
+        let relative_args: Value =
+            serde_json::from_str(&flat_evidence_arguments(&relative).unwrap()).unwrap();
+        assert_eq!(relative_args["current_range"], "1w");
+        assert_eq!(relative_args["comparison_range"], "previous-week");
+        let Action::Storage(relative_round_trip) = action("storage", relative_args).unwrap() else {
+            panic!("expected storage action");
+        };
+        assert_eq!(
+            serde_json::to_value(relative_round_trip).unwrap(),
+            serde_json::to_value(relative).unwrap()
+        );
+        let relative_average = window("7d", "preceding-week-average").unwrap();
+        let average_args: Value =
+            serde_json::from_str(&flat_evidence_arguments(&relative_average).unwrap()).unwrap();
+        let Action::Storage(average_round_trip) = action("storage", average_args).unwrap() else {
+            panic!("expected storage action");
+        };
+        assert_eq!(
+            serde_json::to_value(average_round_trip).unwrap(),
+            serde_json::to_value(relative_average).unwrap()
+        );
+
+        let Action::Storage(absolute) = inferred_storage_action(
+            "Why did storage change over the last 7 days compared with previous 7 days?",
+        )
+        .unwrap() else {
+            panic!("expected storage action");
+        };
+        let absolute_args: Value =
+            serde_json::from_str(&flat_evidence_arguments(&absolute).unwrap()).unwrap();
+        assert!(
+            absolute_args["current_range"]
+                .as_str()
+                .is_some_and(|range| range.contains(".."))
+        );
+        assert!(
+            absolute_args["comparison_range"]
+                .as_str()
+                .is_some_and(|range| range.contains(".."))
+        );
+        let round_trip = action("storage", absolute_args).unwrap();
+        let Action::Storage(round_trip) = round_trip else {
+            panic!("expected storage action");
+        };
+        assert_eq!(
+            serde_json::to_value(round_trip).unwrap(),
+            serde_json::to_value(absolute).unwrap()
+        );
+    }
     #[test]
     fn status_and_incidents_accept_object_metadata_only() {
         assert!(action("status", json!({})).is_ok());
@@ -1656,6 +1995,135 @@ mod tests {
             Some(Action::Storage(request))
                 if request.window.comparison == ComparisonMode::PreviousDay
         ));
+    }
+
+    fn assert_absolute_storage_period(question: &str, expected_seconds: i64) {
+        let before = Utc::now();
+        let Some(Action::Storage(request)) = inferred_storage_action(question) else {
+            panic!("expected an inferred storage action for {question:?}");
+        };
+        let after = Utc::now();
+        let current_start = request.window.start.expect("absolute current start");
+        let current_end = request.window.end.expect("absolute current end");
+        let comparison = request.comparison.expect("absolute comparison");
+        let comparison_start = comparison.start.expect("absolute comparison start");
+        let comparison_end = comparison.end.expect("absolute comparison end");
+        assert!(current_end >= before && current_end <= after);
+        assert_eq!(
+            (current_end - current_start).num_seconds(),
+            expected_seconds
+        );
+        assert_eq!(comparison_end, current_start);
+        assert_eq!(
+            (comparison_end - comparison_start).num_seconds(),
+            expected_seconds
+        );
+        assert!(request.window.relative.is_none());
+        assert!(comparison.relative.is_none());
+    }
+
+    #[test]
+    fn inferred_storage_action_resolves_explicit_adjacent_periods() {
+        assert_absolute_storage_period(
+            "Why did storage change over the last 7 days compared with previous 7 days?",
+            7 * 24 * 60 * 60,
+        );
+        assert_absolute_storage_period(
+            "Compare disk usage over the past 12 hours versus preceding 12 hours.",
+            12 * 60 * 60,
+        );
+        assert_absolute_storage_period(
+            "Diagnose filesystem growth over the last 2 weeks vs the prior period.",
+            2 * 7 * 24 * 60 * 60,
+        );
+        assert_absolute_storage_period(
+            "Compare storage over the last 92 days against preceding 92 days.",
+            92 * 24 * 60 * 60,
+        );
+    }
+
+    #[test]
+    fn inferred_storage_action_rejects_ambiguous_or_mismatched_periods() {
+        assert!(inferred_storage_action("Why did storage increase last week?").is_none());
+        assert!(
+            inferred_storage_action("Compare storage over the last 7 days with previous 3 days")
+                .is_none()
+        );
+        assert!(
+            inferred_storage_action("Compare storage over the last 7 days versus previous week")
+                .is_none()
+        );
+        assert!(
+            inferred_storage_action(
+                "Compare storage over the last 7 days versus previous 7 days or prior 3 days"
+            )
+            .is_none()
+        );
+        assert!(
+            inferred_storage_action("Compare storage over the last 7 days against previous 7 days")
+                .is_some()
+        );
+        assert!(
+            inferred_storage_action(
+                "Compare storage over the last 7 days versus previous 7 days and today"
+            )
+            .is_none()
+        );
+        assert!(
+            inferred_storage_action(
+                "Compare storage from last 7 days with previous 7 days against yesterday"
+            )
+            .is_none()
+        );
+        assert!(
+            inferred_storage_action(
+                "Compare storage over the last 93 days versus previous 93 days"
+            )
+            .is_none()
+        );
+        assert!(
+            inferred_storage_action("Compare memory over the last 7 days versus previous 7 days")
+                .is_none()
+        );
+        assert!(
+            inferred_storage_action(
+                "Compare storage and cpu over the last 7 days versus previous 7 days"
+            )
+            .is_none()
+        );
+        assert!(
+            inferred_storage_action(
+                "Why did disk usage change from yesterday to today while memory increased?"
+            )
+            .is_none()
+        );
+        assert!(inferred_storage_action("Compare storage last 7 days").is_none());
+        assert!(
+            inferred_storage_action(
+                "Compare storage over the last 7 days and last 3 days versus previous 7 days"
+            )
+            .is_none()
+        );
+        assert!(
+            inferred_storage_action("Compare storage over the last 7 days to previous 7 days")
+                .is_some()
+        );
+        assert!(
+            inferred_storage_action("Compare storage over the last 7 days with previous 7 days")
+                .is_some()
+        );
+        assert!(inferred_storage_action("Compare storage today and yesterday").is_none());
+        assert!(inferred_storage_action("Compare storage from today to yesterday").is_none());
+        assert!(inferred_storage_action("Compare storage yesterday to today").is_none());
+        assert!(inferred_storage_action("Compare storage today versus yesterday").is_some());
+        assert!(inferred_storage_action("Compare storage today with yesterday").is_some());
+        assert!(inferred_storage_action("Compare storage today compared with yesterday").is_some());
+        assert!(inferred_storage_action("Compare storage today compared to yesterday").is_some());
+        assert!(inferred_storage_action("Compare storage today compared yesterday").is_none());
+        assert!(
+            inferred_storage_action("Compare storage today compared against yesterday").is_none()
+        );
+        assert!(inferred_storage_action("Compare storage today against yesterday").is_some());
     }
 
     #[test]
