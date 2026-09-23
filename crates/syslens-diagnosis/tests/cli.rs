@@ -63,6 +63,46 @@ fn help_lists_local_storage_diagnosis() {
 }
 
 #[test]
+fn scan_storage_only_requests_the_daemon() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("diagnosis.sqlite");
+    let conn = open_db(&db).unwrap();
+    conn.execute(
+        "INSERT INTO metadata(key,value) VALUES('next_storage_scan','123')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
+        .args(["scan-storage", "--database", db.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("storage scan requested"));
+
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let next: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='next_storage_scan'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let scans: i64 = conn
+        .query_row("SELECT count(*) FROM storage_scans", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(next, "0");
+    assert_eq!(scans, 0);
+}
+
+#[test]
 fn help_lists_explicit_system_mode_without_replacing_user_commands() {
     let output = Command::new(env!("CARGO_BIN_EXE_syslens-diagnosis"))
         .arg("--help")

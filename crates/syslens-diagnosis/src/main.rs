@@ -61,6 +61,16 @@ enum CommandLine {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Request an immediate bounded storage scan from the running daemon.
+    ScanStorage {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Target the privileged system recorder instead of the user recorder.
+        #[arg(long)]
+        system: bool,
+    },
     Daemon {
         #[arg(long)]
         config: PathBuf,
@@ -220,6 +230,39 @@ fn system_binary(binary: Option<PathBuf>) -> Result<PathBuf, String> {
     let path = binary.unwrap_or_else(|| PathBuf::from("/usr/bin/syslens-diagnosis"));
     diagnosis::validate_system_binary(&path).map(|_| path)
 }
+fn scan_storage(
+    config: Option<PathBuf>,
+    database: Option<PathBuf>,
+    system: bool,
+) -> Result<(), String> {
+    let system_config = diagnosis::system_config_path();
+    let system_database = diagnosis::system_database_path();
+    let database_was_explicit = database.is_some();
+    let config = config.unwrap_or_else(|| {
+        if system {
+            system_config.clone()
+        } else {
+            diagnosis::config_path()
+        }
+    });
+    let database = database.unwrap_or_else(|| diagnosis::database_path_for_config(&config));
+    let system_mode = system || config == system_config || database == system_database;
+    if system_mode {
+        require_root("scan-storage")?;
+        diagnosis::validate_config_permissions(&config)?;
+    } else if !database_was_explicit && !config.exists() {
+        return Err(format!(
+            "diagnosis is not enabled: configuration does not exist at {}; run `syslens-diagnosis enable` first",
+            config.display()
+        ));
+    }
+    diagnosis::request_storage_scan(&database)?;
+    println!(
+        "storage scan requested for {}; the running daemon will start its bounded scan on the next loop (this command did not scan or delete evidence)",
+        database.display()
+    );
+    Ok(())
+}
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let r = match cli.command {
@@ -334,6 +377,11 @@ fn main() -> ExitCode {
             })
         }),
         CommandLine::Status { config } => status(config.unwrap_or_else(diagnosis::config_path)),
+        CommandLine::ScanStorage {
+            config,
+            database,
+            system,
+        } => scan_storage(config, database, system),
         CommandLine::Daemon {
             config,
             database,

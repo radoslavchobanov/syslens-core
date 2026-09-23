@@ -1235,6 +1235,44 @@ pub fn open_db(path: &Path) -> Result<Connection, String> {
     secure_database_files(path)?;
     Ok(conn)
 }
+
+/// Request that the running recorder perform its next bounded storage scan.
+///
+/// This is intentionally a control-plane write, not a scan implementation:
+/// it only resets the daemon's scheduling metadata and leaves all evidence
+/// rows untouched. The command uses its own short-lived SQLite connection so
+/// it can be used while the recorder is active; SQLite's busy timeout handles
+/// the normal writer hand-off.
+pub fn request_storage_scan(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!(
+            "evidence database does not exist at {}; enable diagnosis first",
+            path.display()
+        ));
+    }
+    if let Some(warning) = database_permissions_warning(path) {
+        return Err(format!("unsafe evidence permissions: {warning}"));
+    }
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("cannot open evidence database for a scan request: {e}"))?;
+    conn.busy_timeout(StdDuration::from_secs(5))
+        .map_err(|e| format!("cannot configure SQLite busy timeout: {e}"))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("cannot begin storage scan request: {e}"))?;
+    tx.execute(
+        "INSERT INTO metadata(key,value) VALUES('next_storage_scan','0') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [],
+    )
+    .map_err(|e| format!("cannot request storage scan: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("cannot commit storage scan request: {e}"))?;
+    Ok(())
+}
+
 pub fn initialize_db(path: &Path, config: &Config) -> Result<Connection, String> {
     let conn = open_db(path)?;
     conn.execute("INSERT INTO metadata(key,value) VALUES('interval_seconds',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [config.interval_seconds.to_string()]).map_err(|e| e.to_string())?;
@@ -6042,6 +6080,35 @@ mod tests {
                 .unwrap(),
             2
         )
+    }
+
+    #[test]
+    fn storage_scan_request_only_resets_schedule_metadata() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let conn = open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES('next_storage_scan','123')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        request_storage_scan(&path).unwrap();
+
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let next: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='next_storage_scan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let scan_count: i64 = conn
+            .query_row("SELECT count(*) FROM storage_scans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(next, "0");
+        assert_eq!(scan_count, 0);
     }
 
     #[test]
