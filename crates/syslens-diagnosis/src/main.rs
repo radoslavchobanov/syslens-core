@@ -811,6 +811,8 @@ fn daemon(config: PathBuf, database: Option<PathBuf>, system: bool) -> Result<()
                                     ),
                                     entries_seen: 0,
                                     directories: vec![],
+                                    files: vec![],
+                                    file_sample_status: "incomplete".into(),
                                 }
                             }
                         };

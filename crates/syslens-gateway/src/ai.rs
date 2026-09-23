@@ -479,6 +479,9 @@ pub(crate) struct RootStorageFacts {
     /// and are descriptive evidence only; they must never be added to the
     /// top-level accounting findings.
     pub(crate) directory_details: Vec<String>,
+    /// Concrete sampled file deltas. These overlap with directory and mount
+    /// totals and are descriptive evidence only; never add them together.
+    pub(crate) file_findings: Vec<String>,
     pub(crate) current_directory_snapshot: Vec<String>,
     pub(crate) limitations: Vec<String>,
 }
@@ -500,11 +503,36 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
 /// bounded fact block and never as instructions.
 pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
     let data = evidence.get("data")?;
-    let root = data
+    let mut root_mounts = data
         .get("mounts")?
         .as_array()?
         .iter()
-        .find(|mount| mount.get("mount_point").and_then(Value::as_str) == Some("/"))?;
+        .filter(|mount| mount.get("mount_point").and_then(Value::as_str) == Some("/"))
+        .collect::<Vec<_>>();
+    root_mounts.sort_by(|left, right| {
+        left.get("mount_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(right.get("mount_id").and_then(Value::as_str).unwrap_or(""))
+            .then_with(|| {
+                left.get("fs_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(right.get("fs_type").and_then(Value::as_str).unwrap_or(""))
+            })
+            .then_with(|| {
+                left.get("current_used_bytes")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    .cmp(
+                        &right
+                            .get("current_used_bytes")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+    let root = root_mounts.into_iter().next()?;
     let used_bytes_change = root.get("used_bytes_change")?.as_i64()?;
     let current = data.get("current")?;
     let comparison = data.get("comparison")?;
@@ -581,6 +609,68 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .take(12)
         .map(|(_, _, _, formatted)| formatted)
         .collect();
+    let mut file_findings = data
+        .get("file_findings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|file| {
+            file.get("mount_id").and_then(Value::as_str) == Some(root_mount_id)
+                && file.get("root").and_then(Value::as_str) == Some("/")
+        })
+        .filter_map(|file| {
+            let path = file.get("path")?.as_str()?;
+            let allocated = file.get("allocated_bytes_change")?.as_i64()?;
+            let apparent = file.get("apparent_bytes_change")?.as_i64()?;
+            let current_allocated = file.get("current_allocated_bytes")?.as_i64()?;
+            let comparison_allocated = file.get("comparison_allocated_bytes")?.as_i64()?;
+            let current_apparent = file.get("current_apparent_bytes")?.as_i64()?;
+            let comparison_apparent = file.get("comparison_apparent_bytes")?.as_i64()?;
+            let baseline_status = file
+                .get("baseline_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let current_mtime = file
+                .get("current_mtime_utc")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let comparison_mtime = file
+                .get("comparison_mtime_utc")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let current_ctime = file
+                .get("current_ctime_utc")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let comparison_ctime = file
+                .get("comparison_ctime_utc")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let formatted = format!(
+                "{} baseline_status={} allocated_change={allocated:+} bytes apparent_change={apparent:+} bytes current_allocated={current_allocated} bytes comparison_allocated={comparison_allocated} bytes current_apparent={current_apparent} bytes comparison_apparent={comparison_apparent} bytes current_mtime_utc={} comparison_mtime_utc={} current_ctime_utc={} comparison_ctime_utc={}",
+                bounded_text(path, 512),
+                bounded_text(baseline_status, 64),
+                bounded_text(current_mtime, 128),
+                bounded_text(comparison_mtime, 128),
+                bounded_text(current_ctime, 128),
+                bounded_text(comparison_ctime, 128),
+            );
+            Some((allocated, apparent, path, formatted))
+        })
+        .collect::<Vec<_>>();
+    file_findings.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let file_findings = file_findings
+        .into_iter()
+        .take(12)
+        .map(|(_, _, _, formatted)| formatted)
+        .collect();
     let mut current_directory_snapshot = data
         .get("current_directory_snapshot")
         .and_then(Value::as_array)
@@ -635,6 +725,7 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         path_attribution_status: bounded_text(path_attribution_status, 128),
         directories,
         directory_details,
+        file_findings,
         current_directory_snapshot,
         limitations,
     })
@@ -650,6 +741,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
     // data even when they contain instruction-like text.
     let mut directories = facts.directories.clone();
     let mut directory_details = facts.directory_details.clone();
+    let mut file_findings = facts.file_findings.clone();
     let mut current_directory_snapshot = facts.current_directory_snapshot.clone();
     let mut limitations = facts.limitations.clone();
     loop {
@@ -672,6 +764,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             "path_attribution_status": facts.path_attribution_status,
             "directory_findings": directories,
             "directory_detail_findings": directory_details,
+            "file_findings": file_findings,
             "current_directory_snapshot": current_directory_snapshot,
             "limitations": limitations,
         });
@@ -686,6 +779,9 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             continue;
         }
         if directory_details.pop().is_some() {
+            continue;
+        }
+        if file_findings.pop().is_some() {
             continue;
         }
         if current_directory_snapshot.pop().is_some() {
@@ -705,6 +801,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
             "path_attribution_status": facts.path_attribution_status,
             "directory_findings": [],
             "directory_detail_findings": [],
+            "file_findings": [],
             "current_directory_snapshot": [],
             "limitations": ["Canonical storage facts were bounded before delivery"],
         }))
@@ -748,6 +845,13 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
             "Recursive nested directory detail findings (overlapping and non-additive; do not sum with historical directory delta findings): ",
         );
         summary.push_str(&facts.directory_details.join("; "));
+        summary.push_str(". ");
+    }
+    if !facts.file_findings.is_empty() {
+        summary.push_str(
+            "Concrete sampled file findings (overlapping and non-additive; do not sum with directory or mount deltas): ",
+        );
+        summary.push_str(&facts.file_findings.join("; "));
         summary.push_str(". ");
     }
     if !facts.limitations.is_empty() {
@@ -1718,6 +1822,26 @@ mod tests {
     }
 
     #[test]
+    fn root_storage_facts_choose_duplicate_root_mounts_deterministically() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"a","end_utc":"b"},
+                "comparison": {"start_utc":"c","end_utc":"d"},
+                "mounts": [
+                    {"mount_id":"z-root","mount_point":"/","fs_type":"ext4","current_used_bytes":900i64,"comparison_used_bytes":800i64,"used_bytes_change":100i64},
+                    {"mount_id":"a-root","mount_point":"/","fs_type":"ext4","current_used_bytes":700i64,"comparison_used_bytes":600i64,"used_bytes_change":100i64}
+                ],
+                "directories": [],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        assert_eq!(facts.current_used_bytes, 700);
+        assert_eq!(facts.comparison_used_bytes, 600);
+    }
+
+    #[test]
     fn root_storage_facts_filter_directory_mount_and_root() {
         let mut directories = Vec::new();
         for index in 0..13 {
@@ -1914,6 +2038,79 @@ mod tests {
         assert!(summary.contains("Recursive nested directory detail findings"));
         assert!(summary.contains("overlapping and non-additive; do not sum"));
         assert!(summary.contains("/var/lib/docker"));
+    }
+
+    #[test]
+    fn root_storage_facts_include_bounded_non_additive_file_findings() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"current-start","end_utc":"current-end"},
+                "comparison": {"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts": [{
+                    "mount_id":"root-mount",
+                    "mount_point":"/",
+                    "current_used_bytes":1100i64,
+                    "comparison_used_bytes":1000i64,
+                    "used_bytes_change":100i64
+                }],
+                "directories": [],
+                "file_findings": [
+                    {
+                        "mount_id":"root-mount",
+                        "root":"/",
+                        "path":"/var/lib/libvirt/images/minecraft.qcow2",
+                        "allocated_bytes_change":90i64,
+                        "apparent_bytes_change":100i64,
+                        "current_allocated_bytes":200i64,
+                        "comparison_allocated_bytes":110i64,
+                        "current_apparent_bytes":220i64,
+                        "comparison_apparent_bytes":120i64,
+                        "current_mtime_utc":"2026-09-23T12:00:00Z",
+                        "comparison_mtime_utc":"2026-09-22T12:00:00Z",
+                        "current_ctime_utc":"2026-09-23T11:00:00Z",
+                        "comparison_ctime_utc":"2026-09-22T11:00:00Z",
+                        "baseline_status":"known"
+                    },
+                    {
+                        "mount_id":"root-mount",
+                        "root":"/",
+                        "path":"/var/lib/unknown.img",
+                        "allocated_bytes_change":80i64,
+                        "apparent_bytes_change":90i64,
+                        "current_allocated_bytes":80i64,
+                        "comparison_allocated_bytes":0i64,
+                        "current_apparent_bytes":90i64,
+                        "comparison_apparent_bytes":0i64,
+                        "baseline_status":"unknown"
+                    },
+                    {
+                        "mount_id":"other-mount",
+                        "root":"/",
+                        "path":"/wrong",
+                        "allocated_bytes_change":9999i64,
+                        "apparent_bytes_change":9999i64,
+                        "current_allocated_bytes":9999i64,
+                        "comparison_allocated_bytes":0i64,
+                        "current_apparent_bytes":9999i64,
+                        "comparison_apparent_bytes":0i64
+                    }
+                ],
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        assert_eq!(facts.file_findings.len(), 2);
+        assert!(facts.file_findings[0].contains("minecraft.qcow2"));
+        assert!(facts.file_findings[0].contains("current_mtime_utc=2026-09-23"));
+        assert!(facts.file_findings[0].contains("current_ctime_utc=2026-09-23"));
+        assert!(facts.file_findings[1].contains("baseline_status=unknown"));
+        let canonical: Value = serde_json::from_str(&canonical_storage_facts(&facts)).unwrap();
+        assert_eq!(canonical["file_findings"].as_array().unwrap().len(), 2);
+        let summary = deterministic_storage_summary(&facts);
+        assert!(summary.contains("Concrete sampled file findings"));
+        assert!(summary.contains("non-additive"));
+        assert!(summary.contains("minecraft.qcow2"));
     }
 
     #[test]

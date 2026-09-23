@@ -7,7 +7,7 @@ use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
@@ -31,13 +31,16 @@ fn with_api_query_deadline<T>(
     })
 }
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 pub const MIN_SQLITE: (i32, i32, i32) = (3, 51, 3);
 pub const GIB: u64 = 1024 * 1024 * 1024;
 const CONTROL_HEADROOM: u64 = 64 * 1024 * 1024;
 const CURRENT_DIRECTORY_SNAPSHOT_PER_ROOT_MOUNT_LIMIT: i64 = 32;
 const CURRENT_DIRECTORY_SNAPSHOT_TOTAL_LIMIT: i64 = 256;
 const STORAGE_DIRECTORY_DETAILS_LIMIT: usize = 200;
+/// File evidence is deliberately a sample: retaining every path would make a
+/// long-lived home-server evidence database grow with directory cardinality.
+pub const STORAGE_FILE_SAMPLE_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1345,6 +1348,59 @@ fn version_at_least(text: &str, min: (i32, i32, i32)) -> bool {
         p.get(2).copied().unwrap_or(0),
     ) >= min
 }
+fn validate_file_samples_shape(conn: &Connection) -> Result<bool, String> {
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_samples'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+    let mut columns = BTreeMap::new();
+    let mut statement = conn
+        .prepare("PRAGMA table_info(file_samples)")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (name, column_type, primary_key) = row.map_err(|e| e.to_string())?;
+        columns.insert(name, (column_type, primary_key));
+    }
+    let required = [
+        ("scan_id", "INTEGER", true),
+        ("path", "TEXT", true),
+        ("allocated_bytes", "INTEGER", false),
+        ("apparent_bytes", "INTEGER", false),
+        ("mtime", "INTEGER", false),
+        ("ctime", "INTEGER", false),
+    ];
+    for (name, expected_type, primary_key) in required {
+        let Some((column_type, column_primary_key)) = columns.get(name) else {
+            return Err(format!(
+                "existing file_samples table has incompatible schema: missing {name} column"
+            ));
+        };
+        if !column_type.eq_ignore_ascii_case(expected_type)
+            || (primary_key && *column_primary_key == 0)
+        {
+            return Err(format!(
+                "existing file_samples table has incompatible schema: invalid {name} column"
+            ));
+        }
+    }
+    Ok(true)
+}
 fn migrate(conn: &Connection) -> Result<(), String> {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -1417,6 +1473,36 @@ PRAGMA user_version=3; COMMIT;").map_err(|e|e.to_string())?;
         tx.execute_batch("PRAGMA user_version=4;")
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+    }
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if v == 4 {
+        let existing = validate_file_samples_shape(conn)?;
+        if existing {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+CREATE INDEX IF NOT EXISTS file_samples_path ON file_samples(path);
+PRAGMA user_version=5; COMMIT;",
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            conn.execute_batch("BEGIN IMMEDIATE;
+CREATE TABLE file_samples (scan_id INTEGER NOT NULL REFERENCES storage_scans(id) ON DELETE CASCADE, path TEXT NOT NULL, allocated_bytes INTEGER NOT NULL, apparent_bytes INTEGER NOT NULL, mtime INTEGER, ctime INTEGER, PRIMARY KEY(scan_id,path));
+CREATE INDEX file_samples_path ON file_samples(path);
+PRAGMA user_version=5; COMMIT;").map_err(|e| e.to_string())?;
+        }
+    }
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if v == 5 {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+ALTER TABLE storage_scans ADD COLUMN file_sample_status TEXT NOT NULL DEFAULT 'unknown';
+PRAGMA user_version=6; COMMIT;",
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -3702,6 +3788,14 @@ pub struct DirectorySample {
     pub file_count: i64,
 }
 #[derive(Debug, Clone)]
+pub struct FileSample {
+    pub path: String,
+    pub allocated_bytes: i64,
+    pub apparent_bytes: i64,
+    pub mtime: Option<i64>,
+    pub ctime: Option<i64>,
+}
+#[derive(Debug, Clone)]
 pub struct ScanResult {
     pub root: String,
     pub mount_id: Option<String>,
@@ -3711,6 +3805,13 @@ pub struct ScanResult {
     pub reason: Option<String>,
     pub entries_seen: i64,
     pub directories: Vec<DirectorySample>,
+    /// Largest files observed during this scan. This is intentionally bounded
+    /// and descriptive; it must not be added to directory or mount totals.
+    pub files: Vec<FileSample>,
+    /// `complete`, `saturated`, `incomplete`, or `unknown` for legacy/manual
+    /// scans. A saturated or unknown comparison cannot prove a missing path is
+    /// truly zero-sized.
+    pub file_sample_status: String,
 }
 /// The scanner stores only root plus at most `max_depth` nested directories.
 /// This computes the bounded aggregation targets for one observed entry without
@@ -3763,6 +3864,8 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
                 reason: Some(format!("root unavailable: {e}")),
                 entries_seen: 0,
                 directories: vec![],
+                files: vec![],
+                file_sample_status: "incomplete".into(),
             };
         }
     };
@@ -3776,6 +3879,8 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
             reason: Some("root is a symlink".into()),
             entries_seen: 0,
             directories: vec![],
+            files: vec![],
+            file_sample_status: "incomplete".into(),
         };
     }
     let root_dev = std::os::unix::fs::MetadataExt::dev(&root_meta);
@@ -3783,6 +3888,8 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
     let root_allocated = (std::os::unix::fs::MetadataExt::blocks(&root_meta) as i64) * 512;
     let root_apparent = std::os::unix::fs::MetadataExt::size(&root_meta) as i64;
     let mut directories = BTreeMap::<PathBuf, DirectorySample>::new();
+    let mut files = BinaryHeap::<FileSample>::new();
+    let mut file_sample_saturated = false;
     directories.insert(
         root.to_path_buf(),
         DirectorySample {
@@ -3819,6 +3926,8 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         seen: &mut HashSet<(u64, u64)>,
         entries: &mut u64,
         dirs: &mut BTreeMap<PathBuf, DirectorySample>,
+        files: &mut BinaryHeap<FileSample>,
+        file_sample_saturated: &mut bool,
         reason: &mut Option<String>,
         stop: &mut bool,
     ) {
@@ -3913,6 +4022,27 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
                     }
                 }
             }
+            if !is_dir {
+                if files.len() >= STORAGE_FILE_SAMPLE_LIMIT {
+                    *file_sample_saturated = true;
+                }
+                let candidate = FileSample {
+                    path: path.display().to_string(),
+                    allocated_bytes: allocated,
+                    apparent_bytes: apparent,
+                    mtime: Some(std::os::unix::fs::MetadataExt::mtime(&m)),
+                    ctime: Some(std::os::unix::fs::MetadataExt::ctime(&m)),
+                };
+                if files.len() < STORAGE_FILE_SAMPLE_LIMIT {
+                    files.push(candidate);
+                } else if files
+                    .peek()
+                    .is_some_and(|worst| file_sample_order(&candidate, worst).is_gt())
+                {
+                    files.pop();
+                    files.push(candidate);
+                }
+            }
             if is_dir {
                 walk(
                     &path,
@@ -3924,6 +4054,8 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
                     seen,
                     entries,
                     dirs,
+                    files,
+                    file_sample_saturated,
                     reason,
                     stop,
                 )
@@ -3940,10 +4072,21 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         &mut seen,
         &mut entries,
         &mut directories,
+        &mut files,
+        &mut file_sample_saturated,
         &mut reason,
         &mut stop,
     );
     let ended = now + elapsed().as_secs() as i64;
+    let mut files: Vec<_> = files.into_vec();
+    files.sort_by(|left, right| file_sample_order(right, left));
+    let file_sample_status = if reason.is_some() {
+        "incomplete"
+    } else if file_sample_saturated {
+        "saturated"
+    } else {
+        "complete"
+    };
     ScanResult {
         root: root_s,
         mount_id,
@@ -3957,11 +4100,39 @@ pub fn scan_directory_with_elapsed<F: Fn() -> StdDuration>(
         reason,
         entries_seen: entries as i64,
         directories: directories.into_values().collect(),
+        files,
+        file_sample_status: file_sample_status.into(),
+    }
+}
+fn file_sample_order(left: &FileSample, right: &FileSample) -> std::cmp::Ordering {
+    left.allocated_bytes
+        .cmp(&right.allocated_bytes)
+        .then_with(|| left.apparent_bytes.cmp(&right.apparent_bytes))
+        .then_with(|| right.path.cmp(&left.path))
+}
+impl PartialEq for FileSample {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.allocated_bytes == other.allocated_bytes
+            && self.apparent_bytes == other.apparent_bytes
+    }
+}
+impl Eq for FileSample {}
+impl PartialOrd for FileSample {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FileSample {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap::peek must expose the least useful (worst) retained
+        // sample so replacement is O(log N), not a scan of all 128 rows.
+        file_sample_order(other, self)
     }
 }
 pub fn insert_scan(conn: &mut Connection, s: &ScanResult) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute("INSERT INTO storage_scans(root,mount_id,started_at,ended_at,status,reason,entries_seen) VALUES(?,?,?,?,?,?,?)",params![s.root,s.mount_id,s.started_at,s.ended_at,s.status,s.reason,s.entries_seen]).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO storage_scans(root,mount_id,started_at,ended_at,status,reason,entries_seen,file_sample_status) VALUES(?,?,?,?,?,?,?,?)",params![s.root,s.mount_id,s.started_at,s.ended_at,s.status,s.reason,s.entries_seen,s.file_sample_status]).map_err(|e|e.to_string())?;
     let id = tx.last_insert_rowid();
     for d in &s.directories {
         tx.execute(
@@ -3973,6 +4144,20 @@ pub fn insert_scan(conn: &mut Connection, s: &ScanResult) -> Result<(), String> 
                 d.apparent_bytes,
                 d.entry_count,
                 d.file_count
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for file in &s.files {
+        tx.execute(
+            "INSERT INTO file_samples VALUES(?,?,?,?,?,?)",
+            params![
+                id,
+                file.path,
+                file.allocated_bytes,
+                file.apparent_bytes,
+                file.mtime,
+                file.ctime
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -4428,6 +4613,10 @@ pub struct StorageDiagnosis {
     /// `directories`, these overlap and must never be summed for attribution.
     #[serde(default)]
     pub directory_details: Vec<DirectoryFinding>,
+    /// Positive file deltas from a bounded top-file sample. These overlap
+    /// with directory and mount totals and are descriptive only; never sum.
+    #[serde(default)]
+    pub file_findings: Vec<FileFinding>,
     pub current_directory_snapshot: Vec<CurrentDirectorySnapshot>,
     pub path_attribution_status: String,
     pub limitations: Vec<String>,
@@ -4455,6 +4644,34 @@ pub struct DirectoryFinding {
     pub path: String,
     pub allocated_bytes_change: i64,
     pub apparent_bytes_change: i64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FileFinding {
+    pub mount_id: String,
+    pub root: String,
+    pub path: String,
+    pub allocated_bytes_change: i64,
+    pub apparent_bytes_change: i64,
+    pub current_allocated_bytes: i64,
+    pub comparison_allocated_bytes: i64,
+    pub current_apparent_bytes: i64,
+    pub comparison_apparent_bytes: i64,
+    /// `known` when the comparison path exists, `growth_from_zero` only when
+    /// an unsaturated complete comparison sample omitted it, otherwise
+    /// `unknown` because the comparison sample cannot prove absence.
+    #[serde(default = "default_file_baseline_status")]
+    pub baseline_status: String,
+    #[serde(default)]
+    pub current_mtime_utc: Option<String>,
+    #[serde(default)]
+    pub comparison_mtime_utc: Option<String>,
+    #[serde(default)]
+    pub current_ctime_utc: Option<String>,
+    #[serde(default)]
+    pub comparison_ctime_utc: Option<String>,
+}
+fn default_file_baseline_status() -> String {
+    "unknown".into()
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CurrentDirectorySnapshot {
@@ -4752,6 +4969,203 @@ pub fn diagnose_storage_windows(
         .take(STORAGE_DIRECTORY_DETAILS_LIMIT)
         .cloned()
         .collect();
+    let preferred_root_mount_id = mounts
+        .iter()
+        .filter(|mount| mount.mount_point == "/")
+        .map(|mount| mount.mount_id.as_str())
+        .min()
+        .unwrap_or_default();
+    let mut fstmt = conn
+        .prepare(
+            "WITH current_latest AS (
+                 SELECT root, mount_id, MAX(started_at) AS started_at
+                 FROM storage_scans
+                 WHERE status = 'complete' AND mount_id IS NOT NULL
+                   AND started_at >= ?1 AND started_at <= ?2
+                 GROUP BY root, mount_id
+             ), comparison_latest AS (
+                 SELECT root, mount_id, MAX(started_at) AS started_at
+                 FROM storage_scans
+                 WHERE status = 'complete' AND mount_id IS NOT NULL
+                   AND started_at >= ?3 AND started_at <= ?4
+                 GROUP BY root, mount_id
+             ), candidates AS (
+                 SELECT current.mount_id, current.root, current_file.path,
+                        current_file.allocated_bytes -
+                            COALESCE(comparison_file.allocated_bytes, 0) AS allocated_bytes_change,
+                        current_file.apparent_bytes -
+                            COALESCE(comparison_file.apparent_bytes, 0) AS apparent_bytes_change,
+                        current_file.allocated_bytes,
+                        COALESCE(comparison_file.allocated_bytes, 0) AS comparison_allocated_bytes,
+                        current_file.apparent_bytes,
+                        COALESCE(comparison_file.apparent_bytes, 0) AS comparison_apparent_bytes,
+                        current_file.mtime AS current_mtime,
+                        comparison_file.mtime AS comparison_mtime,
+                        current_file.ctime AS current_ctime,
+                        comparison_file.ctime AS comparison_ctime,
+                        comparison_file.path AS comparison_path,
+                        comparison.file_sample_status AS comparison_sample_status
+                 FROM current_latest
+             JOIN storage_scans AS current
+               ON current.root = current_latest.root
+              AND current.mount_id = current_latest.mount_id
+              AND current.started_at = current_latest.started_at
+             JOIN file_samples AS current_file
+               ON current_file.scan_id = current.id
+             JOIN comparison_latest
+               ON comparison_latest.root = current_latest.root
+              AND comparison_latest.mount_id = current_latest.mount_id
+             JOIN storage_scans AS comparison
+               ON comparison.root = comparison_latest.root
+              AND comparison.mount_id = comparison_latest.mount_id
+              AND comparison.started_at = comparison_latest.started_at
+             LEFT JOIN file_samples AS comparison_file
+               ON comparison_file.scan_id = comparison.id
+              AND comparison_file.path = current_file.path
+                 WHERE current_file.allocated_bytes -
+                           COALESCE(comparison_file.allocated_bytes, 0) > 0
+                    OR current_file.apparent_bytes -
+                           COALESCE(comparison_file.apparent_bytes, 0) > 0
+             ), ranked AS (
+                 SELECT candidates.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mount_id, root
+                            ORDER BY allocated_bytes_change DESC,
+                                     apparent_bytes_change DESC,
+                                     path ASC
+                        ) AS file_rank
+                 FROM candidates
+             )
+             SELECT mount_id, root, path, allocated_bytes_change,
+                    apparent_bytes_change, allocated_bytes,
+                    comparison_allocated_bytes, apparent_bytes,
+                    comparison_apparent_bytes, current_mtime, comparison_mtime,
+                    current_ctime, comparison_ctime, comparison_path,
+                    comparison_sample_status
+             FROM ranked
+             WHERE file_rank <= ?6
+             ORDER BY CASE
+                          WHEN root = '/' AND mount_id = ?7 THEN 0
+                          WHEN root = '/' THEN 1
+                          ELSE 2
+                      END,
+                      allocated_bytes_change DESC,
+                      apparent_bytes_change DESC, path ASC,
+                      mount_id ASC, root ASC
+             LIMIT ?5",
+        )
+        .map_err(|e| e.to_string())?;
+    let file_rows = fstmt
+        .query_map(
+            params![
+                start.timestamp(),
+                end.timestamp(),
+                cs.timestamp(),
+                ce.timestamp(),
+                STORAGE_FILE_SAMPLE_LIMIT as i64,
+                STORAGE_FILE_SAMPLE_LIMIT as i64,
+                preferred_root_mount_id,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let file_findings: Vec<_> = file_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(
+            |(
+                mount_id,
+                root,
+                path,
+                allocated_bytes_change,
+                apparent_bytes_change,
+                current_allocated_bytes,
+                comparison_allocated_bytes,
+                current_apparent_bytes,
+                comparison_apparent_bytes,
+                current_mtime,
+                comparison_mtime,
+                current_ctime,
+                comparison_ctime,
+                comparison_path,
+                comparison_sample_status,
+            )| FileFinding {
+                mount_id,
+                root,
+                path,
+                allocated_bytes_change,
+                apparent_bytes_change,
+                current_allocated_bytes,
+                comparison_allocated_bytes,
+                current_apparent_bytes,
+                comparison_apparent_bytes,
+                baseline_status: if comparison_path.is_some() {
+                    "known".into()
+                } else if comparison_sample_status == "complete" {
+                    "growth_from_zero".into()
+                } else {
+                    "unknown".into()
+                },
+                current_mtime_utc: current_mtime.and_then(|value| {
+                    Utc.timestamp_opt(value, 0)
+                        .single()
+                        .map(|time| time.to_rfc3339())
+                }),
+                comparison_mtime_utc: comparison_mtime.and_then(|value| {
+                    Utc.timestamp_opt(value, 0)
+                        .single()
+                        .map(|time| time.to_rfc3339())
+                }),
+                current_ctime_utc: current_ctime.and_then(|value| {
+                    Utc.timestamp_opt(value, 0)
+                        .single()
+                        .map(|time| time.to_rfc3339())
+                }),
+                comparison_ctime_utc: comparison_ctime.and_then(|value| {
+                    Utc.timestamp_opt(value, 0)
+                        .single()
+                        .map(|time| time.to_rfc3339())
+                }),
+            },
+        )
+        .collect();
+    limits.push(format!(
+        "File findings are a descriptive, non-additive top-{STORAGE_FILE_SAMPLE_LIMIT} sample per scan; files outside that sample may be omitted."
+    ));
+    if file_findings
+        .iter()
+        .any(|finding| finding.baseline_status == "unknown")
+    {
+        limits.push(
+            "Some sampled file candidates have an unknown comparison baseline because the comparison file sample was saturated, incomplete, or legacy-unknown; their displayed deltas are not exact growth measurements."
+                .into(),
+        );
+    }
+    if file_findings.is_empty() {
+        limits.push(
+            "No positive sampled file delta is available for both storage intervals; file attribution may be incomplete."
+                .into(),
+        );
+    }
     if mounts.is_empty() {
         limits
             .push("No comparable available mount-capacity samples exist in both intervals.".into());
@@ -4769,6 +5183,7 @@ pub fn diagnose_storage_windows(
             mounts: vec![],
             directories: vec![],
             directory_details,
+            file_findings,
             current_directory_snapshot,
             path_attribution_status: "unavailable".into(),
             limitations: limits,
@@ -4843,6 +5258,7 @@ pub fn diagnose_storage_windows(
         mounts,
         directories,
         directory_details,
+        file_findings,
         current_directory_snapshot,
         path_attribution_status: path_attribution_status.into(),
         limitations: limits,
@@ -4881,6 +5297,20 @@ pub fn render_storage_diagnosis(d: &StorageDiagnosis) -> String {
             x.path,
             x.root,
             x.allocated_bytes_change / 1048576
+        ));
+    }
+    for x in &d.file_findings {
+        s.push_str(&format!(
+            "- File finding {} (root {}): baseline {}; {:+} MiB allocated, {:+} MiB apparent; current {} allocated / {} apparent bytes (mtime {:?}, ctime {:?})\n",
+            x.path,
+            x.root,
+            x.baseline_status,
+            x.allocated_bytes_change / 1048576,
+            x.apparent_bytes_change / 1048576,
+            x.current_allocated_bytes,
+            x.current_apparent_bytes,
+            x.current_mtime_utc,
+            x.current_ctime_utc,
         ));
     }
     for x in &d.current_directory_snapshot {
@@ -6035,9 +6465,44 @@ mod tests {
         assert_eq!(
             c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            6
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='file_samples'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM pragma_table_info('storage_scans') WHERE name='file_sample_status'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
         assert!(evidence_identities(&path).is_ok());
+    }
+
+    #[test]
+    fn migration_rejects_an_incompatible_existing_file_samples_table() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let c = open_db(&path).unwrap();
+        c.execute_batch(
+            "DROP TABLE file_samples;
+             CREATE TABLE file_samples(scan_id INTEGER PRIMARY KEY);
+             PRAGMA user_version=4;",
+        )
+        .unwrap();
+        drop(c);
+        let error = open_db(&path).unwrap_err();
+        assert!(error.contains("file_samples table has incompatible schema"));
+        assert!(error.contains("missing path column"));
     }
 
     #[test]
@@ -6104,6 +6569,35 @@ mod tests {
             .unwrap();
         assert_eq!(r.file_count, 2);
         assert!(r.apparent_bytes >= 4096 && r.apparent_bytes < 8192);
+    }
+
+    #[test]
+    fn directory_scan_keeps_only_bounded_largest_files_with_timestamps() {
+        let d = tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir(&root).unwrap();
+        for index in 0..(STORAGE_FILE_SAMPLE_LIMIT + 2) {
+            fs::write(
+                root.join(format!("file-{index:03}")),
+                vec![7_u8; (index + 1) * 4096],
+            )
+            .unwrap();
+        }
+        let scan = scan_directory(&root, Some("m".into()), &StorageConfig::default(), 1);
+        assert_eq!(scan.status, "complete");
+        assert_eq!(scan.files.len(), STORAGE_FILE_SAMPLE_LIMIT);
+        assert_eq!(
+            scan.files[0].path,
+            root.join("file-129").display().to_string()
+        );
+        assert!(scan.files.iter().all(|file| file.mtime.is_some()));
+        assert!(scan.files.iter().all(|file| file.ctime.is_some()));
+        assert!(
+            !scan
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("file-000"))
+        );
     }
 
     #[test]
@@ -6341,6 +6835,8 @@ mod tests {
                         entry_count: 1,
                         file_count: 1,
                     }],
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -6458,6 +6954,8 @@ mod tests {
                             })
                         })
                         .collect(),
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -6479,6 +6977,235 @@ mod tests {
             render_storage_diagnosis(&out)
                 .contains("Directory detail /var/lib/docker (root /): +70 MiB allocated")
         );
+    }
+
+    #[test]
+    fn storage_diagnosis_reports_current_only_file_growth_without_adding_it_to_directories() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (time, used, files) in [
+            (
+                now - 7 * 86400 - 60,
+                100_i64,
+                vec![FileSample {
+                    path: "/var/lib/old.img".into(),
+                    allocated_bytes: 10,
+                    apparent_bytes: 10,
+                    mtime: Some(now - 7 * 86400),
+                    ctime: Some(now - 7 * 86400),
+                }],
+            ),
+            (
+                now - 60,
+                500_i64,
+                vec![
+                    FileSample {
+                        path: "/var/lib/old.img".into(),
+                        allocated_bytes: 20,
+                        apparent_bytes: 20,
+                        mtime: Some(now - 3600),
+                        ctime: Some(now - 3600),
+                    },
+                    FileSample {
+                        path: "/var/lib/minecraft.qcow2".into(),
+                        allocated_bytes: 300,
+                        apparent_bytes: 300,
+                        mtime: Some(now - 120),
+                        ctime: Some(now - 120),
+                    },
+                ],
+            ),
+        ] {
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp: time,
+                    mount_id: "root-mount".into(),
+                    mount_point: "/".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(1000),
+                    free_bytes: Some(1000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/".into(),
+                    mount_id: Some("root-mount".into()),
+                    started_at: time,
+                    ended_at: time,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: files.len() as i64,
+                    directories: vec![],
+                    files,
+                    file_sample_status: "complete".into(),
+                },
+            )
+            .unwrap();
+        }
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.file_findings.len(), 2);
+        assert_eq!(out.file_findings[0].path, "/var/lib/minecraft.qcow2");
+        assert_eq!(out.file_findings[0].comparison_allocated_bytes, 0);
+        assert_eq!(out.file_findings[0].allocated_bytes_change, 300);
+        assert!(out.file_findings[0].current_mtime_utc.is_some());
+        assert_eq!(out.mounts[0].attributable_bytes, 0);
+        assert!(render_storage_diagnosis(&out).contains("File finding /var/lib/minecraft.qcow2"));
+        assert!(out.limitations.iter().any(
+            |limitation| limitation.contains("top-128") && limitation.contains("non-additive")
+        ));
+    }
+
+    #[test]
+    fn storage_diagnosis_marks_missing_file_baseline_unknown_when_comparison_sample_saturated() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (time, used, status, files) in [
+            (
+                now - 7 * 86400 - 60,
+                100_i64,
+                "saturated",
+                vec![FileSample {
+                    path: "/var/lib/other.img".into(),
+                    allocated_bytes: 10,
+                    apparent_bytes: 10,
+                    mtime: None,
+                    ctime: None,
+                }],
+            ),
+            (
+                now - 60,
+                500_i64,
+                "complete",
+                vec![FileSample {
+                    path: "/var/lib/new.img".into(),
+                    allocated_bytes: 300,
+                    apparent_bytes: 300,
+                    mtime: None,
+                    ctime: None,
+                }],
+            ),
+        ] {
+            insert_mounts(
+                &mut c,
+                &[MountSample {
+                    timestamp: time,
+                    mount_id: "root-mount".into(),
+                    mount_point: "/".into(),
+                    fs_type: "ext4".into(),
+                    total_bytes: Some(1000),
+                    free_bytes: Some(1000 - used),
+                    used_bytes: Some(used),
+                    total_inodes: None,
+                    free_inodes: None,
+                    read_only: false,
+                    capability: "available".into(),
+                }],
+            )
+            .unwrap();
+            insert_scan(
+                &mut c,
+                &ScanResult {
+                    root: "/".into(),
+                    mount_id: Some("root-mount".into()),
+                    started_at: time,
+                    ended_at: time,
+                    status: "complete".into(),
+                    reason: None,
+                    entries_seen: files.len() as i64,
+                    directories: vec![],
+                    files,
+                    file_sample_status: status.into(),
+                },
+            )
+            .unwrap();
+        }
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.file_findings.len(), 1);
+        assert_eq!(out.file_findings[0].baseline_status, "unknown");
+        assert!(
+            out.limitations
+                .iter()
+                .any(|limitation| limitation.contains("unknown comparison baseline"))
+        );
+        assert!(render_storage_diagnosis(&out).contains("baseline unknown"));
+    }
+
+    #[test]
+    fn storage_file_findings_prioritize_root_before_secondary_mounts() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("x.sqlite");
+        let mut c = open_db(&path).unwrap();
+        let now = unix_now();
+        for (mount_id, root, file_path, comparison_size, current_size) in [
+            ("root-mount", "/", "/root.img", 10_i64, 20_i64),
+            (
+                "secondary-mount",
+                "/srv",
+                "/srv/huge.img",
+                10_i64,
+                1_000_i64,
+            ),
+        ] {
+            for (time, used, size) in [
+                (now - 7 * 86400 - 60, 100_i64, comparison_size),
+                (now - 60, 300_i64, current_size),
+            ] {
+                insert_mounts(
+                    &mut c,
+                    &[MountSample {
+                        timestamp: time,
+                        mount_id: mount_id.into(),
+                        mount_point: root.into(),
+                        fs_type: "ext4".into(),
+                        total_bytes: Some(10_000),
+                        free_bytes: Some(10_000 - used),
+                        used_bytes: Some(used),
+                        total_inodes: None,
+                        free_inodes: None,
+                        read_only: false,
+                        capability: "available".into(),
+                    }],
+                )
+                .unwrap();
+                insert_scan(
+                    &mut c,
+                    &ScanResult {
+                        root: root.into(),
+                        mount_id: Some(mount_id.into()),
+                        started_at: time,
+                        ended_at: time,
+                        status: "complete".into(),
+                        reason: None,
+                        entries_seen: 1,
+                        directories: vec![],
+                        files: vec![FileSample {
+                            path: file_path.into(),
+                            allocated_bytes: size,
+                            apparent_bytes: size,
+                            mtime: None,
+                            ctime: None,
+                        }],
+                        file_sample_status: "complete".into(),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let out = diagnose_storage(&path, "1h", "previous-week").unwrap();
+        assert_eq!(out.file_findings[0].root, "/");
+        assert_eq!(out.file_findings[0].path, "/root.img");
     }
 
     #[test]
@@ -6529,6 +7256,8 @@ mod tests {
                     reason: None,
                     entries_seen: 205,
                     directories,
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -6561,6 +7290,7 @@ mod tests {
             mounts: vec![],
             directories: vec![],
             directory_details: vec![],
+            file_findings: vec![],
             current_directory_snapshot: vec![],
             path_attribution_status: "unavailable".into(),
             limitations: vec![],
@@ -6642,6 +7372,8 @@ mod tests {
                             file_count: 1,
                         })
                         .collect(),
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -6693,6 +7425,8 @@ mod tests {
                         entry_count: 1,
                         file_count: 1,
                     }],
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -6751,6 +7485,8 @@ mod tests {
                         entry_count: 1,
                         file_count: 1,
                     }],
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -6815,6 +7551,8 @@ mod tests {
                     entry_count: 1,
                     file_count: 1,
                 }],
+                files: vec![],
+                file_sample_status: "complete".into(),
             },
         )
         .unwrap();
@@ -6838,6 +7576,8 @@ mod tests {
                 reason: None,
                 entries_seen: 101,
                 directories,
+                files: vec![],
+                file_sample_status: "complete".into(),
             },
         )
         .unwrap();
@@ -6911,6 +7651,8 @@ mod tests {
                     entry_count: 1,
                     file_count: 1,
                 }],
+                files: vec![],
+                file_sample_status: "complete".into(),
             },
         )
         .unwrap();
@@ -6935,6 +7677,8 @@ mod tests {
                     reason: None,
                     entries_seen: 32,
                     directories,
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -7005,6 +7749,8 @@ mod tests {
                         entry_count: 1,
                         file_count: 1,
                     }],
+                    files: vec![],
+                    file_sample_status: "complete".into(),
                 },
             )
             .unwrap();
@@ -7094,6 +7840,8 @@ mod tests {
                             entry_count: 1,
                             file_count: 1,
                         }],
+                        files: vec![],
+                        file_sample_status: "complete".into(),
                     },
                 )
                 .unwrap();
@@ -7143,6 +7891,8 @@ mod tests {
                 reason: None,
                 entries_seen: 0,
                 directories: vec![],
+                files: vec![],
+                file_sample_status: "complete".into(),
             },
         )
         .unwrap();
