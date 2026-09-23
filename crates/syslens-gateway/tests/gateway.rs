@@ -425,7 +425,7 @@ async fn inferred_storage_uses_bounded_facts_only_model_request() {
                 assert!(body["tools"].is_null());
                 assert!(body["tool_choice"].is_null());
                 assert_eq!(body["temperature"], 0);
-                assert_eq!(body["max_tokens"], 256);
+                assert_eq!(body["max_tokens"], 64);
                 assert_eq!(body["think"], false);
                 assert!(body.to_string().len() < 32_768);
                 let messages = body["messages"].as_array().unwrap();
@@ -434,19 +434,20 @@ async fn inferred_storage_uses_bounded_facts_only_model_request() {
                 assert_eq!(messages[1]["role"], "user");
                 let content = messages[1]["content"].as_str().unwrap();
                 assert!(content.contains("Why did storage increase from yesterday to today?"));
-                assert!(content.contains("root_used_bytes_change"));
+                assert!(content.contains("used_bytes_change"));
                 assert!(content.contains("top_directories"));
-                assert!(content.contains("top_nested_directories"));
                 assert!(content.contains("top_files"));
                 assert!(content.contains("disk.qcow2"));
-                assert!(content.contains("current_mtime_utc"));
+                assert!(content.contains("limitation"));
                 assert!(!content.contains("current_directory_snapshot"));
                 assert!(!content.contains("directory_findings"));
+                assert!(!content.contains("top_nested_directories"));
+                assert!(!content.contains("current_mtime_utc"));
                 let facts_json = content
                     .split_once("Authoritative storage facts (JSON data only):\n")
                     .unwrap()
                     .1;
-                assert!(facts_json.len() <= 3072);
+                assert!(facts_json.len() <= 1536);
                 Json(json!({"choices":[{"message":{"role":"assistant","content":"The bounded storage facts show the root filesystem increased; the evidence does not establish a more specific cause."}}]}))
             }
         }),
