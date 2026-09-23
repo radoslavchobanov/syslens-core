@@ -28,6 +28,8 @@ use tokio::{
     sync::Semaphore,
 };
 
+const MAX_MODEL_EVIDENCE_BYTES: usize = 12_000;
+
 #[derive(Clone)]
 pub struct App {
     pub config: Arc<Config>,
@@ -65,6 +67,10 @@ struct ChatResponseContext<'a> {
 
 fn deterministic_recovery_answer(facts: Option<&ai::RootStorageFacts>) -> Option<String> {
     facts.map(ai::deterministic_storage_summary)
+}
+
+fn storage_evidence_exceeds_model_budget(evidence: &Value) -> bool {
+    evidence.to_string().len() > MAX_MODEL_EVIDENCE_BYTES
 }
 
 impl PrefetchedStorageEvidence {
@@ -231,7 +237,15 @@ impl App {
                     _ => unreachable!("storage inference returned a non-storage action"),
                 };
                 messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":"storage","arguments":arguments}}]}));
-                let model_evidence = if evidence.to_string().len() > 12_000 {
+                if storage_evidence_exceeds_model_budget(&evidence)
+                    && root_storage_facts.is_some()
+                {
+                    limitations.push("Evidence exceeded the model context budget; model analysis was skipped and a deterministic answer was returned from authoritative storage facts. Full evidence remains available through deterministic diagnosis".into());
+                    let answer = deterministic_recovery_answer(root_storage_facts.as_ref())
+                        .ok_or("oversized storage evidence has no authoritative root facts")?;
+                    return self.finish_chat(response_context, answer, refs, limitations);
+                }
+                let model_evidence = if storage_evidence_exceeds_model_budget(&evidence) {
                     limitations.push("Evidence exceeded model context budget; full result is available through deterministic diagnosis".into());
                     json!({"status":"insufficient_evidence","limitation":"Evidence omitted because it exceeds model context budget","request_id":evidence["request_id"]})
                 } else {
@@ -760,5 +774,14 @@ mod tests {
             Some(ai::deterministic_storage_summary(&facts))
         );
         assert_eq!(deterministic_recovery_answer(None), None);
+    }
+
+    #[test]
+    fn storage_evidence_budget_is_strictly_bounded() {
+        let below = json!({"padding":"x".repeat(MAX_MODEL_EVIDENCE_BYTES - 32)});
+        let above = json!({"padding":"x".repeat(MAX_MODEL_EVIDENCE_BYTES)});
+
+        assert!(!storage_evidence_exceeds_model_budget(&below));
+        assert!(storage_evidence_exceeds_model_budget(&above));
     }
 }

@@ -27,6 +27,7 @@ struct Fixture {
     host: Host,
     gap_floor: Arc<AtomicI64>,
     storage_calls: Arc<AtomicI64>,
+    oversized_storage: Arc<AtomicI64>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -78,15 +79,17 @@ async fn fixture() -> Fixture {
     let events_floor = gap_floor.clone();
     let storage_calls = Arc::new(AtomicI64::new(0));
     let storage_count = storage_calls.clone();
+    let oversized_storage = Arc::new(AtomicI64::new(0));
+    let oversized_storage_response = oversized_storage.clone();
     let router=Router::new().route("/v1/capabilities",get(||async{Json(envelope(json!({"timezone":"UTC","resources":["memory","storage"],"earliest_observation":null,"latest_observation":null})))}))
         .route("/v1/status",get(||async{Json(envelope(json!({"recording":"active","samples":10,"latest_observation":null,"freshness_seconds":0})))}))
         .route("/v1/events",get(move|Query(query):Query<BTreeMap<String,String>>|{let floor=events_floor.clone();async move{let after=query.get("after").and_then(|v|v.parse::<i64>().ok()).unwrap_or(0);let replay=floor.load(Ordering::Relaxed);if replay>after{(StatusCode::CONFLICT,Json(json!({"version":1,"request_id":"request","error":{"code":"history_gap","message":"notification history gap"},"replay_floor":replay}))).into_response()}else{Json(envelope(json!({"events":[],"next_cursor":after,"has_more":false}))).into_response()}}}))
         .route("/v1/evidence/memory",post(|Json(body):Json<Value>|async move{assert!(body["window"].is_object());Json(envelope(json!({"status":"insufficient evidence","limitations":["No comparison history yet"]})))}))
-        .route("/v1/evidence/storage",post(move|Json(body):Json<Value>|{let calls=storage_count.clone();async move{
+        .route("/v1/evidence/storage",post(move|Json(body):Json<Value>|{let calls=storage_count.clone();let oversized=oversized_storage_response.clone();async move{
             calls.fetch_add(1,Ordering::Relaxed);
             assert_eq!(body["window"]["relative"]["unit"],"today");
             assert_eq!(body["window"]["comparison"],"previous-day");
-            Json(envelope(json!({
+            let mut data = json!({
                 "current":{"start_utc":"2026-09-16T00:00:00Z","end_utc":"2026-09-16T12:00:00Z"},
                 "comparison":{"start_utc":"2026-09-15T00:00:00Z","end_utc":"2026-09-15T12:00:00Z"},
                 "mounts":[{"mount_id":"root","mount_point":"/","current_used_bytes":1100i64,"comparison_used_bytes":1000i64,"used_bytes_change":100i64}],
@@ -94,7 +97,11 @@ async fn fixture() -> Fixture {
                 "current_directory_snapshot":[],
                 "path_attribution_status":"unavailable",
                 "limitations":["No comparable historical directory scan"]
-            })))
+            });
+            if oversized.load(Ordering::Relaxed) != 0 {
+                data["limitations"] = json!(vec!["bounded evidence padding ".repeat(128); 16]);
+            }
+            Json(envelope(data))
         }}));
     let task = tokio::spawn(async move {
         loop {
@@ -123,6 +130,7 @@ async fn fixture() -> Fixture {
         },
         gap_floor,
         storage_calls,
+        oversized_storage,
         task,
     }
 }
@@ -395,6 +403,79 @@ async fn model_failure_after_storage_prefetch_returns_and_saves_grounded_answer(
     let stored_response: Value =
         serde_json::from_str(saved["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(stored_response["answer"], result["answer"]);
+    model.abort();
+}
+
+#[tokio::test]
+async fn oversized_storage_evidence_skips_model_and_persists_authoritative_answer() {
+    let f = fixture().await;
+    f.oversized_storage.store(1, Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let model_calls = Arc::new(AtomicI64::new(0));
+    let calls = model_calls.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"unexpected model call"}}]}))
+            }
+        }),
+    );
+    let model = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut config = app_config(&f);
+    config.ai.enabled = true;
+    config.ai.allow_insecure_http = true;
+    config.ai.endpoint_url = format!("http://{address}/v1/chat/completions");
+    config.ai.model = "test-model".into();
+    let app = App::new(config).unwrap();
+
+    let result = app
+        .chat(ChatRequest {
+            question: "Why did storage increase from yesterday to today?".into(),
+            host: Some("pi".into()),
+            session: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(model_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(f.storage_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(result["evidence_refs"].as_array().unwrap().len(), 1);
+    assert!(
+        result["answer"]
+            .as_str()
+            .unwrap()
+            .contains("increased by 100 bytes")
+    );
+    assert!(
+        result["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| {
+                value.as_str().is_some_and(|text| {
+                    text.contains("model analysis was skipped")
+                        && text.contains("Full evidence remains available")
+                })
+            })
+    );
+
+    let saved = app
+        .operation(
+            "sessions",
+            json!({"id":result["session"].as_str().unwrap()}),
+        )
+        .await
+        .unwrap();
+    let stored_response: Value =
+        serde_json::from_str(saved["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(stored_response["answer"], result["answer"]);
+    assert_eq!(stored_response["evidence_refs"], result["evidence_refs"]);
     model.abort();
 }
 
