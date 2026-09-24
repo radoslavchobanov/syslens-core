@@ -795,7 +795,7 @@ pub(crate) fn memory_facts(evidence: &Value) -> Option<MemoryFacts> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .take(8)
+        .take(4)
         .map(|value| bounded_text(value, 512))
         .collect::<Vec<_>>();
     let limitations = data
@@ -950,7 +950,7 @@ pub(crate) fn incident_model_facts(facts: &IncidentFacts) -> Value {
                 "updated_at_unix": incident.updated_at,
                 "recovered_at_unix": incident.recovered_at,
                 "acknowledged_at_unix": incident.acknowledged_at,
-                "evidence": bounded_text(&incident.evidence_summary, 192),
+                "evidence": bounded_text(&incident.evidence_summary, 128),
             })
         })
         .collect::<Vec<_>>();
