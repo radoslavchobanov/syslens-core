@@ -2944,44 +2944,93 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
     }
 
     fn has_structural_uncertainty(words: &[&str]) -> bool {
-        const UNCERTAINTY_WORDS: &[&str] = &[
-            "unknown",
-            "unclear",
-            "uncertain",
-            "insufficient",
-            "unavailable",
-            "unable",
-            "cannot",
-            "cant",
-            "can't",
-            "couldnt",
-            "couldn't",
-            "undetermined",
-            "unresolved",
-            "inconclusive",
-            "missing",
-            "lack",
-            "lacks",
-        ];
         const DENIED_OUTCOMES: &[&str] = &[
+            "identify",
             "identified",
+            "know",
             "known",
+            "infer",
             "inferred",
+            "conclude",
             "concluded",
+            "deduce",
             "deduced",
+            "determine",
             "determined",
+            "establish",
             "established",
             "found",
             "attributable",
+            "attribute",
             "responsible",
+            "explain",
+            "explains",
+            "explained",
+            "cause",
+            "causes",
+            "caused",
+            "contribute",
+            "contributes",
+            "contributed",
+            "account",
+            "accounts",
+            "accounted",
+            "result",
+            "results",
+            "resulted",
+            "drive",
+            "drives",
+            "drove",
+            "lead",
+            "leads",
+            "led",
         ];
 
+        fn is_modal_uncertainty(token: &str) -> bool {
+            matches!(
+                token,
+                "cannot" | "cant" | "can't" | "couldnt" | "couldn't" | "unable"
+            )
+        }
+
         words.iter().enumerate().any(|(index, word)| {
-            UNCERTAINTY_WORDS.contains(word)
-                || (*word == "not"
-                    && words
-                        .get(index + 1)
-                        .is_some_and(|next| DENIED_OUTCOMES.contains(next)))
+            if matches!(*word, "unknown" | "unclear" | "uncertain") {
+                return words
+                    .get(index + 1)
+                    .is_some_and(|next| matches!(*next, "whether" | "if"));
+            }
+            if *word == "insufficient" {
+                return words.get(index + 1) == Some(&"to")
+                    && words.get(index + 2).is_some_and(|next| {
+                        DENIED_OUTCOMES.contains(next)
+                            || matches!(
+                                *next,
+                                "show"
+                                    | "confirm"
+                                    | "assess"
+                                    | "link"
+                                    | "explain"
+                                    | "explains"
+                                    | "explained"
+                                    | "explaining"
+                            )
+                    });
+            }
+            if is_modal_uncertainty(word) {
+                return words
+                    .get(index + 1..(index + 6).min(words.len()))
+                    .is_some_and(|following| {
+                        following.iter().any(|next| DENIED_OUTCOMES.contains(next))
+                    });
+            }
+            (*word == "not"
+                && words
+                    .get(index + 1)
+                    .is_some_and(|next| DENIED_OUTCOMES.contains(next)))
+                || ((*word == "is" || *word == "was" || *word == "remains")
+                    && words.get(index + 1).is_some_and(|next| {
+                        matches!(*next, "unknown" | "unclear" | "uncertain" | "unavailable")
+                    }))
         })
     }
 
@@ -3526,7 +3575,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                         .rposition(|word| is_predicate_boundary(word))
                         .map_or(0, |boundary| boundary + 1);
                     let predicate_uncertain =
-                        has_structural_uncertainty(&words[predicate_start..predicate_index]);
+                        has_structural_uncertainty(&words[predicate_start..=predicate_index]);
                     if is_causal_predicate(candidate) {
                         return !token_is_negated(&words, predicate_index) && !predicate_uncertain;
                     }
@@ -4977,6 +5026,31 @@ mod tests {
                 &no_eligible_facts
             )
             .is_none()
+        );
+        assert!(
+            grounded_storage_fallback("An unknown file caused the increase.", &no_eligible_facts)
+                .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "The likely contributor is an unknown file.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Although evidence is insufficient, a file caused the increase.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Despite insufficient evidence, the likely contributor is a file.",
+                &no_eligible_facts
+            )
+            .is_some()
         );
 
         let chat_summary = deterministic_storage_chat_summary(&facts);
