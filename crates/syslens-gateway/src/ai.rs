@@ -3543,6 +3543,12 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                         | "contributors"
                         | "attribution"
                         | "attributable"
+                        | "explanation"
+                        | "explanations"
+                        | "source"
+                        | "sources"
+                        | "factor"
+                        | "factors"
                         | "growth"
                         | "grow"
                         | "growing"
@@ -3651,7 +3657,9 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                         && predicate_index
                             .checked_sub(1)
                             .and_then(|previous| words.get(previous))
-                            == Some(&"scan");
+                            .is_some_and(|previous| {
+                                matches!(*previous, "diagnostic" | "sample" | "scan" | "test")
+                            });
                     if is_causal_predicate(candidate) && !nominal_scan_result {
                         return !token_is_negated(&words, predicate_index) && !predicate_uncertain;
                     }
@@ -5187,6 +5195,34 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "A file cannot be ruled out from the scan results.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be ruled out as an explanation.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be excluded as the source.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be ruled out from the diagnostic results.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be ruled out from the test results.",
                 &no_eligible_facts
             )
             .is_none()
