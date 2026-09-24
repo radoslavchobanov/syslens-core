@@ -3303,6 +3303,50 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             )
         }
 
+        fn is_measurement_adverb(token: &str) -> bool {
+            (token.is_ascii() && token.ends_with("ly"))
+                || matches!(
+                    token,
+                    "again"
+                        | "already"
+                        | "also"
+                        | "first"
+                        | "just"
+                        | "last"
+                        | "not"
+                        | "now"
+                        | "only"
+                        | "recent"
+                        | "still"
+                        | "very"
+                )
+        }
+
+        fn is_subordinate_measurement(following: &[&str]) -> bool {
+            following.iter().enumerate().any(|(index, token)| {
+                if !matches!(*token, "is" | "was" | "were") {
+                    return false;
+                }
+                let mut cursor = index + 1;
+                while following
+                    .get(cursor)
+                    .is_some_and(|next| is_measurement_adverb(next))
+                {
+                    cursor += 1;
+                }
+                if following.get(cursor) == Some(&"being") {
+                    cursor += 1;
+                    while following
+                        .get(cursor)
+                        .is_some_and(|next| is_measurement_adverb(next))
+                    {
+                        cursor += 1;
+                    }
+                }
+                matches!(following.get(cursor), Some(&"measured" | &"monitored"))
+            })
+        }
+
         let words = tokens(segment);
         words.iter().enumerate().any(|(index, token)| {
             *token == "root"
@@ -3319,15 +3363,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     )
                 })
                 && words.get(index + 2..).is_some_and(|following| {
-                    let is_subordinate_measurement = following.windows(2).any(|window| {
-                        matches!(window[0], "is" | "was" | "were")
-                            && matches!(window[1], "measured" | "monitored")
-                    }) || following.windows(3).any(|window| {
-                        matches!(window[0], "is" | "was" | "were")
-                            && window[1] == "being"
-                            && matches!(window[2], "measured" | "monitored")
-                    });
-                    !is_subordinate_measurement
+                    !is_subordinate_measurement(following)
                         && following.iter().any(|word| is_measurement_predicate(word))
                         && following.iter().any(|word| is_measurement_term(word))
                 })
@@ -4542,6 +4578,20 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "diagnosis.sqlite increased while root storage was monitored today.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite increased while root storage was last measured today.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite increased while root storage was currently monitored today.",
                 &facts
             )
             .is_some()
