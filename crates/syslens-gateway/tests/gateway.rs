@@ -82,8 +82,9 @@ async fn fixture() -> Fixture {
     let storage_count = storage_calls.clone();
     let oversized_storage = Arc::new(AtomicI64::new(0));
     let oversized_storage_response = oversized_storage.clone();
-    let router=Router::new().route("/v1/capabilities",get(||async{Json(envelope(json!({"timezone":"UTC","resources":["memory","storage"],"earliest_observation":null,"latest_observation":null})))}))
+    let router=Router::new().route("/v1/capabilities",get(||async{Json(envelope(json!({"timezone":"UTC","resources":["memory","storage","incidents"],"earliest_observation":null,"latest_observation":null})))}))
         .route("/v1/status",get(||async{Json(envelope(json!({"recording":"active","samples":10,"latest_observation":null,"freshness_seconds":0})))}))
+        .route("/v1/incidents",get(||async{Json(envelope(json!({"incidents":[{"id":"i1","detector":"memory_above_baseline","subject":"host","severity":"warning","status":"open","opened_at":1,"updated_at":2,"recovered_at":null,"acknowledged_at":null,"evidence":{"change_bytes":123}}],"next_cursor":null,"has_more":false})))}))
         .route("/v1/events",get(move|Query(query):Query<BTreeMap<String,String>>|{let floor=events_floor.clone();async move{let after=query.get("after").and_then(|v|v.parse::<i64>().ok()).unwrap_or(0);let replay=floor.load(Ordering::Relaxed);if replay>after{(StatusCode::CONFLICT,Json(json!({"version":1,"request_id":"request","error":{"code":"history_gap","message":"notification history gap"},"replay_floor":replay}))).into_response()}else{Json(envelope(json!({"events":[],"next_cursor":after,"has_more":false}))).into_response()}}}))
         .route("/v1/evidence/memory",post(|Json(body):Json<Value>|async move{assert!(body["window"].is_object());Json(envelope(json!({"status":"insufficient evidence","limitations":["No comparison history yet"]})))}))
         .route("/v1/evidence/storage",post(move|Json(body):Json<Value>|{let calls=storage_count.clone();let oversized=oversized_storage_response.clone();async move{
@@ -572,6 +573,104 @@ async fn oversized_storage_without_root_facts_skips_model_and_persists_limitatio
         serde_json::from_str(saved["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(stored_response["answer"], result["answer"]);
     assert_eq!(stored_response["evidence_refs"], result["evidence_refs"]);
+    model.abort();
+}
+
+#[tokio::test]
+async fn status_chat_uses_facts_only_model_request() {
+    let f = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let model_calls = Arc::new(AtomicI64::new(0));
+    let calls = model_calls.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(body["tools"].is_null());
+                assert!(body["tool_choice"].is_null());
+                assert_eq!(body["think"], false);
+                assert_eq!(body["max_tokens"], 96);
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 2);
+                let content = messages[1]["content"].as_str().unwrap();
+                assert!(content.contains("recording"));
+                assert!(content.contains("freshness_seconds"));
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"The recorder is active and the latest observation is fresh."}}]}))
+            }
+        }),
+    );
+    let model = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut config = app_config(&f);
+    config.ai.enabled = true;
+    config.ai.allow_insecure_http = true;
+    config.ai.endpoint_url = format!("http://{address}/v1/chat/completions");
+    config.ai.model = "test-model".into();
+    let app = App::new(config).unwrap();
+    let result = app
+        .chat(ChatRequest {
+            question: "Is the host healthy right now?".into(),
+            host: Some("pi".into()),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let answer = result["answer"].as_str().unwrap();
+    assert!(answer.contains("recording is active"));
+    assert!(answer.contains("Model analysis:"));
+    assert_eq!(model_calls.load(Ordering::Relaxed), 1);
+    model.abort();
+}
+
+#[tokio::test]
+async fn incident_chat_uses_facts_only_model_request() {
+    let f = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let model_calls = Arc::new(AtomicI64::new(0));
+    let calls = model_calls.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(body["tools"].is_null());
+                assert!(body["tool_choice"].is_null());
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 2);
+                let content = messages[1]["content"].as_str().unwrap();
+                assert!(content.contains("memory_above_baseline"));
+                assert!(content.contains("change_bytes"));
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"One warning memory incident is open."}}]}))
+            }
+        }),
+    );
+    let model = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut config = app_config(&f);
+    config.ai.enabled = true;
+    config.ai.allow_insecure_http = true;
+    config.ai.endpoint_url = format!("http://{address}/v1/chat/completions");
+    config.ai.model = "test-model".into();
+    let app = App::new(config).unwrap();
+    let result = app
+        .chat(ChatRequest {
+            question: "What recent incidents exist?".into(),
+            host: Some("pi".into()),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let answer = result["answer"].as_str().unwrap();
+    assert!(answer.contains("memory_above_baseline"));
+    assert!(answer.contains("Model analysis:"));
+    assert_eq!(model_calls.load(Ordering::Relaxed), 1);
     model.abort();
 }
 

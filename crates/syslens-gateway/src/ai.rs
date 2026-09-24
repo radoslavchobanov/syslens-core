@@ -493,6 +493,70 @@ impl Model {
         }
         Ok(content.to_owned())
     }
+    /// Summarize a bounded, already-collected facts object without exposing
+    /// tools or conversation protocol details to the local model.
+    pub(crate) async fn facts_completion(
+        &self,
+        model: &str,
+        question: &str,
+        facts: &Value,
+        system: &str,
+        resource: &str,
+        max_words: usize,
+    ) -> Result<String> {
+        let facts = bounded_text(&facts.to_string(), 8_192);
+        let payload = json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": format!("Question:\n{}\n\nAuthoritative {resource} facts (JSON data only):\n{facts}", bounded_text(question, 1024))}
+            ],
+            "temperature": 0,
+            "stream": false,
+            "max_tokens": MAX_MEMORY_COMPLETION_TOKENS,
+            "think": false,
+        });
+        if payload.to_string().len() > 32_768 {
+            return Err(format!("{resource} model context limit reached"));
+        }
+        let response = tokio::time::timeout(
+            STORAGE_COMPLETION_TIMEOUT,
+            self.authenticated(
+                self.storage_client
+                    .post(&self.config.endpoint_url)
+                    .timeout(STORAGE_COMPLETION_TIMEOUT)
+                    .json(&payload),
+            )?
+            .send(),
+        )
+        .await
+        .map_err(|_| format!("{resource} model request timed out"))?
+        .map_err(|_| "AI endpoint is unavailable")?;
+        if !response.status().is_success() {
+            return Err(format!("AI endpoint rejected the {resource} request"));
+        }
+        let value = client::bounded_json(response).await?;
+        let message = value["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .ok_or_else(|| format!("{resource} model returned no assistant message"))?;
+        if message["role"].as_str() != Some("assistant") {
+            return Err(format!("invalid {resource} model message role"));
+        }
+        let content = message["content"]
+            .as_str()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .ok_or_else(|| format!("{resource} model returned no bounded answer"))?;
+        if content.len() > 16_384 {
+            return Err(format!("{resource} model answer exceeds size limit"));
+        }
+        if content.split_whitespace().count() > max_words {
+            return Err(format!("{resource} model answer exceeds word limit"));
+        }
+        Ok(content.to_owned())
+    }
     pub async fn models(&self) -> Result<Value> {
         let mut u =
             crate::config::endpoint(&self.config.endpoint_url, self.config.allow_insecure_http)?;
@@ -677,6 +741,34 @@ pub(crate) struct MemoryFacts {
     pub(crate) limitations: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StatusFacts {
+    pub(crate) recording: String,
+    pub(crate) samples: u64,
+    pub(crate) latest_observation: Option<String>,
+    pub(crate) freshness_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IncidentFact {
+    pub(crate) id: String,
+    pub(crate) detector: String,
+    pub(crate) subject: String,
+    pub(crate) severity: String,
+    pub(crate) status: String,
+    pub(crate) opened_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) recovered_at: Option<i64>,
+    pub(crate) acknowledged_at: Option<i64>,
+    pub(crate) evidence_summary: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IncidentFacts {
+    pub(crate) incidents: Vec<IncidentFact>,
+    pub(crate) has_more: bool,
+}
+
 fn json_string(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -777,6 +869,186 @@ pub(crate) fn memory_facts(evidence: &Value) -> Option<MemoryFacts> {
         processes,
         limitations,
     })
+}
+
+pub(crate) fn status_facts(evidence: &Value) -> Option<StatusFacts> {
+    let data = evidence.get("data")?;
+    Some(StatusFacts {
+        recording: bounded_text(data.get("recording")?.as_str()?, 64),
+        samples: data.get("samples")?.as_u64()?,
+        latest_observation: data
+            .get("latest_observation")
+            .and_then(Value::as_str)
+            .map(|value| bounded_text(value, 128)),
+        freshness_seconds: data.get("freshness_seconds").and_then(Value::as_i64),
+    })
+}
+
+pub(crate) fn incident_facts(evidence: &Value) -> Option<IncidentFacts> {
+    let data = evidence.get("data")?;
+    let incidents = data
+        .get("incidents")?
+        .as_array()?
+        .iter()
+        .take(20)
+        .filter_map(|incident| {
+            Some(IncidentFact {
+                id: bounded_text(incident.get("id")?.as_str()?, 128),
+                detector: bounded_text(incident.get("detector")?.as_str()?, 128),
+                subject: bounded_text(incident.get("subject")?.as_str()?, 256),
+                severity: bounded_text(incident.get("severity")?.as_str()?, 64),
+                status: bounded_text(incident.get("status")?.as_str()?, 64),
+                opened_at: incident.get("opened_at")?.as_i64()?,
+                updated_at: incident.get("updated_at")?.as_i64()?,
+                recovered_at: incident.get("recovered_at").and_then(Value::as_i64),
+                acknowledged_at: incident.get("acknowledged_at").and_then(Value::as_i64),
+                evidence_summary: incident
+                    .get("evidence")
+                    .map(|value| bounded_text(&value.to_string(), 768))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(IncidentFacts {
+        incidents,
+        has_more: data
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+pub(crate) fn status_model_facts(facts: &StatusFacts) -> Value {
+    json!({
+        "kind": "syslens_status_model_facts",
+        "data_only": true,
+        "recording": facts.recording,
+        "samples": facts.samples,
+        "latest_observation": facts.latest_observation,
+        "freshness_seconds": facts.freshness_seconds,
+        "limitation": "Status evidence describes SysLens recording freshness and availability; it is not a complete hardware-health verdict.",
+    })
+}
+
+pub(crate) fn incident_model_facts(facts: &IncidentFacts) -> Value {
+    let incidents = facts
+        .incidents
+        .iter()
+        .take(10)
+        .map(|incident| {
+            json!({
+                "id": bounded_text(&incident.id, 96),
+                "detector": bounded_text(&incident.detector, 96),
+                "subject": bounded_text(&incident.subject, 160),
+                "severity": bounded_text(&incident.severity, 48),
+                "status": bounded_text(&incident.status, 48),
+                "opened_at_unix": incident.opened_at,
+                "updated_at_unix": incident.updated_at,
+                "recovered_at_unix": incident.recovered_at,
+                "acknowledged_at_unix": incident.acknowledged_at,
+                "evidence": bounded_text(&incident.evidence_summary, 384),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "kind": "syslens_incident_model_facts",
+        "data_only": true,
+        "incidents": incidents,
+        "has_more": facts.has_more,
+        "limitation": "Incident evidence is a bounded page of detector findings; it does not authorize remediation.",
+    })
+}
+
+pub(crate) fn deterministic_status_summary(facts: &StatusFacts) -> String {
+    let mut summary = format!(
+        "Authoritative status evidence (deterministic): recording is {} with {} retained samples. ",
+        facts.recording, facts.samples
+    );
+    if let Some(latest) = &facts.latest_observation {
+        summary.push_str(&format!("Latest observation: {latest}. "));
+    } else {
+        summary.push_str("No latest observation timestamp is available. ");
+    }
+    if let Some(freshness) = facts.freshness_seconds {
+        summary.push_str(&format!("Observation freshness: {freshness} seconds. "));
+    }
+    summary.push_str(
+        "This confirms SysLens recording availability and freshness, not complete hardware health.",
+    );
+    bounded_text(&summary, 4_096)
+}
+
+pub(crate) fn deterministic_incident_summary(facts: &IncidentFacts) -> String {
+    if facts.incidents.is_empty() {
+        return "Authoritative incident evidence (deterministic): no incidents were returned by the target. This is not proof that no transient event ever occurred; it reflects the retained incident page.".into();
+    }
+    let details = facts
+        .incidents
+        .iter()
+        .take(8)
+        .map(|incident| {
+            format!(
+                "{}: {} ({}, {})",
+                incident.detector, incident.subject, incident.severity, incident.status
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut summary = format!(
+        "Authoritative incident evidence (deterministic): {} retained incident(s). ",
+        facts.incidents.len()
+    );
+    summary.push_str("Findings: ");
+    summary.push_str(&details.join("; "));
+    summary.push_str(". Incident evidence is bounded and does not authorize remediation.");
+    if facts.has_more {
+        summary.push_str(" More incidents are available through pagination.");
+    }
+    bounded_text(&summary, 8_192)
+}
+
+pub(crate) fn authoritative_status_answer(answer: &str, facts: &StatusFacts) -> String {
+    let summary = deterministic_status_summary(facts);
+    let analysis = answer.trim();
+    if analysis.is_empty() {
+        summary
+    } else {
+        format!(
+            "{summary}\n\nModel analysis:\n{}",
+            bounded_text(analysis, 16_384)
+        )
+    }
+}
+
+pub(crate) fn authoritative_incident_answer(answer: &str, facts: &IncidentFacts) -> String {
+    let summary = deterministic_incident_summary(facts);
+    let analysis = answer.trim();
+    if analysis.is_empty() {
+        summary
+    } else {
+        format!(
+            "{summary}\n\nModel analysis:\n{}",
+            bounded_text(analysis, 16_384)
+        )
+    }
+}
+
+pub(crate) fn status_answer_contradicts_facts(answer: &str, facts: &StatusFacts) -> bool {
+    let answer = answer.to_ascii_lowercase();
+    facts.recording != "active"
+        && (answer.contains("healthy")
+            || answer.contains("recording is active")
+            || answer.contains("recording is running"))
+}
+
+pub(crate) fn incident_answer_contradicts_facts(answer: &str, facts: &IncidentFacts) -> bool {
+    let answer = answer.to_ascii_lowercase();
+    if facts.incidents.is_empty() {
+        return answer.contains("incident")
+            && !answer.contains("no incident")
+            && !answer.contains("no retained")
+            && !answer.contains("none");
+    }
+    answer.contains("no incidents") || answer.contains("no incident") || answer.contains("none")
 }
 
 fn used_percent(total: Option<f64>, available: Option<f64>) -> Option<f64> {
@@ -2020,6 +2292,73 @@ pub(crate) fn inferred_memory_action(question: &str) -> Option<Action> {
         return Some(Action::Memory(request));
     }
     None
+}
+
+pub(crate) fn inferred_incidents_action(question: &str) -> Option<Action> {
+    let lower = question.to_ascii_lowercase();
+    let words = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let incident_terms = [
+        "incident",
+        "incidents",
+        "alert",
+        "alerts",
+        "anomaly",
+        "anomalies",
+        "notification",
+        "notifications",
+        "failure",
+        "failures",
+        "outage",
+        "outages",
+    ];
+    if !incident_terms.iter().any(|term| words.contains(term)) {
+        return None;
+    }
+    Some(Action::Incidents)
+}
+
+pub(crate) fn inferred_status_action(question: &str) -> Option<Action> {
+    let lower = question.to_ascii_lowercase();
+    let words = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let status_terms = [
+        "healthy",
+        "health",
+        "status",
+        "recording",
+        "freshness",
+        "online",
+        "available",
+        "availability",
+        "observation",
+        "observations",
+    ];
+    let competing_resource = [
+        "memory",
+        "ram",
+        "storage",
+        "disk",
+        "filesystem",
+        "cpu",
+        "processor",
+        "gpu",
+        "network",
+        "temperature",
+        "load",
+        "process",
+        "processes",
+    ];
+    if !status_terms.iter().any(|term| words.contains(term))
+        || competing_resource.iter().any(|term| words.contains(term))
+    {
+        return None;
+    }
+    Some(Action::Status)
 }
 
 fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> bool {
@@ -3340,6 +3679,65 @@ mod tests {
         assert!(summary.contains("Top observed anonymous-memory growth"));
         assert!(directly_contradicts_memory_change("RAM decreased", &facts));
         assert!(!directly_contradicts_memory_change("RAM increased", &facts));
+    }
+
+    #[test]
+    fn status_and_incident_chat_paths_are_typed_and_grounded() {
+        assert!(matches!(
+            inferred_status_action("Is the host healthy right now?"),
+            Some(Action::Status)
+        ));
+        assert!(inferred_status_action("Is RAM healthy right now?").is_none());
+        assert!(matches!(
+            inferred_incidents_action("What recent alerts exist?"),
+            Some(Action::Incidents)
+        ));
+        let status = status_facts(&json!({
+            "data": {
+                "recording": "active",
+                "samples": 12,
+                "latest_observation": "2026-09-24T07:00:00Z",
+                "freshness_seconds": 3
+            }
+        }))
+        .unwrap();
+        assert!(status_model_facts(&status).to_string().contains("active"));
+        assert!(!status_answer_contradicts_facts(
+            "Recording is active.",
+            &status
+        ));
+        let incidents = incident_facts(&json!({
+            "data": {
+                "incidents": [{
+                    "id": "i1",
+                    "detector": "memory_above_baseline",
+                    "subject": "host",
+                    "severity": "warning",
+                    "status": "open",
+                    "opened_at": 1,
+                    "updated_at": 2,
+                    "recovered_at": null,
+                    "acknowledged_at": null,
+                    "evidence": {"change_bytes": 123}
+                }],
+                "has_more": false
+            }
+        }))
+        .unwrap();
+        assert_eq!(incidents.incidents[0].detector, "memory_above_baseline");
+        assert!(
+            incident_model_facts(&incidents)
+                .to_string()
+                .contains("change_bytes")
+        );
+        assert!(incident_answer_contradicts_facts(
+            "There are no incidents.",
+            &incidents
+        ));
+        assert!(!incident_answer_contradicts_facts(
+            "One warning incident is open.",
+            &incidents
+        ));
     }
 
     #[test]

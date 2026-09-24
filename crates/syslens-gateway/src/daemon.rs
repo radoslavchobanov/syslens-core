@@ -208,6 +208,49 @@ impl App {
             let mut refs=Vec::new();let mut limitations=Vec::new();
             let mut root_storage_facts=None;
             if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
+            if capabilities.data.resources.iter().any(|resource| resource == "incidents")
+                && let Some(action) = ai::inferred_incidents_action(&r.question)
+            {
+                let evidence = self.evidence(&target, action).await?;
+                refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
+                let facts = ai::incident_facts(&evidence);
+                let Some(facts) = facts else {
+                    limitations.push("Authoritative incident facts were unavailable; the bounded incident model was not called".into());
+                    return self.finish_chat(
+                        response_context,
+                        deterministic_incident_recovery_answer(None),
+                        refs,
+                        limitations,
+                    );
+                };
+                let model_analysis = match model_client
+                    .facts_completion(
+                        &model,
+                        &r.question,
+                        &ai::incident_model_facts(&facts),
+                        "You are a concise SysLens incident analyst. Use only the authoritative JSON facts. List the relevant detector findings, severity, status, and evidence limitations. Do not invent incidents or remediation. Return plain English in at most 70 words.",
+                        "incident",
+                        70,
+                    )
+                    .await
+                {
+                    Ok(answer) if !ai::incident_answer_contradicts_facts(&answer, &facts) => {
+                        Some(answer)
+                    }
+                    Ok(_) => {
+                        limitations.push("The bounded incident model contradicted authoritative incident evidence; the deterministic incident answer was returned".into());
+                        None
+                    }
+                    Err(error) => {
+                        limitations.push(format!("The bounded incident model failed ({error}); the deterministic incident answer was returned"));
+                        None
+                    }
+                };
+                let answer = model_analysis
+                    .map(|analysis| ai::authoritative_incident_answer(&analysis, &facts))
+                    .unwrap_or_else(|| deterministic_incident_recovery_answer(Some(&facts)));
+                return self.finish_chat(response_context, answer, refs, limitations);
+            }
             if capabilities.data.resources.iter().any(|resource| resource == "memory")
                 && let Some(action) = ai::inferred_memory_action(&r.question)
             {
@@ -287,6 +330,47 @@ impl App {
                 let answer = model_analysis
                     .map(|analysis| ai::authoritative_storage_chat_answer(&analysis, facts))
                     .unwrap_or_else(|| ai::deterministic_storage_chat_summary(facts));
+                return self.finish_chat(response_context, answer, refs, limitations);
+            }
+            if let Some(action) = ai::inferred_status_action(&r.question) {
+                let evidence = self.evidence(&target, action).await?;
+                refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
+                let facts = ai::status_facts(&evidence);
+                let Some(facts) = facts else {
+                    limitations.push("Authoritative status facts were unavailable; the bounded status model was not called".into());
+                    return self.finish_chat(
+                        response_context,
+                        deterministic_status_recovery_answer(None),
+                        refs,
+                        limitations,
+                    );
+                };
+                let model_analysis = match model_client
+                    .facts_completion(
+                        &model,
+                        &r.question,
+                        &ai::status_model_facts(&facts),
+                        "You are a concise SysLens status analyst. Use only the authoritative JSON facts. State recording availability, sample count, latest observation, and freshness. Do not claim complete hardware health from recorder status alone. Return plain English in at most 50 words.",
+                        "status",
+                        50,
+                    )
+                    .await
+                {
+                    Ok(answer) if !ai::status_answer_contradicts_facts(&answer, &facts) => {
+                        Some(answer)
+                    }
+                    Ok(_) => {
+                        limitations.push("The bounded status model contradicted authoritative status evidence; the deterministic status answer was returned".into());
+                        None
+                    }
+                    Err(error) => {
+                        limitations.push(format!("The bounded status model failed ({error}); the deterministic status answer was returned"));
+                        None
+                    }
+                };
+                let answer = model_analysis
+                    .map(|analysis| ai::authoritative_status_answer(&analysis, &facts))
+                    .unwrap_or_else(|| deterministic_status_recovery_answer(Some(&facts)));
                 return self.finish_chat(response_context, answer, refs, limitations);
             }
             for round in 0..=self.config.ai.max_rounds {
@@ -494,6 +578,22 @@ impl App {
             tokio::select! {_ = stop.changed()=>break,_ = interval.tick()=>{let mut tasks=tokio::task::JoinSet::new();let permits=Arc::new(Semaphore::new(4));for name in self.config.hosts.keys(){if failures.get(name).is_some_and(|(_,next)|*next>std::time::Instant::now()){continue;}let name=name.clone();let app=self.clone();let p=permits.clone();tasks.spawn(async move{let _permit=p.acquire_owned().await;let result=app.poll_host(&name).await;(name,result)});}while let Some(result)=tasks.join_next().await{if let Ok((name,result))=result{match result{Ok(())=>{failures.remove(&name);},Err(e)=>{let count=failures.get(&name).map(|v|v.0).unwrap_or(0).saturating_add(1).min(6);failures.insert(name.clone(),(count,std::time::Instant::now()+Duration::from_secs((self.config.poll_seconds*(1<<count)).min(1800))));if let Ok(db)=self.db(){let _=db.host_error(&name,&e);}}}}}if let Ok(db)=self.db(){let _=db.cleanup(self.config.session_retention_days,self.config.event_retention_days);}}}
         }
     }
+}
+
+fn deterministic_status_recovery_answer(facts: Option<&ai::StatusFacts>) -> String {
+    facts
+        .map(ai::deterministic_status_summary)
+        .unwrap_or_else(|| {
+            "Authoritative status evidence was unavailable, so recording health and freshness cannot be established. Model analysis was skipped.".into()
+        })
+}
+
+fn deterministic_incident_recovery_answer(facts: Option<&ai::IncidentFacts>) -> String {
+    facts
+        .map(ai::deterministic_incident_summary)
+        .unwrap_or_else(|| {
+            "Authoritative incident evidence was unavailable, so no retained incident conclusion can be reported. Model analysis was skipped.".into()
+        })
 }
 fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T> {
     serde_json::from_value(v).map_err(|_| "invalid gateway request".into())
