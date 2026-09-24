@@ -1526,7 +1526,17 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
             .then_with(|| right.apparent_bytes_change.cmp(&left.apparent_bytes_change))
             .then_with(|| left.path.cmp(&right.path))
     });
-    let file_facts = file_facts.into_iter().take(12).collect::<Vec<_>>();
+    // Retain eligible current-interval candidates before applying the raw
+    // 12-row bound. A large inventory-only image must not evict the smaller
+    // finding that has the provenance required for causal interpretation.
+    let (eligible_file_facts, other_file_facts): (Vec<_>, Vec<_>) = file_facts
+        .into_iter()
+        .partition(|finding| finding.evidence_class.causal_eligible());
+    let file_facts = eligible_file_facts
+        .into_iter()
+        .chain(other_file_facts)
+        .take(12)
+        .collect::<Vec<_>>();
     let file_findings = file_facts
         .iter()
         .map(|finding| {
@@ -2926,7 +2936,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
 
     fn tokens(clause: &str) -> Vec<&str> {
         clause
-            .split(|character: char| !character.is_ascii_alphanumeric())
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '\'')
             .filter(|token| !token.is_empty())
             .collect()
     }
@@ -2936,7 +2946,17 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         tokens[start..index].iter().any(|token| {
             matches!(
                 *token,
-                "not" | "no" | "never" | "cannot" | "cant" | "doesnt" | "didnt" | "without"
+                "not"
+                    | "no"
+                    | "never"
+                    | "cannot"
+                    | "cant"
+                    | "can't"
+                    | "doesnt"
+                    | "doesn't"
+                    | "didnt"
+                    | "didn't"
+                    | "without"
             )
         })
     }
@@ -2972,6 +2992,12 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "led",
             "resulted",
             "attributable",
+            "account",
+            "accounts",
+            "accounted",
+            "drive",
+            "drives",
+            "drove",
         ];
         for (index, token) in tokens.iter().enumerate() {
             if !causal_verbs.contains(token) || token_is_negated(&tokens, index) {
@@ -3034,13 +3060,64 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             while let Some(relative) = answer[search_from..].find(&alias) {
                 let alias_start = search_from + relative;
                 let alias_end = alias_start + alias.len();
-                let clause_start = answer[..alias_start]
-                    .rfind(|character: char| ".,;!?:\n".contains(character))
-                    .map(|index| index + 1)
+                let is_alias_token_character = |character: char| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                };
+                let has_left_token = answer[..alias_start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_alias_token_character);
+                let has_right_token = match answer[alias_end..].chars().next() {
+                    Some('.') => answer[alias_end + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(is_alias_token_character),
+                    Some(character) => is_alias_token_character(character),
+                    None => false,
+                };
+                if has_left_token || has_right_token {
+                    search_from = alias_end;
+                    continue;
+                }
+
+                let is_claim_boundary = |character: char| ".,;!?:\n".contains(character);
+                let mut boundaries = answer
+                    .char_indices()
+                    .filter_map(|(index, character)| {
+                        (is_claim_boundary(character)
+                            && (index < alias_start || index >= alias_end))
+                            .then_some((index, index + character.len_utf8()))
+                    })
+                    .flat_map(|(start, end)| [start, end])
+                    .collect::<Vec<_>>();
+                for conjunction in ["but", "while", "and", "however", "although", "yet"] {
+                    for (index, _) in answer.match_indices(conjunction) {
+                        if index >= alias_start && index < alias_end {
+                            continue;
+                        }
+                        let before = answer[..index].chars().next_back();
+                        let after = answer[index + conjunction.len()..].chars().next();
+                        let is_word_boundary = |character: Option<char>| {
+                            character.is_none_or(|value| !value.is_alphanumeric())
+                        };
+                        if is_word_boundary(before) && is_word_boundary(after) {
+                            boundaries.push(index);
+                            boundaries.push(index + conjunction.len());
+                        }
+                    }
+                }
+                boundaries.sort_unstable();
+                boundaries.dedup();
+                let clause_start = boundaries
+                    .iter()
+                    .rev()
+                    .find(|&&boundary| boundary <= alias_start)
+                    .copied()
                     .unwrap_or(0);
-                let clause_end = answer[alias_end..]
-                    .find(|character: char| ".,;!?:\n".contains(character))
-                    .map(|index| alias_end + index)
+                let clause_end = boundaries
+                    .iter()
+                    .find(|&&boundary| boundary >= alias_end)
+                    .copied()
                     .unwrap_or(answer.len());
                 let clause = &answer[clause_start..clause_end];
                 let has_unsupported_attribution = attribution_phrases
@@ -3681,6 +3758,63 @@ mod tests {
     }
 
     #[test]
+    fn root_storage_facts_retain_eligible_file_after_raw_twelve_row_cap() {
+        let mut file_findings = Vec::new();
+        for index in 0..13 {
+            file_findings.push(json!({
+                "mount_id":"root-mount",
+                "root":"/",
+                "path":format!("/var/lib/inventory-{index:02}.img"),
+                "allocated_bytes_change":(10_000 - index) as i64,
+                "apparent_bytes_change":(10_000 - index) as i64,
+                "current_allocated_bytes":(20_000 - index) as i64,
+                "comparison_allocated_bytes":10_000_i64,
+                "current_apparent_bytes":(20_000 - index) as i64,
+                "comparison_apparent_bytes":10_000_i64,
+                "baseline_status":"unknown",
+                "temporal_status":"before_comparison"
+            }));
+        }
+        file_findings.push(json!({
+            "mount_id":"root-mount",
+            "root":"/",
+            "path":"/var/lib/verified-small-growth.img",
+            "allocated_bytes_change":1i64,
+            "apparent_bytes_change":1i64,
+            "current_allocated_bytes":2i64,
+            "comparison_allocated_bytes":1i64,
+            "current_apparent_bytes":2i64,
+            "comparison_apparent_bytes":1i64,
+            "baseline_status":"known",
+            "temporal_status":"current_interval"
+        }));
+        let facts = root_storage_facts(&json!({
+            "data": {
+                "current":{"start_utc":"current-start","end_utc":"current-end"},
+                "comparison":{"start_utc":"comparison-start","end_utc":"comparison-end"},
+                "mounts":[{"mount_id":"root-mount","mount_point":"/","current_used_bytes":1100i64,"comparison_used_bytes":1000i64,"used_bytes_change":100i64}],
+                "directories":[],
+                "file_findings":file_findings,
+                "path_attribution_status":"available",
+                "limitations":[]
+            }
+        })).unwrap();
+        assert_eq!(facts.file_facts.len(), 12);
+        assert!(facts.file_facts.iter().any(|finding| {
+            finding.path.ends_with("verified-small-growth.img")
+                && finding.evidence_class == StorageFileEvidenceClass::CausalCandidate
+        }));
+        assert_eq!(
+            facts
+                .file_facts
+                .iter()
+                .filter(|finding| finding.evidence_class == StorageFileEvidenceClass::InventoryOnly)
+                .count(),
+            11
+        );
+    }
+
+    #[test]
     fn storage_file_provenance_gate_reproduces_live_growth_case() {
         let evidence = json!({
             "data": {
@@ -3821,6 +3955,8 @@ mod tests {
             "minecraft-rpg.qcow2 caused storage growth.",
             "minecraft-rpg.qcow2 was modified yesterday.",
             "minecraft-rpg.qcow2 caused 11 GB of storage growth.",
+            "minecraft-rpg.qcow2 accounted for 11 GB of storage growth.",
+            "minecraft-rpg.qcow2 drove 11 GB of storage growth.",
             "minecraft-rpg.qcow2 grew today.",
             "minecraft-rpg.qcow2 grew by 11 GB today.",
             "minecraft-rpg.qcow2 changed during this period.",
@@ -3864,6 +4000,13 @@ mod tests {
             )
             .is_none()
         );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 can't possibly have caused 11 GB of storage growth.",
+                &facts
+            )
+            .is_none()
+        );
         assert!(grounded_storage_fallback(
             "minecraft-rpg.qcow2 was not the source of the increase and was not active in the current window.",
             &facts
@@ -3884,6 +4027,20 @@ mod tests {
             &facts
         )
         .is_none());
+        for conjunction in ["but", "while", "and"] {
+            let answer = format!(
+                "minecraft-rpg.qcow2 is inventory-only {conjunction} verified-current-growth.img is a likely contributor."
+            );
+            assert!(
+                grounded_storage_fallback(&answer, &facts).is_none(),
+                "cross-file conjunction was incorrectly rejected: {answer}"
+            );
+        }
+        assert!(grounded_storage_fallback(
+            "minecraft-rpg.qcow2 caused 11 GB of storage growth, but verified-current-growth.img is also a likely contributor.",
+            &facts
+        )
+        .is_some());
 
         let chat_summary = deterministic_storage_chat_summary(&facts);
         assert!(chat_summary.contains("Eligible sampled file contributors"));
@@ -3911,19 +4068,37 @@ mod tests {
                     "current_allocated_bytes":100i64,"comparison_allocated_bytes":0i64,
                     "current_apparent_bytes":100i64,"comparison_apparent_bytes":0i64,
                     "baseline_status":"unknown","temporal_status":"before_comparison"
+                },
+                {
+                    "mount_id":"root-mount","root":"/","path":"/var/data",
+                    "allocated_bytes_change":90i64,"apparent_bytes_change":90i64,
+                    "current_allocated_bytes":90i64,"comparison_allocated_bytes":0i64,
+                    "current_apparent_bytes":90i64,"comparison_apparent_bytes":0i64,
+                    "baseline_status":"unknown","temporal_status":"before_comparison"
+                },
+                {
+                    "mount_id":"root-mount","root":"/","path":"/var/log",
+                    "allocated_bytes_change":80i64,"apparent_bytes_change":80i64,
+                    "current_allocated_bytes":80i64,"comparison_allocated_bytes":0i64,
+                    "current_apparent_bytes":80i64,"comparison_apparent_bytes":0i64,
+                    "baseline_status":"unknown","temporal_status":"before_comparison"
                 }],
                 "path_attribution_status":"available",
                 "limitations":[]
             }
         });
         let facts = root_storage_facts(&evidence).unwrap();
-        let answer = format!("{}xданные.img caused storage growth.", "é".repeat(64));
+        let answer = format!("{}!данные.img caused storage growth.", "é".repeat(64));
         assert!(grounded_storage_fallback(&answer, &facts).is_some());
         let negative = format!(
-            "{}xданные.img was not caused by the storage growth.",
+            "{}!данные.img was not caused by the storage growth.",
             "é".repeat(64)
         );
         assert!(grounded_storage_fallback(&negative, &facts).is_none());
+        assert!(grounded_storage_fallback("metadata caused storage growth.", &facts).is_none());
+        assert!(grounded_storage_fallback("catalog grew today.", &facts).is_none());
+        assert!(grounded_storage_fallback("data caused storage growth.", &facts).is_some());
+        assert!(grounded_storage_fallback("log grew today.", &facts).is_some());
     }
 
     #[test]
