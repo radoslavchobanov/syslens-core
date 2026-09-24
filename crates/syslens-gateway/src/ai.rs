@@ -795,7 +795,7 @@ pub(crate) fn memory_facts(evidence: &Value) -> Option<MemoryFacts> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .take(4)
+        .take(8)
         .map(|value| bounded_text(value, 512))
         .collect::<Vec<_>>();
     let limitations = data
@@ -938,7 +938,7 @@ pub(crate) fn incident_model_facts(facts: &IncidentFacts) -> Value {
         // model-facing projection small enough for CPU-only Ollama prompt
         // processing; the complete bounded page remains in the evidence
         // reference and deterministic answer.
-        .take(8)
+        .take(4)
         .map(|incident| {
             json!({
                 "id": bounded_text(&incident.id, 96),
