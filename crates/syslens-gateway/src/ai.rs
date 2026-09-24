@@ -2985,6 +2985,27 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "leads",
             "led",
         ];
+        const MODAL_DENIALS: &[&str] = &[
+            "identify",
+            "identified",
+            "know",
+            "known",
+            "infer",
+            "inferred",
+            "conclude",
+            "concluded",
+            "deduce",
+            "deduced",
+            "determine",
+            "determined",
+            "establish",
+            "established",
+            "find",
+            "found",
+            "attribute",
+            "attributed",
+            "attributable",
+        ];
 
         fn is_modal_uncertainty(token: &str) -> bool {
             matches!(
@@ -3020,7 +3041,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 return words
                     .get(index + 1..(index + 6).min(words.len()))
                     .is_some_and(|following| {
-                        following.iter().any(|next| DENIED_OUTCOMES.contains(next))
+                        following.iter().any(|next| MODAL_DENIALS.contains(next))
                     });
             }
             (*word == "not"
@@ -3503,6 +3524,13 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             )
         }
 
+        fn is_modal_uncertainty(token: &str) -> bool {
+            matches!(
+                token,
+                "cannot" | "cant" | "can't" | "couldnt" | "couldn't" | "unable"
+            )
+        }
+
         fn is_timing_predicate(token: &str) -> bool {
             matches!(
                 token,
@@ -3562,6 +3590,19 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         words.iter().enumerate().any(|(file_index, token)| {
             if !matches!(*token, "file" | "files") {
                 return false;
+            }
+            let file_subject_modal_claim = words
+                .get(file_index + 1)
+                .is_some_and(|modal| is_modal_uncertainty(modal))
+                && words
+                    .get(file_index + 2..(file_index + 12).min(words.len()))
+                    .is_some_and(|following| {
+                        following
+                            .iter()
+                            .any(|candidate| is_causal_predicate(candidate))
+                    });
+            if file_subject_modal_claim {
+                return true;
             }
             words
                 .iter()
@@ -5048,6 +5089,27 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "Despite insufficient evidence, the likely contributor is a file.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be ruled out as the cause.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be excluded as responsible for the increase.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot fully explain the increase.",
                 &no_eligible_facts
             )
             .is_some()
