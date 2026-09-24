@@ -3043,10 +3043,14 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             )
         }
 
+        fn is_emphatic_modifier(token: &str) -> bool {
+            matches!(token, "only" | "just" | "merely" | "simply")
+        }
+
         let preceding = &tokens[..index];
         let emphatic_not_only = preceding
             .windows(2)
-            .rposition(|window| window == ["not", "only"])
+            .rposition(|window| window[0] == "not" && is_emphatic_modifier(window[1]))
             .is_some_and(|start| {
                 preceding[start + 2..].iter().all(|token| {
                     !is_predicate_boundary(token) && !is_negator(token) && is_negation_bridge(token)
@@ -3085,7 +3089,11 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             if matches!(token, "and" | "but" | "then" | "while") {
                 break;
             }
-            if token == "not" && following.get(following_index + 1) == Some(&"only") {
+            if token == "not"
+                && following.get(following_index + 1).is_some_and(|modifier| {
+                    matches!(*modifier, "only" | "just" | "merely" | "simply")
+                })
+            {
                 following_index += 2;
                 continue;
             }
@@ -3287,10 +3295,25 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         words.iter().enumerate().any(|(index, token)| {
             *token == "root"
                 && words.get(index + 1).is_some_and(|subject| {
-                    matches!(*subject, "disk" | "filesystem" | "mount" | "storage")
+                    matches!(
+                        *subject,
+                        "disk"
+                            | "drive"
+                            | "filesystem"
+                            | "mount"
+                            | "partition"
+                            | "storage"
+                            | "volume"
+                    )
                 })
                 && words.get(index + 2..).is_some_and(|following| {
-                    following.iter().any(|word| is_measurement_predicate(word))
+                    let is_subordinate_measurement = following.windows(3).any(|window| {
+                        matches!(window[0], "is" | "was" | "were")
+                            && window[1] == "being"
+                            && matches!(window[2], "measured" | "monitored")
+                    });
+                    !is_subordinate_measurement
+                        && following.iter().any(|word| is_measurement_predicate(word))
                         && following.iter().any(|word| is_measurement_term(word))
                 })
         })
@@ -4375,6 +4398,14 @@ mod tests {
                 .is_some()
         );
         assert!(
+            grounded_storage_fallback("diagnosis.sqlite not just caused storage growth.", &facts)
+                .is_some()
+        );
+        assert!(
+            grounded_storage_fallback("diagnosis.sqlite showed not merely growth today.", &facts)
+                .is_some()
+        );
+        assert!(
             grounded_storage_fallback("diagnosis.sqlite showed zero growth today.", &facts)
                 .is_none()
         );
@@ -4457,6 +4488,20 @@ mod tests {
                 &facts
             )
             .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite increased while root storage was being measured today.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite is inventory-only while root partition showed growth today.",
+                &facts
+            )
+            .is_none()
         );
         assert!(
             grounded_storage_fallback(
