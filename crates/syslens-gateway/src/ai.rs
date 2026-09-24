@@ -2828,7 +2828,7 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
 }
 
 fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFacts) -> bool {
-    let answer = answer.to_ascii_lowercase();
+    let answer = answer.to_ascii_lowercase().replace(['’', '‘'], "'");
     let attribution_phrases = [
         "caused by",
         "cause was",
@@ -2906,35 +2906,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 .next()
                 .unwrap_or(prefix)
                 .trim_end();
-            let prefix_words = clause.split_whitespace().collect::<Vec<_>>();
-            let generic_negation =
-                prefix_words
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .take(5)
-                    .any(|(index, word)| {
-                        let normalized = word.trim_matches(|character: char| {
-                            !character.is_ascii_alphanumeric() && character != '\''
-                        });
-                        (normalized.ends_with("n't")
-                            || matches!(
-                                normalized,
-                                "not"
-                                    | "no"
-                                    | "never"
-                                    | "cannot"
-                                    | "can't"
-                                    | "doesn't"
-                                    | "doesnt"
-                                    | "didn't"
-                                    | "didnt"
-                                    | "without"
-                            ))
-                            && !prefix_words[index + 1..]
-                                .iter()
-                                .any(|following| matches!(*following, "but" | "and" | "while"))
-                    });
+            let prefix_tokens = tokens(clause);
             let negated = [
                 " not",
                 " no",
@@ -2955,7 +2927,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             ]
             .iter()
             .any(|negator| clause.ends_with(negator))
-                || generic_negation;
+                || token_is_negated(&prefix_tokens, prefix_tokens.len());
             if !negated {
                 return false;
             }
@@ -2972,11 +2944,9 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
     }
 
     fn token_is_negated(tokens: &[&str], index: usize) -> bool {
-        let start = index.saturating_sub(3);
-        let preceding = &tokens[start..index];
-        preceding.iter().enumerate().any(|(offset, token)| {
-            (matches!(
-                *token,
+        fn is_negator(token: &str) -> bool {
+            matches!(
+                token,
                 "not"
                     | "no"
                     | "never"
@@ -2988,11 +2958,82 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     | "didnt"
                     | "didn't"
                     | "without"
-            ) || token.ends_with("n't"))
-                && !preceding[offset + 1..]
-                    .iter()
-                    .any(|following| matches!(*following, "but" | "and" | "while"))
-        })
+            ) || token.ends_with("n't")
+        }
+
+        fn is_predicate_boundary(token: &str) -> bool {
+            matches!(
+                token,
+                "and"
+                    | "although"
+                    | "but"
+                    | "however"
+                    | "then"
+                    | "though"
+                    | "unless"
+                    | "while"
+                    | "yet"
+            )
+        }
+
+        fn is_negation_bridge(token: &str) -> bool {
+            matches!(
+                token,
+                "a" | "an"
+                    | "also"
+                    | "actually"
+                    | "active"
+                    | "be"
+                    | "been"
+                    | "being"
+                    | "changed"
+                    | "created"
+                    | "decreased"
+                    | "downloaded"
+                    | "ever"
+                    | "grew"
+                    | "grown"
+                    | "had"
+                    | "has"
+                    | "have"
+                    | "increased"
+                    | "increasing"
+                    | "is"
+                    | "just"
+                    | "likely"
+                    | "maybe"
+                    | "may"
+                    | "modified"
+                    | "perhaps"
+                    | "possibly"
+                    | "probably"
+                    | "really"
+                    | "still"
+                    | "the"
+                    | "to"
+                    | "are"
+                    | "was"
+                    | "were"
+                    | "do"
+                    | "did"
+                    | "does"
+                    | "will"
+                    | "would"
+                    | "could"
+                    | "should"
+                    | "might"
+            )
+        }
+
+        for token in tokens[..index].iter().rev().take(4) {
+            if is_negator(token) {
+                return true;
+            }
+            if is_predicate_boundary(token) || !is_negation_bridge(token) {
+                return false;
+            }
+        }
+        false
     }
 
     fn has_following_token(tokens: &[&str], index: usize, candidates: &[&str]) -> bool {
@@ -3015,47 +3056,25 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "filesystem",
             "consumption",
         ];
-        let causal_verbs = [
-            "caused",
-            "cause",
-            "causing",
-            "explains",
-            "explained",
-            "contributed",
-            "responsible",
-            "led",
-            "resulted",
-            "attributable",
-            "contributes",
-            "contributing",
-            "account",
-            "accounts",
-            "accounted",
-            "drive",
-            "drives",
-            "drove",
-            "driven",
-            "driving",
-        ];
+        fn is_causal_verb(token: &str) -> bool {
+            token.starts_with("caus")
+                || token.starts_with("explain")
+                || token.starts_with("contribut")
+                || token.starts_with("attribut")
+                || token.starts_with("account")
+                || token.starts_with("responsib")
+                || token.starts_with("result")
+                || token.starts_with("driv")
+                || matches!(token, "drove" | "lead" | "leads" | "led" | "leading")
+        }
         for (index, token) in tokens.iter().enumerate() {
-            if !causal_verbs.contains(token) || token_is_negated(&tokens, index) {
+            if !is_causal_verb(token) || token_is_negated(&tokens, index) {
                 continue;
             }
             if has_following_token(&tokens, index, &resource_terms) {
                 return true;
             }
-            if matches!(
-                *token,
-                "contributed"
-                    | "contributes"
-                    | "contributing"
-                    | "responsible"
-                    | "led"
-                    | "resulted"
-                    | "driven"
-                    | "driving"
-            ) && has_following_token(&tokens, index, &["to", "for", "from", "by"])
-            {
+            if has_following_token(&tokens, index, &["to", "for", "from", "by"]) {
                 return true;
             }
         }
@@ -3064,19 +3083,18 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
 
     fn has_token_level_timing_claim(clause: &str) -> bool {
         let tokens = tokens(clause);
-        let timing_verbs = [
-            "happened",
-            "created",
-            "grew",
-            "increased",
-            "increasing",
-            "decreased",
-            "decreasing",
-            "changed",
-            "downloaded",
-            "modified",
-            "active",
-        ];
+        fn is_timing_verb(token: &str) -> bool {
+            token.starts_with("happen")
+                || token.starts_with("creat")
+                || (token.starts_with("grow") && token != "growth")
+                || (token.starts_with("increas") && token != "increase")
+                || (token.starts_with("decreas") && token != "decrease")
+                || token.starts_with("chang")
+                || token.starts_with("download")
+                || token.starts_with("modif")
+                || token.starts_with("active")
+                || token == "grew"
+        }
         let timing_terms = [
             "today",
             "yesterday",
@@ -3086,7 +3104,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "current",
         ];
         tokens.iter().enumerate().any(|(index, token)| {
-            timing_verbs.contains(token)
+            is_timing_verb(token)
                 && !token_is_negated(&tokens, index)
                 && has_following_token(&tokens, index, &timing_terms)
         })
@@ -3139,7 +3157,20 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             }
         })
         .collect::<Vec<_>>();
-    let is_claim_boundary = |character: char| ".,;!?:\n".contains(character);
+    let is_claim_boundary = |index: usize, character: char| {
+        if !".,;!?:\n".contains(character) {
+            return false;
+        }
+        character != '.'
+            || !(answer[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|value| value.is_ascii_digit())
+                && answer[index + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|value| value.is_ascii_digit()))
+    };
     let mut conjunctions = Vec::new();
     for conjunction in ["but", "while", "and", "however", "although", "yet"] {
         for (index, _) in answer.match_indices(conjunction) {
@@ -3162,11 +3193,17 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             .filter(|(_, owner)| *owner == finding_index)
         {
             for (alias_start, alias_end) in alias_occurrences(&answer, alias) {
+                let is_inside_any_alias = |index: usize| {
+                    file_aliases.iter().any(|(known_alias, _)| {
+                        alias_occurrences(&answer, known_alias)
+                            .iter()
+                            .any(|(start, end)| index >= *start && index < *end)
+                    })
+                };
                 let mut boundaries = answer
                     .char_indices()
                     .filter_map(|(index, character)| {
-                        (is_claim_boundary(character)
-                            && (index < alias_start || index >= alias_end))
+                        (is_claim_boundary(index, character) && !is_inside_any_alias(index))
                             .then_some((index, index + character.len_utf8()))
                     })
                     .flat_map(|(start, end)| [start, end])
@@ -3175,6 +3212,12 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     if conjunction_start >= alias_start && conjunction_start < alias_end {
                         continue;
                     }
+                    let preceding_start = boundaries
+                        .iter()
+                        .copied()
+                        .filter(|boundary| *boundary <= conjunction_start)
+                        .max()
+                        .unwrap_or(0);
                     let following_end = boundaries
                         .iter()
                         .copied()
@@ -3188,16 +3231,23 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                                 .min()
                         })
                         .unwrap_or(answer.len());
-                    let introduces_another_file =
-                        file_aliases.iter().any(|(other_alias, other_owner)| {
-                            *other_owner != finding_index
-                                && alias_occurrences(&answer, other_alias).iter().any(
-                                    |(start, end)| {
-                                        *start >= conjunction_end && *end <= following_end
-                                    },
-                                )
-                        });
-                    if introduces_another_file {
+                    let has_other_alias_before = file_aliases.iter().any(|(other_alias, owner)| {
+                        *owner != finding_index
+                            && alias_occurrences(&answer, other_alias)
+                                .iter()
+                                .any(|(start, end)| {
+                                    *start >= preceding_start && *end <= conjunction_start
+                                })
+                    });
+                    let has_other_alias_after = file_aliases.iter().any(|(other_alias, owner)| {
+                        *owner != finding_index
+                            && alias_occurrences(&answer, other_alias)
+                                .iter()
+                                .any(|(start, end)| {
+                                    *start >= conjunction_end && *end <= following_end
+                                })
+                    });
+                    if has_other_alias_before || has_other_alias_after {
                         boundaries.push(conjunction_start);
                         boundaries.push(conjunction_end);
                     }
@@ -4050,15 +4100,19 @@ mod tests {
             "minecraft-rpg.qcow2 caused storage growth.",
             "minecraft-rpg.qcow2 was modified yesterday.",
             "minecraft-rpg.qcow2 caused 11 GB of storage growth.",
+            "minecraft-rpg.qcow2 causes storage growth.",
             "minecraft-rpg.qcow2 accounted for 11 GB of storage growth.",
             "minecraft-rpg.qcow2 drove 11 GB of storage growth.",
             "minecraft-rpg.qcow2 grew today.",
+            "diagnosis.sqlite has grown by 1.2 GB today.",
             "minecraft-rpg.qcow2 grew by 11 GB today.",
             "minecraft-rpg.qcow2 increased today.",
             "minecraft-rpg.qcow2 is increasing during the current period.",
             "minecraft-rpg.qcow2 changed during this period.",
+            "minecraft-rpg.qcow2 may contribute to storage growth.",
             "minecraft-rpg.qcow2 is contributing to storage growth.",
             "growth was driven by minecraft-rpg.qcow2.",
+            "growth was attributed to minecraft-rpg.qcow2.",
             "The increase is attributable to minecraft-rpg.qcow2.",
             "minecraft-rpg.qcow2 was the source of the increase.",
             "minecraft-rpg.qcow2 was active in the current window.",
@@ -4101,6 +4155,13 @@ mod tests {
         );
         assert!(
             grounded_storage_fallback(
+                "minecraft-rpg.qcow2 did not shrink then caused 11 GB of storage growth.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
                 "minecraft-rpg.qcow2 can't possibly have caused 11 GB of storage growth.",
                 &facts
             )
@@ -4109,6 +4170,13 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "minecraft-rpg.qcow2 couldn't possibly have caused 11 GB of storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 couldn’t possibly have caused 11 GB of storage growth.",
                 &facts
             )
             .is_none()
@@ -4149,6 +4217,11 @@ mod tests {
                 "cross-file conjunction was incorrectly rejected: {answer}"
             );
         }
+        assert!(grounded_storage_fallback(
+            "verified-current-growth.img is a likely contributor while minecraft-rpg.qcow2 is inventory-only.",
+            &facts
+        )
+        .is_none());
         assert!(
             grounded_storage_fallback(
                 "minecraft-rpg.qcow2 was old but increased by 11 GB today.",
