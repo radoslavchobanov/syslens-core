@@ -1544,16 +1544,30 @@ pub(crate) fn deterministic_storage_chat_summary(facts: &RootStorageFacts) -> St
             directory.path, directory.allocated_bytes_change
         ));
     }
-    if let Some(directory) = facts.directory_detail_facts.first() {
+    if let Some(directory) = facts.directory_detail_facts.iter().find(|detail| {
+        !facts
+            .directory_facts
+            .iter()
+            .any(|top_level| top_level.path == detail.path)
+    }) {
         summary.push_str(&format!(
             "Largest nested detail: {} ({:+} bytes, overlapping its ancestor). ",
             directory.path, directory.allocated_bytes_change
         ));
     }
-    let files = facts
+    let mut ordered_files = facts
         .file_facts
         .iter()
-        .take(3)
+        .filter(|file| file.temporal_status == "current_interval")
+        .chain(
+            facts
+                .file_facts
+                .iter()
+                .filter(|file| file.temporal_status != "current_interval"),
+        )
+        .take(3);
+    let files = ordered_files
+        .by_ref()
         .map(|file| {
             format!(
                 "{} ({:+} bytes; temporal_status={}; baseline_status={})",
