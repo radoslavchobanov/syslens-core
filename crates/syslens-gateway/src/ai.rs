@@ -3372,29 +3372,76 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
 
     fn generic_file_predicate_claim(clause: &str) -> bool {
         fn is_causal_predicate(token: &str) -> bool {
-            !matches!(token, "contributor" | "contributors")
-                && (token.starts_with("caus")
-                    || token.starts_with("explain")
-                    || token.starts_with("contribut")
-                    || token.starts_with("attribut")
-                    || token.starts_with("account")
-                    || token.starts_with("responsib")
-                    || token.starts_with("result")
-                    || token.starts_with("driv")
-                    || matches!(token, "drove" | "lead" | "leads" | "led" | "leading"))
+            matches!(
+                token,
+                "cause"
+                    | "causes"
+                    | "caused"
+                    | "causing"
+                    | "explain"
+                    | "explains"
+                    | "explained"
+                    | "explaining"
+                    | "contribute"
+                    | "contributes"
+                    | "contributed"
+                    | "contributing"
+                    | "attribute"
+                    | "attributes"
+                    | "attributed"
+                    | "attributing"
+                    | "attributable"
+                    | "account"
+                    | "accounts"
+                    | "accounted"
+                    | "accounting"
+                    | "responsible"
+                    | "result"
+                    | "results"
+                    | "resulted"
+                    | "resulting"
+                    | "drive"
+                    | "drives"
+                    | "drove"
+                    | "driven"
+                    | "driving"
+                    | "lead"
+                    | "leads"
+                    | "led"
+                    | "leading"
+            )
         }
 
         fn is_timing_predicate(token: &str) -> bool {
-            token.starts_with("happen")
-                || token.starts_with("creat")
-                || (token.starts_with("grow") && token != "growth")
-                || (token.starts_with("increas") && token != "increase")
-                || (token.starts_with("decreas") && token != "decrease")
-                || token.starts_with("chang")
-                || token.starts_with("download")
-                || token.starts_with("modif")
-                || token.starts_with("active")
-                || matches!(token, "saw" | "see" | "seen" | "show" | "shows" | "showed")
+            matches!(
+                token,
+                "happen"
+                    | "happens"
+                    | "happened"
+                    | "happening"
+                    | "create"
+                    | "creates"
+                    | "created"
+                    | "creating"
+                    | "grow"
+                    | "grows"
+                    | "grew"
+                    | "grown"
+                    | "growing"
+                    | "increased"
+                    | "increasing"
+                    | "decreased"
+                    | "decreasing"
+                    | "changed"
+                    | "changing"
+                    | "downloaded"
+                    | "downloads"
+                    | "downloading"
+                    | "modified"
+                    | "modifies"
+                    | "modifying"
+                    | "active"
+            ) || matches!(token, "saw" | "see" | "seen" | "show" | "shows" | "showed")
         }
 
         fn is_predicate_boundary(token: &str) -> bool {
@@ -3484,7 +3531,30 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 .iter()
                 .any(|token| matches!(*token, "file" | "files"));
             let snippet = &text[prefix_start..phrase_end];
-            if has_file_context && !explicit_no_file && !phrase_is_negated(snippet, phrase) {
+            let suffix_denies_identification = [
+                "cannot be identified",
+                "can't be identified",
+                "could not be identified",
+                "cannot be determined",
+                "could not be determined",
+                "cannot be established",
+                "could not be established",
+                "cannot be found",
+                "is unknown",
+                "was unknown",
+                "is unclear",
+                "remains unclear",
+                "not identified",
+                "not known",
+                "not established",
+            ]
+            .iter()
+            .any(|denial| text[phrase_end..clause_suffix_end].contains(denial));
+            if has_file_context
+                && !explicit_no_file
+                && !suffix_denies_identification
+                && !phrase_is_negated(snippet, phrase)
+            {
                 return true;
             }
             offset = phrase_end;
@@ -3548,6 +3618,12 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "probable cause",
             "probable causes",
             "root cause",
+            "caused by a file",
+            "caused by the file",
+            "came from a file",
+            "came from the file",
+            "cause is a file",
+            "cause is the file",
             "main contributor",
             "main file",
             "primary contributor",
@@ -4799,6 +4875,24 @@ mod tests {
         );
         assert!(
             grounded_storage_fallback(
+                "The increase was caused by a file in /var.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Storage growth came from a file under /var.",
+                &no_eligible_facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback("The cause is a file under /var.", &no_eligible_facts)
+                .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
                 "No eligible file is a likely contributor.",
                 &no_eligible_facts
             )
@@ -4807,6 +4901,24 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "Files outside the current interval are not causes.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback("File attribution is unavailable.", &no_eligible_facts)
+                .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "The file evidence cannot establish causation.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "The root cause cannot be identified from the file evidence.",
                 &no_eligible_facts
             )
             .is_none()
