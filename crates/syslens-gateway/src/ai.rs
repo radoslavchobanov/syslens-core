@@ -319,7 +319,7 @@ impl Model {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a concise SysLens storage analyst. Use only the authoritative JSON facts. State the measured change, name the strongest directory and the most relevant file when present, mention temporal status, and state one key limitation. Do not invent causes. Return plain English in at most 45 words."
+                    "content": "You are a concise SysLens storage analyst. Use only the authoritative JSON facts. State the measured change and strongest directory. Only a file with evidence_class=causal_candidate and causal_eligible=true may be called a likely contributor; never call inventory_only or insufficient_evidence files causes, the most relevant file, or current-period activity. Do not say a candidate caused the change or happened yesterday unless the facts support it. No finding proves causation. State one key limitation. Return plain English in at most 45 words."
                 },
                 {
                     "role": "user",
@@ -677,6 +677,70 @@ struct FileFindingFact {
     comparison_mtime_utc: String,
     current_ctime_utc: String,
     comparison_ctime_utc: String,
+    /// Provenance classification derived from the typed storage evidence.
+    /// This is deliberately not inferred from a rendered path or filename.
+    evidence_class: StorageFileEvidenceClass,
+    causal_basis: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageFileEvidenceClass {
+    CausalCandidate,
+    InventoryOnly,
+    InsufficientEvidence,
+}
+
+impl StorageFileEvidenceClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CausalCandidate => "causal_candidate",
+            Self::InventoryOnly => "inventory_only",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+
+    fn causal_eligible(self) -> bool {
+        matches!(self, Self::CausalCandidate)
+    }
+}
+
+fn classify_storage_file(
+    baseline_status: &str,
+    temporal_status: &str,
+    allocated_bytes_change: i64,
+    root_change: i64,
+) -> (StorageFileEvidenceClass, &'static str) {
+    // A file can be a causal candidate only when its sampled size has a
+    // comparable baseline, its metadata activity is in the requested current
+    // interval, and its allocation delta has the same direction as the root
+    // mount delta.  This is still a candidate, not proof of causation.
+    if (baseline_status == "known" || baseline_status == "growth_from_zero")
+        && temporal_status == "current_interval"
+        && root_change != 0
+        && allocated_bytes_change.signum() == root_change.signum()
+        && allocated_bytes_change != 0
+    {
+        return (
+            StorageFileEvidenceClass::CausalCandidate,
+            "matched_current_baseline_and_timing",
+        );
+    }
+
+    // A finding that predates the comparison window is useful inventory or
+    // historical context, but can never explain growth in the requested
+    // interval. Keep this distinct from incomplete evidence so the model can
+    // explain the difference without treating either as a cause.
+    if matches!(temporal_status, "before_comparison" | "comparison_interval") {
+        return (
+            StorageFileEvidenceClass::InventoryOnly,
+            "outside_current_interval",
+        );
+    }
+
+    (
+        StorageFileEvidenceClass::InsufficientEvidence,
+        "missing_comparable_baseline_or_timing",
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -1430,6 +1494,12 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
                 .get("comparison_ctime_utc")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let (evidence_class, causal_basis) = classify_storage_file(
+                baseline_status,
+                temporal_status,
+                allocated,
+                used_bytes_change,
+            );
             Some(FileFindingFact {
                 path: bounded_text(path, 512),
                 allocated_bytes_change: allocated,
@@ -1444,6 +1514,8 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
                 comparison_mtime_utc: bounded_text(comparison_mtime, 128),
                 current_ctime_utc: bounded_text(current_ctime, 128),
                 comparison_ctime_utc: bounded_text(comparison_ctime, 128),
+                evidence_class,
+                causal_basis: bounded_text(causal_basis, 96),
             })
         })
         .collect::<Vec<_>>();
@@ -1459,10 +1531,13 @@ pub(crate) fn root_storage_facts(evidence: &Value) -> Option<RootStorageFacts> {
         .iter()
         .map(|finding| {
             format!(
-                "{} baseline_status={} temporal_status={} allocated_change={:+} bytes apparent_change={:+} bytes current_allocated={} bytes comparison_allocated={} bytes current_apparent={} bytes comparison_apparent={} bytes current_mtime_utc={} comparison_mtime_utc={} current_ctime_utc={} comparison_ctime_utc={}",
+                "{} baseline_status={} temporal_status={} evidence_class={} causal_eligible={} causal_basis={} allocated_change={:+} bytes apparent_change={:+} bytes current_allocated={} bytes comparison_allocated={} bytes current_apparent={} bytes comparison_apparent={} bytes current_mtime_utc={} comparison_mtime_utc={} current_ctime_utc={} comparison_ctime_utc={}",
                 finding.path,
                 finding.baseline_status,
                 finding.temporal_status,
+                finding.evidence_class.as_str(),
+                finding.evidence_class.causal_eligible(),
+                finding.causal_basis,
                 finding.allocated_bytes_change,
                 finding.apparent_bytes_change,
                 finding.current_allocated_bytes,
@@ -1551,6 +1626,11 @@ fn rendered_file_candidate(finding: &FileFindingFact) -> String {
         finding.temporal_status,
         finding.baseline_status,
         finding.allocated_bytes_change,
+    ) + &format!(
+        " evidence_class={} causal_eligible={} causal_basis={}",
+        finding.evidence_class.as_str(),
+        finding.evidence_class.causal_eligible(),
+        finding.causal_basis,
     )
 }
 
@@ -1601,6 +1681,9 @@ pub(crate) fn storage_model_facts(facts: &RootStorageFacts) -> String {
                 "allocated_bytes_change": finding.allocated_bytes_change,
                 "temporal_status": bounded_text(&finding.temporal_status, 32),
                 "baseline_status": bounded_text(&finding.baseline_status, 32),
+                "evidence_class": finding.evidence_class.as_str(),
+                "causal_eligible": finding.evidence_class.causal_eligible(),
+                "causal_basis": finding.causal_basis,
             })
         })
         .collect::<Vec<_>>();
@@ -1618,6 +1701,7 @@ pub(crate) fn storage_model_facts(facts: &RootStorageFacts) -> String {
             },
             "top_directories": directories,
             "top_files": files,
+            "file_evidence_policy": "Only files with evidence_class=causal_candidate and causal_eligible=true may be described as likely contributors. inventory_only and insufficient_evidence files are not causes; mention them only as historical context, inventory, or insufficient evidence. No finding proves causation.",
             "limitation": "Directory and file findings overlap the root total; do not add them together.",
         });
         let text = serde_json::to_string(&value).expect("storage model facts are serializable");
@@ -1873,33 +1957,49 @@ pub(crate) fn deterministic_storage_chat_summary(facts: &RootStorageFacts) -> St
             directory.path, directory.allocated_bytes_change
         ));
     }
-    let mut ordered_files = facts
+    let causal_files = facts
         .file_facts
         .iter()
-        .filter(|file| file.temporal_status == "current_interval")
-        .chain(
-            facts
-                .file_facts
-                .iter()
-                .filter(|file| file.temporal_status != "current_interval"),
-        )
-        .take(3);
-    let files = ordered_files
-        .by_ref()
+        .filter(|file| file.evidence_class.causal_eligible())
+        .take(3)
         .map(|file| {
             format!(
-                "{} ({:+} bytes; temporal_status={}; baseline_status={})",
-                file.path, file.allocated_bytes_change, file.temporal_status, file.baseline_status
+                "{} ({:+} bytes; evidence_class={}; causal_basis={})",
+                file.path,
+                file.allocated_bytes_change,
+                file.evidence_class.as_str(),
+                file.causal_basis,
             )
         })
         .collect::<Vec<_>>();
-    if !files.is_empty() {
-        summary.push_str("Top sampled file candidates: ");
-        summary.push_str(&files.join("; "));
+    if !causal_files.is_empty() {
+        summary.push_str("Eligible sampled file contributors (candidates, not proof): ");
+        summary.push_str(&causal_files.join("; "));
+        summary.push_str(". ");
+    }
+    let inventory_files = facts
+        .file_facts
+        .iter()
+        .filter(|file| !file.evidence_class.causal_eligible())
+        .take(3)
+        .map(|file| {
+            format!(
+                "{} ({:+} bytes; temporal_status={}; baseline_status={}; evidence_class={}; causal_eligible=false)",
+                file.path,
+                file.allocated_bytes_change,
+                file.temporal_status,
+                file.baseline_status,
+                file.evidence_class.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !inventory_files.is_empty() {
+        summary.push_str("Inventory-only or insufficient file findings (not causal evidence): ");
+        summary.push_str(&inventory_files.join("; "));
         summary.push_str(". ");
     }
     summary.push_str(
-        "Directory and file findings overlap the root total; never add them together. File timestamps describe activity, not proof of causation. ",
+        "Directory and file findings overlap the root total; never add them together. File timestamps describe activity, not proof of causation. Only evidence_class=causal_candidate files with a matched baseline and current-interval timing may be discussed as likely contributors; all other files must remain inventory or insufficient evidence. ",
     );
     if !facts.limitations.is_empty() {
         summary.push_str("Limitations: ");
@@ -2711,11 +2811,105 @@ fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> b
     false
 }
 
+fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFacts) -> bool {
+    let answer = answer.to_ascii_lowercase();
+    let attribution_phrases = [
+        "caused by",
+        "cause was",
+        "caused the",
+        "responsible for",
+        "led to",
+        "resulted from",
+        "due to",
+        "because of",
+        "contributed",
+        "likely cause",
+        "likely contributor",
+        "probable cause",
+        "root cause",
+        "most relevant file",
+        "primary file",
+        "main file",
+        "strongest file",
+        "key file",
+        "largest file",
+    ];
+    let timing_phrases = [
+        "happened yesterday",
+        "created yesterday",
+        "grew yesterday",
+        "downloaded yesterday",
+        "during yesterday",
+        "in the current interval",
+        "during the current interval",
+        "in the current period",
+        "during the current period",
+    ];
+    let caveat_phrases = [
+        "not caused by",
+        "not a cause",
+        "not causal",
+        "cannot be attributed",
+        "cannot establish",
+        "does not establish",
+        "does not prove",
+        "not prove",
+        "not enough evidence",
+        "insufficient evidence",
+        "unknown baseline",
+        "inventory only",
+        "inventory-only",
+        "not eligible",
+        "predates",
+    ];
+
+    facts.file_facts.iter().any(|finding| {
+        if finding.evidence_class.causal_eligible() {
+            return false;
+        }
+        let path = finding.path.to_ascii_lowercase();
+        let basename = path.rsplit('/').next().unwrap_or(path.as_str()).to_owned();
+        let aliases = if basename == path {
+            vec![path]
+        } else {
+            vec![path, basename]
+        };
+        aliases.into_iter().any(|alias| {
+            let Some(alias_start) = answer.find(&alias) else {
+                return false;
+            };
+            let mut context_start = alias_start.saturating_sub(180);
+            while !answer.is_char_boundary(context_start) {
+                context_start = context_start.saturating_sub(1);
+            }
+            let mut context_end = (alias_start + alias.len() + 180).min(answer.len());
+            while context_end < answer.len() && !answer.is_char_boundary(context_end) {
+                context_end += 1;
+            }
+            let context = &answer[context_start..context_end];
+            let has_caveat = caveat_phrases.iter().any(|phrase| context.contains(phrase));
+            let has_attribution = attribution_phrases.iter().any(|phrase| {
+                if !context.contains(phrase) {
+                    return false;
+                }
+                // Do not reject an explicit negative statement such as
+                // "not caused by ..." merely because it contains the
+                // attribution vocabulary.
+                !matches!(
+                    *phrase,
+                    "caused by" | "cause was" | "caused the" | "responsible for"
+                ) || !context.contains("not ")
+            });
+            let has_timing = timing_phrases.iter().any(|phrase| context.contains(phrase));
+            (has_attribution || has_timing) && !has_caveat
+        })
+    })
+}
+
 pub(crate) fn grounded_storage_fallback(answer: &str, facts: &RootStorageFacts) -> Option<String> {
-    if facts.used_bytes_change == 0 {
-        return None;
-    }
-    if !directly_contradicts_root_change(answer, facts) {
+    let root_contradiction = directly_contradicts_root_change(answer, facts);
+    let unsupported_file_claim = storage_answer_has_unsupported_file_claim(answer, facts);
+    if !root_contradiction && !unsupported_file_claim {
         return None;
     }
     let direction = if facts.used_bytes_change > 0 {
@@ -2724,8 +2918,13 @@ pub(crate) fn grounded_storage_fallback(answer: &str, facts: &RootStorageFacts) 
         "decreased"
     };
     let magnitude = facts.used_bytes_change.saturating_abs();
+    let rejection_reason = if unsupported_file_claim {
+        "The model answer was rejected because it assigned causation or current-period timing to an ineligible file finding."
+    } else {
+        "The model answer was rejected because it contradicted the authoritative storage evidence."
+    };
     let mut fallback = format!(
-        "The model answer was rejected because it contradicted the authoritative storage evidence. \
+        "{rejection_reason} \
          The root filesystem {direction} by {magnitude} bytes (delta {:+} bytes, {:+.2} GiB): \
          {} bytes used in the current interval versus {} bytes in the comparison interval. \
          Current interval: {} to {}. Comparison interval: {} to {}. \
@@ -3311,6 +3510,147 @@ mod tests {
             )
         );
         assert!(summary.contains("minecraft.qcow2"));
+    }
+
+    #[test]
+    fn storage_file_provenance_gate_reproduces_live_growth_case() {
+        let evidence = json!({
+            "data": {
+                "current": {"start_utc":"2026-09-23T00:00:00Z","end_utc":"2026-09-24T00:00:00Z"},
+                "comparison": {"start_utc":"2026-09-22T00:00:00Z","end_utc":"2026-09-23T00:00:00Z"},
+                "mounts": [{
+                    "mount_id":"root-mount","mount_point":"/",
+                    "current_used_bytes":20_481_288_192i64,
+                    "comparison_used_bytes":20_000_000_000i64,
+                    "used_bytes_change":481_288_192i64
+                }],
+                "directories": [
+                    {"mount_id":"root-mount","root":"/","path":"/var","allocated_bytes_change":445_677_568i64,"apparent_bytes_change":445_677_568i64},
+                    {"mount_id":"root-mount","root":"/","path":"/var/lib","allocated_bytes_change":434_810_880i64,"apparent_bytes_change":434_810_880i64}
+                ],
+                "file_findings": [
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/home/acemagic/.local/share/diagnosis.sqlite",
+                        "allocated_bytes_change":1_220_000_000i64,"apparent_bytes_change":1_220_000_000i64,
+                        "current_allocated_bytes":1_220_000_000i64,"comparison_allocated_bytes":0i64,
+                        "current_apparent_bytes":1_220_000_000i64,"comparison_apparent_bytes":0i64,
+                        "current_mtime_utc":"2026-09-23T18:00:00Z","comparison_mtime_utc":"unknown",
+                        "current_ctime_utc":"2026-09-23T18:00:00Z","comparison_ctime_utc":"unknown",
+                        "baseline_status":"unknown","temporal_status":"current_interval"
+                    },
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/var/lib/libvirt/images/minecraft-rpg.qcow2",
+                        "allocated_bytes_change":11_530_000_000i64,"apparent_bytes_change":11_530_000_000i64,
+                        "current_allocated_bytes":11_530_000_000i64,"comparison_allocated_bytes":0i64,
+                        "current_apparent_bytes":11_530_000_000i64,"comparison_apparent_bytes":0i64,
+                        "current_mtime_utc":"2026-09-15T18:30:00Z","comparison_mtime_utc":"unknown",
+                        "current_ctime_utc":"2026-09-15T18:30:00Z","comparison_ctime_utc":"unknown",
+                        "baseline_status":"unknown","temporal_status":"before_comparison"
+                    },
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/var/lib/containerd/io.containerd.content/blobs/sha256/blob",
+                        "allocated_bytes_change":3_560_000_000i64,"apparent_bytes_change":3_560_000_000i64,
+                        "current_allocated_bytes":3_560_000_000i64,"comparison_allocated_bytes":0i64,
+                        "current_apparent_bytes":3_560_000_000i64,"comparison_apparent_bytes":0i64,
+                        "current_mtime_utc":"2026-09-15T18:30:00Z","comparison_mtime_utc":"unknown",
+                        "current_ctime_utc":"2026-09-15T18:30:00Z","comparison_ctime_utc":"unknown",
+                        "baseline_status":"unknown","temporal_status":"before_comparison"
+                    },
+                    {
+                        "mount_id":"root-mount","root":"/","path":"/var/lib/verified-current-growth.img",
+                        "allocated_bytes_change":100_000_000i64,"apparent_bytes_change":100_000_000i64,
+                        "current_allocated_bytes":200_000_000i64,"comparison_allocated_bytes":100_000_000i64,
+                        "current_apparent_bytes":200_000_000i64,"comparison_apparent_bytes":100_000_000i64,
+                        "current_mtime_utc":"2026-09-23T18:30:00Z","comparison_mtime_utc":"2026-09-22T18:30:00Z",
+                        "current_ctime_utc":"2026-09-23T18:30:00Z","comparison_ctime_utc":"2026-09-22T18:30:00Z",
+                        "baseline_status":"known","temporal_status":"current_interval"
+                    }
+                ],
+                "path_attribution_status":"available",
+                "limitations":["Sampled file findings overlap directory and root totals"]
+            }
+        });
+        let facts = root_storage_facts(&evidence).unwrap();
+        let diagnosis = facts
+            .file_facts
+            .iter()
+            .find(|finding| finding.path.ends_with("diagnosis.sqlite"))
+            .unwrap();
+        assert_eq!(
+            diagnosis.evidence_class,
+            StorageFileEvidenceClass::InsufficientEvidence
+        );
+        assert!(!diagnosis.evidence_class.causal_eligible());
+        let minecraft = facts
+            .file_facts
+            .iter()
+            .find(|finding| finding.path.ends_with("minecraft-rpg.qcow2"))
+            .unwrap();
+        assert_eq!(
+            minecraft.evidence_class,
+            StorageFileEvidenceClass::InventoryOnly
+        );
+        let verified = facts
+            .file_facts
+            .iter()
+            .find(|finding| finding.path.ends_with("verified-current-growth.img"))
+            .unwrap();
+        assert_eq!(
+            verified.evidence_class,
+            StorageFileEvidenceClass::CausalCandidate
+        );
+
+        let model_facts: Value = serde_json::from_str(&storage_model_facts(&facts)).unwrap();
+        let model_files = model_facts["top_files"].as_array().unwrap();
+        let model_minecraft = model_files
+            .iter()
+            .find(|file| {
+                file["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("minecraft-rpg.qcow2")
+            })
+            .unwrap();
+        assert_eq!(model_minecraft["evidence_class"], "inventory_only");
+        assert_eq!(model_minecraft["causal_eligible"], false);
+        assert!(
+            model_facts["file_evidence_policy"]
+                .as_str()
+                .unwrap()
+                .contains("Only files with evidence_class=causal_candidate")
+        );
+
+        assert!(
+            grounded_storage_fallback(
+                "The storage growth was caused by minecraft-rpg.qcow2.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "The most relevant file is diagnosis.sqlite and it happened yesterday.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(grounded_storage_fallback(
+            "minecraft-rpg.qcow2 is inventory-only and cannot establish the cause; its baseline is unknown.",
+            &facts
+        )
+        .is_none());
+        assert!(grounded_storage_fallback(
+            "verified-current-growth.img is a likely contributor, but it is not proven as the root cause.",
+            &facts
+        )
+        .is_none());
+
+        let chat_summary = deterministic_storage_chat_summary(&facts);
+        assert!(chat_summary.contains("Eligible sampled file contributors"));
+        assert!(chat_summary.contains("verified-current-growth.img"));
+        assert!(chat_summary.contains("Inventory-only or insufficient file findings"));
+        assert!(chat_summary.contains("minecraft-rpg.qcow2"));
+        assert!(chat_summary.contains("causal_eligible=false"));
     }
 
     #[test]
