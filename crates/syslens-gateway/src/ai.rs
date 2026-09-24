@@ -934,19 +934,23 @@ pub(crate) fn incident_model_facts(facts: &IncidentFacts) -> Value {
     let incidents = facts
         .incidents
         .iter()
-        .take(10)
+        // A page can contain many repeated detector findings. Keep the
+        // model-facing projection small enough for CPU-only Ollama prompt
+        // processing; the complete bounded page remains in the evidence
+        // reference and deterministic answer.
+        .take(8)
         .map(|incident| {
             json!({
                 "id": bounded_text(&incident.id, 96),
                 "detector": bounded_text(&incident.detector, 96),
-                "subject": bounded_text(&incident.subject, 160),
+                "subject": bounded_text(&incident.subject, 96),
                 "severity": bounded_text(&incident.severity, 48),
                 "status": bounded_text(&incident.status, 48),
                 "opened_at_unix": incident.opened_at,
                 "updated_at_unix": incident.updated_at,
                 "recovered_at_unix": incident.recovered_at,
                 "acknowledged_at_unix": incident.acknowledged_at,
-                "evidence": bounded_text(&incident.evidence_summary, 384),
+                "evidence": bounded_text(&incident.evidence_summary, 192),
             })
         })
         .collect::<Vec<_>>();
@@ -3760,6 +3764,7 @@ mod tests {
                 .to_string()
                 .contains("change_bytes")
         );
+        assert!(incident_model_facts(&incidents).to_string().len() < 4096);
         assert!(incident_answer_contradicts_facts(
             "There are no incidents.",
             &incidents
