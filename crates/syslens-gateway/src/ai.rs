@@ -2943,6 +2943,48 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             .collect()
     }
 
+    fn has_structural_uncertainty(words: &[&str]) -> bool {
+        const UNCERTAINTY_WORDS: &[&str] = &[
+            "unknown",
+            "unclear",
+            "uncertain",
+            "insufficient",
+            "unavailable",
+            "unable",
+            "cannot",
+            "cant",
+            "can't",
+            "couldnt",
+            "couldn't",
+            "undetermined",
+            "unresolved",
+            "inconclusive",
+            "missing",
+            "lack",
+            "lacks",
+        ];
+        const DENIED_OUTCOMES: &[&str] = &[
+            "identified",
+            "known",
+            "inferred",
+            "concluded",
+            "deduced",
+            "determined",
+            "established",
+            "found",
+            "attributable",
+            "responsible",
+        ];
+
+        words.iter().enumerate().any(|(index, word)| {
+            UNCERTAINTY_WORDS.contains(word)
+                || (*word == "not"
+                    && words
+                        .get(index + 1)
+                        .is_some_and(|next| DENIED_OUTCOMES.contains(next)))
+        })
+    }
+
     fn token_is_negated(tokens: &[&str], index: usize) -> bool {
         fn is_negator(token: &str) -> bool {
             matches!(
@@ -3479,11 +3521,18 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 .take(24)
                 .take_while(|(_, candidate)| !is_predicate_boundary(candidate))
                 .any(|(predicate_index, candidate)| {
+                    let predicate_start = words[..predicate_index]
+                        .iter()
+                        .rposition(|word| is_predicate_boundary(word))
+                        .map_or(0, |boundary| boundary + 1);
+                    let predicate_uncertain =
+                        has_structural_uncertainty(&words[predicate_start..predicate_index]);
                     if is_causal_predicate(candidate) {
-                        return !token_is_negated(&words, predicate_index);
+                        return !token_is_negated(&words, predicate_index) && !predicate_uncertain;
                     }
                     is_timing_predicate(candidate)
                         && !token_is_negated(&words, predicate_index)
+                        && !predicate_uncertain
                         && has_following_token(&words, predicate_index, &timing_terms)
                 })
         })
@@ -3531,28 +3580,13 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 .iter()
                 .any(|token| matches!(*token, "file" | "files"));
             let snippet = &text[prefix_start..phrase_end];
-            let suffix_denies_identification = [
-                "cannot be identified",
-                "can't be identified",
-                "could not be identified",
-                "cannot be determined",
-                "could not be determined",
-                "cannot be established",
-                "could not be established",
-                "cannot be found",
-                "is unknown",
-                "was unknown",
-                "is unclear",
-                "remains unclear",
-                "not identified",
-                "not known",
-                "not established",
-            ]
-            .iter()
-            .any(|denial| text[phrase_end..clause_suffix_end].contains(denial));
+            let scoped_prefix_uncertain = has_structural_uncertainty(&tokens(scoped_prefix));
+            let suffix_uncertain =
+                has_structural_uncertainty(&tokens(&text[phrase_end..clause_suffix_end]));
             if has_file_context
                 && !explicit_no_file
-                && !suffix_denies_identification
+                && !scoped_prefix_uncertain
+                && !suffix_uncertain
                 && !phrase_is_negated(snippet, phrase)
             {
                 return true;
@@ -4919,6 +4953,27 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "The root cause cannot be identified from the file evidence.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "It is unknown whether the increase was caused by a file.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "File evidence is insufficient to explain the increase.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "The root cause cannot be inferred from the file evidence.",
                 &no_eligible_facts
             )
             .is_none()
