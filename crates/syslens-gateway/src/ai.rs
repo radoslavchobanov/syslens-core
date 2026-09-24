@@ -1225,6 +1225,7 @@ fn gibibytes(bytes: i64) -> f64 {
     bytes as f64 / 1_073_741_824.0
 }
 
+#[allow(dead_code)]
 fn rendered_file_candidate(finding: &FileFindingFact) -> String {
     format!(
         "{} (temporal_status={}; baseline_status={}; allocated_change={:+} bytes)",
@@ -1235,6 +1236,7 @@ fn rendered_file_candidate(finding: &FileFindingFact) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn append_file_candidates(
     summary: &mut String,
     findings: &[FileFindingFact],
@@ -1393,6 +1395,7 @@ pub(crate) fn canonical_storage_facts(facts: &RootStorageFacts) -> String {
 
 /// A deterministic, bounded summary that keeps a useful answer available when
 /// a local model emits only reasoning or a generic evidence paraphrase.
+#[allow(dead_code)]
 pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String {
     let direction = match facts.used_bytes_change.cmp(&0) {
         std::cmp::Ordering::Greater => "increased",
@@ -1511,13 +1514,92 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
     bounded_text(&summary, 8192)
 }
 
+/// Chat-facing storage evidence is intentionally much shorter than the full
+/// deterministic diagnosis renderer. The evidence reference still points to
+/// the complete host response, but a terminal conversation should lead with
+/// the exact delta and the most useful causal candidates rather than replaying
+/// every retained directory and sampled-file row.
+pub(crate) fn deterministic_storage_chat_summary(facts: &RootStorageFacts) -> String {
+    let direction = match facts.used_bytes_change.cmp(&0) {
+        std::cmp::Ordering::Greater => "increased",
+        std::cmp::Ordering::Less => "decreased",
+        std::cmp::Ordering::Equal => "did not change",
+    };
+    let magnitude = facts.used_bytes_change.saturating_abs();
+    let mut summary = format!(
+        "Authoritative storage evidence (deterministic): root filesystem {direction} by {magnitude} bytes ({:+.2} GiB; signed delta {:+} bytes). Current used: {} bytes. Comparison used: {} bytes. Intervals: {} to {} versus {} to {}. Path attribution: {}. ",
+        gibibytes(facts.used_bytes_change),
+        facts.used_bytes_change,
+        facts.current_used_bytes,
+        facts.comparison_used_bytes,
+        facts.current_start,
+        facts.current_end,
+        facts.comparison_start,
+        facts.comparison_end,
+        facts.path_attribution_status,
+    );
+    if let Some(directory) = facts.directory_facts.first() {
+        summary.push_str(&format!(
+            "Largest first-level directory: {} ({:+} bytes). ",
+            directory.path, directory.allocated_bytes_change
+        ));
+    }
+    if let Some(directory) = facts.directory_detail_facts.first() {
+        summary.push_str(&format!(
+            "Largest nested detail: {} ({:+} bytes, overlapping its ancestor). ",
+            directory.path, directory.allocated_bytes_change
+        ));
+    }
+    let files = facts
+        .file_facts
+        .iter()
+        .take(3)
+        .map(|file| {
+            format!(
+                "{} ({:+} bytes; temporal_status={}; baseline_status={})",
+                file.path, file.allocated_bytes_change, file.temporal_status, file.baseline_status
+            )
+        })
+        .collect::<Vec<_>>();
+    if !files.is_empty() {
+        summary.push_str("Top sampled file candidates: ");
+        summary.push_str(&files.join("; "));
+        summary.push_str(". ");
+    }
+    summary.push_str(
+        "Directory and file findings overlap the root total; never add them together. File timestamps describe activity, not proof of causation. ",
+    );
+    if !facts.limitations.is_empty() {
+        summary.push_str("Limitations: ");
+        summary.push_str(&facts.limitations.join("; "));
+    }
+    bounded_text(&summary, 8_192)
+}
+
 /// Put the exact deterministic storage summary first, regardless of what the
 /// model says. Remove any identical copy from the model text so retries or a
 /// model echo cannot duplicate the authoritative block.
+#[allow(dead_code)]
 pub(crate) fn authoritative_storage_answer(answer: &str, facts: &RootStorageFacts) -> String {
     let summary = deterministic_storage_summary(facts);
     let analysis = answer.replace(&summary, "");
     let analysis = analysis.trim();
+    if analysis.is_empty() {
+        summary
+    } else {
+        let prefix = format!("{summary}\n\nModel analysis:\n");
+        let available = MAX_FINAL_ANSWER_BYTES.saturating_sub(prefix.len());
+        let mut end = available.min(analysis.len());
+        while !analysis.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{prefix}{}", &analysis[..end])
+    }
+}
+
+pub(crate) fn authoritative_storage_chat_answer(answer: &str, facts: &RootStorageFacts) -> String {
+    let summary = deterministic_storage_chat_summary(facts);
+    let analysis = answer.trim();
     if analysis.is_empty() {
         summary
     } else {

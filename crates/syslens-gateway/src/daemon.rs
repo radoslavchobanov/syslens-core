@@ -60,7 +60,7 @@ struct ChatResponseContext<'a> {
 }
 
 fn deterministic_recovery_answer(facts: Option<&ai::RootStorageFacts>) -> Option<String> {
-    facts.map(ai::deterministic_storage_summary)
+    facts.map(ai::deterministic_storage_chat_summary)
 }
 
 fn deterministic_memory_recovery_answer(facts: Option<&ai::MemoryFacts>) -> String {
@@ -285,8 +285,8 @@ impl App {
                     }
                 };
                 let answer = model_analysis
-                    .map(|analysis| ai::authoritative_storage_answer(&analysis, facts))
-                    .unwrap_or_else(|| ai::deterministic_storage_summary(facts));
+                    .map(|analysis| ai::authoritative_storage_chat_answer(&analysis, facts))
+                    .unwrap_or_else(|| ai::deterministic_storage_chat_summary(facts));
                 return self.finish_chat(response_context, answer, refs, limitations);
             }
             for round in 0..=self.config.ai.max_rounds {
@@ -324,7 +324,9 @@ impl App {
                 };
                 if calls.is_empty(){let mut answer=assistant["content"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=32_768).map(str::to_owned);
                     if answer.is_none() {
-                        answer = root_storage_facts.as_ref().map(ai::deterministic_storage_summary);
+                        answer = root_storage_facts
+                            .as_ref()
+                            .map(ai::deterministic_storage_chat_summary);
                     }
                     let mut answer=answer.ok_or("AI returned no bounded answer")?;
                     if let Some(facts)=root_storage_facts.as_ref()
@@ -334,7 +336,7 @@ impl App {
                         answer=fallback;
                     }
                     if let Some(facts) = root_storage_facts.as_ref() {
-                        answer = ai::authoritative_storage_answer(&answer, facts);
+                        answer = ai::authoritative_storage_chat_answer(&answer, facts);
                     }
                     return self.finish_chat(response_context,answer,refs,limitations);
                 }
@@ -746,7 +748,7 @@ mod tests {
 
         assert_eq!(
             deterministic_recovery_answer(Some(&facts)),
-            Some(ai::deterministic_storage_summary(&facts))
+            Some(ai::deterministic_storage_chat_summary(&facts))
         );
         assert_eq!(deterministic_recovery_answer(None), None);
     }
@@ -779,7 +781,7 @@ mod tests {
             }
         });
         let facts = ai::root_storage_facts(&evidence).expect("root facts are available");
-        let expected = ai::deterministic_storage_summary(&facts);
+        let expected = ai::deterministic_storage_chat_summary(&facts);
 
         assert_eq!(oversized_storage_answer(Some(&facts)), expected);
         assert!(expected.contains("increased by 1000 bytes"));
