@@ -63,6 +63,14 @@ fn deterministic_recovery_answer(facts: Option<&ai::RootStorageFacts>) -> Option
     facts.map(ai::deterministic_storage_summary)
 }
 
+fn deterministic_memory_recovery_answer(facts: Option<&ai::MemoryFacts>) -> String {
+    facts
+        .map(ai::deterministic_memory_summary)
+        .unwrap_or_else(|| {
+            "Authoritative memory evidence was unavailable, so no measured RAM comparison can be reported. Model analysis was skipped. Check the target recording status and retained evidence before retrying.".into()
+        })
+}
+
 fn oversized_storage_answer(facts: Option<&ai::RootStorageFacts>) -> String {
     deterministic_recovery_answer(facts).unwrap_or_else(|| {
         "Authoritative storage evidence (deterministic): usable root-mount facts were unavailable, so no authoritative root filesystem delta can be reported. Model analysis was skipped because the full storage evidence exceeded the model context budget and no compact root-mount facts were available. Full evidence remains available through deterministic diagnosis.".into()
@@ -200,6 +208,43 @@ impl App {
             let mut refs=Vec::new();let mut limitations=Vec::new();
             let mut root_storage_facts=None;
             if omitted{limitations.push("Older conversation context was omitted to fit the model budget".to_string());}
+            if capabilities.data.resources.iter().any(|resource| resource == "memory")
+                && let Some(action) = ai::inferred_memory_action(&r.question)
+            {
+                let evidence = self.evidence(&target, action).await?;
+                refs.push(json!({"request_id":evidence["request_id"],"host_id":evidence["host_id"],"evidence_store_id":evidence["evidence_store_id"],"observed_at":evidence["observed_at"]}));
+                let facts = ai::memory_facts(&evidence);
+                if facts.is_none() {
+                    limitations.push("Authoritative memory facts were unavailable; the bounded memory model was not called".into());
+                    return self.finish_chat(
+                        response_context,
+                        deterministic_memory_recovery_answer(None),
+                        refs,
+                        limitations,
+                    );
+                }
+                let facts = facts.expect("memory facts checked above");
+                let model_analysis = match model_client
+                    .memory_completion(&model, &r.question, &facts)
+                    .await
+                {
+                    Ok(answer) if !ai::directly_contradicts_memory_change(&answer, &facts) => {
+                        Some(answer)
+                    }
+                    Ok(_) => {
+                        limitations.push("The bounded memory model contradicted authoritative measurements; the deterministic memory answer was returned".into());
+                        None
+                    }
+                    Err(error) => {
+                        limitations.push(format!("The bounded memory model failed ({error}); the deterministic memory answer was returned"));
+                        None
+                    }
+                };
+                let answer = model_analysis
+                    .map(|analysis| ai::authoritative_memory_answer(&analysis, &facts))
+                    .unwrap_or_else(|| deterministic_memory_recovery_answer(Some(&facts)));
+                return self.finish_chat(response_context, answer, refs, limitations);
+            }
             if capabilities.data.resources.iter().any(|resource| resource == "storage")
                 && let Some(action) = ai::inferred_storage_action(&r.question)
             {

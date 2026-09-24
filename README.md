@@ -333,6 +333,14 @@ recent incidents—never shell, SQL, filesystem, arbitrary network, or arbitrary
 tool access. Model failure never stops deterministic host status, diagnosis,
 event replay, or recording; chat reports a safe bounded error instead.
 
+For common memory and storage questions, the gateway resolves the requested
+comparison interval itself, fetches typed host evidence, and sends the model
+only a compact facts block. The model is an optional narrator, not the evidence
+planner: deterministic measurements and limitations are returned first, while
+malformed, contradictory, slow, or unavailable model output falls back to the
+deterministic answer. The bounded tool loop remains a compatibility path for
+questions that cannot yet be classified.
+
 Existing `[ai]` settings in a diagnosis config are ignored by targets. To move
 them without overwriting configuration, run `syslens-gateway migrate-ai --from
 ~/.config/syslens-diagnosis/config.toml` before creating the gateway config;

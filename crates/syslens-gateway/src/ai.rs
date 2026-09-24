@@ -14,6 +14,8 @@ const MAX_COMPLETION_TOKENS: u64 = 512;
 /// local model to spend its context on protocol bookkeeping.
 const MAX_STORAGE_COMPLETION_TOKENS: u64 = 96;
 const MAX_STORAGE_COMPLETION_WORDS: usize = 45;
+const MAX_MEMORY_COMPLETION_TOKENS: u64 = 96;
+const MAX_MEMORY_COMPLETION_WORDS: usize = 70;
 // A local model may need to load a cold model before it can generate the
 // answer. Keep a hard upper bound, but do not let the generic gateway timeout
 // turn a valid local completion into a deterministic-only response.
@@ -423,6 +425,74 @@ impl Model {
         }
         Ok(content.to_owned())
     }
+    /// Ask the local model to interpret already-collected memory facts. The
+    /// model never chooses the evidence interval or calls a host tool here;
+    /// those decisions are made by the gateway before this request.
+    pub(crate) async fn memory_completion(
+        &self,
+        model: &str,
+        question: &str,
+        facts: &MemoryFacts,
+    ) -> Result<String> {
+        let model_facts = memory_model_facts(facts);
+        let payload = json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a concise SysLens memory analyst. Use only the authoritative JSON facts. State the measured RAM change, the strongest observed process, and limitations. Do not invent causes. Return plain English in at most 70 words."
+                },
+                {
+                    "role": "user",
+                    "content": format!("Question:\n{}\n\nAuthoritative memory facts (JSON data only):\n{}", bounded_text(question, 1024), model_facts)
+                }
+            ],
+            "temperature": 0,
+            "stream": false,
+            "max_tokens": MAX_MEMORY_COMPLETION_TOKENS,
+            "think": false,
+        });
+        if payload.to_string().len() > 32_768 {
+            return Err("memory model context limit reached".into());
+        }
+        let response = tokio::time::timeout(
+            STORAGE_COMPLETION_TIMEOUT,
+            self.authenticated(
+                self.storage_client
+                    .post(&self.config.endpoint_url)
+                    .timeout(STORAGE_COMPLETION_TIMEOUT)
+                    .json(&payload),
+            )?
+            .send(),
+        )
+        .await
+        .map_err(|_| "memory model request timed out")?
+        .map_err(|_| "AI endpoint is unavailable")?;
+        if !response.status().is_success() {
+            return Err("AI endpoint rejected the memory request".into());
+        }
+        let value = client::bounded_json(response).await?;
+        let message = value["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .ok_or("memory model returned no assistant message")?;
+        if message["role"].as_str() != Some("assistant") {
+            return Err("invalid memory model message role".into());
+        }
+        let content = message["content"]
+            .as_str()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .ok_or("memory model returned no bounded answer")?;
+        if content.len() > 16_384 {
+            return Err("memory model answer exceeds size limit".into());
+        }
+        if content.split_whitespace().count() > MAX_MEMORY_COMPLETION_WORDS {
+            return Err("memory model answer exceeds word limit".into());
+        }
+        Ok(content.to_owned())
+    }
     pub async fn models(&self) -> Result<Value> {
         let mut u =
             crate::config::endpoint(&self.config.endpoint_url, self.config.allow_insecure_http)?;
@@ -573,6 +643,295 @@ pub(crate) struct RootStorageFacts {
     file_facts: Vec<FileFindingFact>,
     pub(crate) current_directory_snapshot: Vec<String>,
     pub(crate) limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryProcessFact {
+    pub(crate) name: String,
+    pub(crate) executable: String,
+    pub(crate) rss_anon_change_bytes: i64,
+    pub(crate) first_seen_utc: String,
+    pub(crate) last_seen_utc: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryFacts {
+    pub(crate) status: String,
+    pub(crate) current_start: String,
+    pub(crate) current_end: String,
+    pub(crate) comparison_start: String,
+    pub(crate) comparison_end: String,
+    pub(crate) current_mean_total_bytes: Option<f64>,
+    pub(crate) current_mean_available_bytes: Option<f64>,
+    pub(crate) comparison_mean_total_bytes: Option<f64>,
+    pub(crate) comparison_mean_available_bytes: Option<f64>,
+    pub(crate) current_samples: i64,
+    pub(crate) comparison_samples: i64,
+    pub(crate) expected_samples: i64,
+    pub(crate) current_ratio: f64,
+    pub(crate) comparison_ratio: f64,
+    pub(crate) current_gaps: i64,
+    pub(crate) comparison_gaps: i64,
+    pub(crate) findings: Vec<String>,
+    pub(crate) processes: Vec<MemoryProcessFact>,
+    pub(crate) limitations: Vec<String>,
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| bounded_text(value, 128))
+}
+
+fn json_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+/// Extract a compact, typed memory fact set from a host evidence envelope.
+/// Everything returned by the model-facing path is derived from these fields;
+/// the full host response remains available through the evidence reference.
+pub(crate) fn memory_facts(evidence: &Value) -> Option<MemoryFacts> {
+    let data = evidence.get("data")?;
+    let current = data.get("current")?;
+    let comparison = data.get("comparison")?;
+    let coverage = data.get("coverage")?;
+    let status = json_string(data, "status").unwrap_or_else(|| "unknown".into());
+    let findings = data
+        .get("findings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(8)
+        .map(|value| bounded_text(value, 512))
+        .collect::<Vec<_>>();
+    let limitations = data
+        .get("limitations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(8)
+        .map(|value| bounded_text(value, 512))
+        .collect::<Vec<_>>();
+    let processes = data
+        .get("processes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(10)
+        .filter_map(|process| {
+            Some(MemoryProcessFact {
+                name: bounded_text(process.get("name")?.as_str()?, 128),
+                executable: process
+                    .get("executable")
+                    .and_then(Value::as_str)
+                    .map(|value| bounded_text(value, 256))
+                    .unwrap_or_default(),
+                rss_anon_change_bytes: process.get("rss_anon_change_bytes")?.as_i64()?,
+                first_seen_utc: bounded_text(process.get("first_seen_utc")?.as_str()?, 128),
+                last_seen_utc: bounded_text(process.get("last_seen_utc")?.as_str()?, 128),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(MemoryFacts {
+        status,
+        current_start: json_string(current, "start_utc")?,
+        current_end: json_string(current, "end_utc")?,
+        comparison_start: json_string(comparison, "start_utc")?,
+        comparison_end: json_string(comparison, "end_utc")?,
+        current_mean_total_bytes: json_f64(current, "mean_mem_total_bytes"),
+        current_mean_available_bytes: json_f64(current, "mean_mem_available_bytes"),
+        comparison_mean_total_bytes: json_f64(comparison, "mean_mem_total_bytes"),
+        comparison_mean_available_bytes: json_f64(comparison, "mean_mem_available_bytes"),
+        current_samples: coverage
+            .get("current_samples")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        comparison_samples: coverage
+            .get("comparison_samples")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        expected_samples: coverage
+            .get("expected_samples")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        current_ratio: coverage
+            .get("current_ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        comparison_ratio: coverage
+            .get("comparison_ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        current_gaps: coverage
+            .get("current_gaps")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        comparison_gaps: coverage
+            .get("comparison_gaps")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        findings,
+        processes,
+        limitations,
+    })
+}
+
+fn used_percent(total: Option<f64>, available: Option<f64>) -> Option<f64> {
+    let total = total?;
+    let available = available?;
+    (total > 0.0).then_some((total - available) / total * 100.0)
+}
+
+fn memory_change_points(facts: &MemoryFacts) -> Option<f64> {
+    Some(
+        used_percent(
+            facts.current_mean_total_bytes,
+            facts.current_mean_available_bytes,
+        )? - used_percent(
+            facts.comparison_mean_total_bytes,
+            facts.comparison_mean_available_bytes,
+        )?,
+    )
+}
+
+fn memory_model_facts(facts: &MemoryFacts) -> String {
+    let current_used = used_percent(
+        facts.current_mean_total_bytes,
+        facts.current_mean_available_bytes,
+    );
+    let comparison_used = used_percent(
+        facts.comparison_mean_total_bytes,
+        facts.comparison_mean_available_bytes,
+    );
+    let processes = facts
+        .processes
+        .iter()
+        .take(5)
+        .map(|process| {
+            json!({
+                "name": bounded_text(&process.name, 96),
+                "executable": bounded_text(&process.executable, 160),
+                "rss_anon_change_bytes": process.rss_anon_change_bytes,
+                "first_seen_utc": bounded_text(&process.first_seen_utc, 96),
+                "last_seen_utc": bounded_text(&process.last_seen_utc, 96),
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "kind": "syslens_memory_model_facts",
+        "data_only": true,
+        "status": facts.status,
+        "current_interval": format!("{}..{}", facts.current_start, facts.current_end),
+        "comparison_interval": format!("{}..{}", facts.comparison_start, facts.comparison_end),
+        "average_used_ram_percent": {
+            "current": current_used,
+            "comparison": comparison_used,
+            "change_percentage_points": memory_change_points(facts),
+        },
+        "coverage": {
+            "current_ratio": facts.current_ratio,
+            "comparison_ratio": facts.comparison_ratio,
+            "current_samples": facts.current_samples,
+            "comparison_samples": facts.comparison_samples,
+            "expected_samples": facts.expected_samples,
+            "current_gaps": facts.current_gaps,
+            "comparison_gaps": facts.comparison_gaps,
+        },
+        "findings": facts.findings.iter().take(4).map(|value| bounded_text(value, 384)).collect::<Vec<_>>(),
+        "top_processes": processes,
+        "limitations": facts.limitations.iter().take(4).map(|value| bounded_text(value, 384)).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string(&value).expect("memory model facts are serializable");
+    bounded_text(&text, 6_000)
+}
+
+pub(crate) fn deterministic_memory_summary(facts: &MemoryFacts) -> String {
+    let mut summary = format!(
+        "Authoritative memory evidence (deterministic): status {}. Current interval: {} to {}. Comparison interval: {} to {}. ",
+        facts.status,
+        facts.current_start,
+        facts.current_end,
+        facts.comparison_start,
+        facts.comparison_end,
+    );
+    if let (Some(current), Some(comparison), Some(change)) = (
+        used_percent(
+            facts.current_mean_total_bytes,
+            facts.current_mean_available_bytes,
+        ),
+        used_percent(
+            facts.comparison_mean_total_bytes,
+            facts.comparison_mean_available_bytes,
+        ),
+        memory_change_points(facts),
+    ) {
+        summary.push_str(&format!(
+            "Average used RAM was {:.1}% versus {:.1}% ({:+.1} percentage points). ",
+            current, comparison, change
+        ));
+    } else {
+        summary.push_str("Average RAM usage could not be calculated from the retained samples. ");
+    }
+    summary.push_str(&format!(
+        "Coverage: {:.1}% current and {:.1}% comparison. ",
+        facts.current_ratio * 100.0,
+        facts.comparison_ratio * 100.0
+    ));
+    if let Some(process) = facts.processes.first() {
+        summary.push_str(&format!(
+            "Top observed anonymous-memory growth: {} ({:+.1} MiB). ",
+            process.name,
+            process.rss_anon_change_bytes as f64 / 1_048_576.0
+        ));
+    } else {
+        summary.push_str("No positive process-level anonymous-memory growth was observed. ");
+    }
+    if let Some(finding) = facts.findings.get(1) {
+        summary.push_str(&format!("Additional finding: {}. ", finding));
+    }
+    summary.push_str(
+        "Process RssAnon is anonymous resident memory, not private/USS, and does not exactly reconcile physical RAM. ",
+    );
+    if !facts.limitations.is_empty() {
+        summary.push_str("Limitations: ");
+        summary.push_str(&facts.limitations.join("; "));
+    }
+    bounded_text(&summary, 8_192)
+}
+
+pub(crate) fn directly_contradicts_memory_change(answer: &str, facts: &MemoryFacts) -> bool {
+    let Some(change) = memory_change_points(facts) else {
+        return false;
+    };
+    let answer = answer.to_ascii_lowercase();
+    if change.abs() < 0.05 {
+        return false;
+    }
+    let opposite = if change > 0.0 {
+        ["decreased", "decrease", "fell", "lower", "drop", "dropped"]
+    } else {
+        ["increased", "increase", "rose", "higher", "grew", "growth"]
+    };
+    opposite.iter().any(|word| answer.contains(word))
+}
+
+pub(crate) fn authoritative_memory_answer(answer: &str, facts: &MemoryFacts) -> String {
+    let summary = deterministic_memory_summary(facts);
+    let analysis = answer.trim();
+    if analysis.is_empty() {
+        summary
+    } else {
+        let prefix = format!("{summary}\n\nModel analysis:\n");
+        let available = MAX_FINAL_ANSWER_BYTES.saturating_sub(prefix.len());
+        let mut end = available.min(analysis.len());
+        while !analysis.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{prefix}{}", &analysis[..end])
+    }
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {
@@ -1417,6 +1776,41 @@ pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
         return None;
     }
 
+    // If a storage question asks for a current change but omits an interval,
+    // use the native diagnosis default instead of handing interval selection
+    // to a small model. Statements that merely mention storage or dates still
+    // fall through and are not treated as diagnosis requests.
+    let needs_default = [
+        "current",
+        "now",
+        "usage",
+        "used",
+        "why",
+        "explain",
+        "increase",
+        "increased",
+        "higher",
+        "change",
+        "changed",
+        "growth",
+        "grew",
+        "decrease",
+        "decreased",
+        "lower",
+    ]
+    .iter()
+    .any(|term| words.contains(term));
+    if needs_default
+        && !words.iter().any(|word| {
+            matches!(
+                *word,
+                "last" | "past" | "previous" | "preceding" | "prior" | "today" | "yesterday"
+            )
+        })
+    {
+        return window("today", "previous-week").ok().map(Action::Storage);
+    }
+
     let current_marker = words
         .iter()
         .position(|word| *word == "last" || *word == "past")?;
@@ -1449,6 +1843,84 @@ pub(crate) fn inferred_storage_action(question: &str) -> Option<Action> {
         return None;
     }
     absolute_adjacent_storage_request(current_period.duration)
+}
+
+/// Infer memory comparisons using the same bounded period grammar as storage.
+/// The gateway owns this decision so a small local model never has to invent
+/// RFC3339 bounds. Questions without an explicit period use today versus the
+/// preceding week, which is also the native diagnosis default.
+pub(crate) fn inferred_memory_action(question: &str) -> Option<Action> {
+    let lower = question.to_ascii_lowercase();
+    let words = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let resource = ["memory", "ram", "swap"]
+        .iter()
+        .any(|term| words.contains(term));
+    let competing_resource = [
+        "storage",
+        "disk",
+        "filesystem",
+        "cpu",
+        "processor",
+        "gpu",
+        "network",
+        "temperature",
+        "load",
+        "process",
+        "processes",
+    ]
+    .iter()
+    .any(|term| words.contains(term));
+    if !resource || competing_resource {
+        return None;
+    }
+
+    // Reuse the storage parser after replacing only the resource words. This
+    // keeps the two chat grammars identical for today/yesterday and adjacent
+    // explicit periods without making the model parse either one.
+    let normalized = words
+        .iter()
+        .map(|word| {
+            if matches!(*word, "memory" | "ram" | "swap") {
+                "storage"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(Action::Storage(request)) = inferred_storage_action(&normalized) {
+        return Some(Action::Memory(request));
+    }
+
+    // A question such as "what is current RAM usage?" has no comparison
+    // marker but still needs evidence. Use the stable default rather than
+    // falling into the model-controlled tool loop.
+    let needs_default = [
+        "current",
+        "now",
+        "usage",
+        "used",
+        "healthy",
+        "why",
+        "explain",
+        "increase",
+        "increased",
+        "higher",
+        "change",
+        "changed",
+        "growth",
+        "pressure",
+    ]
+    .iter()
+    .any(|term| words.contains(term));
+    if needs_default {
+        let request = window("today", "previous-week").ok()?;
+        return Some(Action::Memory(request));
+    }
+    None
 }
 
 fn directly_contradicts_root_change(answer: &str, facts: &RootStorageFacts) -> bool {
@@ -2696,6 +3168,79 @@ mod tests {
             inferred_storage_action("Compare storage today compared against yesterday").is_none()
         );
         assert!(inferred_storage_action("Compare storage today against yesterday").is_some());
+    }
+
+    #[test]
+    fn inferred_memory_action_owns_interval_selection_for_common_questions() {
+        assert!(matches!(
+            inferred_memory_action("Why did RAM increase from yesterday to today?"),
+            Some(Action::Memory(request))
+                if request.window.comparison == ComparisonMode::PreviousDay
+        ));
+        assert!(matches!(
+            inferred_memory_action("What is the current memory usage?"),
+            Some(Action::Memory(request))
+                if request.window.comparison == ComparisonMode::PreviousWeek
+        ));
+        assert!(matches!(
+            inferred_memory_action(
+                "Compare memory over the last 7 days with previous 7 days"
+            ),
+            Some(Action::Memory(request))
+                if request.comparison.is_some()
+        ));
+        assert!(inferred_memory_action("Why did storage increase today?").is_none());
+        assert!(inferred_memory_action("The report mentions RAM and disk").is_none());
+    }
+
+    #[test]
+    fn memory_facts_are_bounded_and_deterministic() {
+        let evidence = json!({
+            "data": {
+                "status": "ok",
+                "current": {
+                    "start_utc": "2026-09-23T00:00:00Z",
+                    "end_utc": "2026-09-24T00:00:00Z",
+                    "mean_mem_total_bytes": 1000.0,
+                    "mean_mem_available_bytes": 800.0
+                },
+                "comparison": {
+                    "start_utc": "2026-09-22T00:00:00Z",
+                    "end_utc": "2026-09-23T00:00:00Z",
+                    "mean_mem_total_bytes": 1000.0,
+                    "mean_mem_available_bytes": 850.0
+                },
+                "coverage": {
+                    "current_samples": 10,
+                    "comparison_samples": 10,
+                    "expected_samples": 10,
+                    "current_ratio": 1.0,
+                    "comparison_ratio": 1.0,
+                    "current_gaps": 0,
+                    "comparison_gaps": 0
+                },
+                "findings": ["Average used RAM was 20.0% versus 15.0% (+5.0 percentage points)."],
+                "processes": [{
+                    "name": "llama-server",
+                    "executable": "/usr/bin/llama-server",
+                    "rss_anon_change_bytes": 1048576,
+                    "first_seen_utc": "2026-09-23T12:00:00Z",
+                    "last_seen_utc": "2026-09-23T12:01:00Z"
+                }],
+                "limitations": ["RssAnon is not private/USS."]
+            }
+        });
+        let facts = memory_facts(&evidence).unwrap();
+        assert_eq!(facts.processes[0].name, "llama-server");
+        assert_eq!(memory_change_points(&facts), Some(5.0));
+        let model_facts = memory_model_facts(&facts);
+        assert!(model_facts.len() <= 6000);
+        assert!(model_facts.contains("llama-server"));
+        let summary = deterministic_memory_summary(&facts);
+        assert!(summary.contains("Average used RAM was 20.0% versus 15.0%"));
+        assert!(summary.contains("Top observed anonymous-memory growth"));
+        assert!(directly_contradicts_memory_change("RAM decreased", &facts));
+        assert!(!directly_contradicts_memory_change("RAM increased", &facts));
     }
 
     #[test]
