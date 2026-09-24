@@ -1066,7 +1066,29 @@ pub(crate) fn incident_answer_contradicts_facts(answer: &str, facts: &IncidentFa
             && !answer.contains("no retained")
             && !answer.contains("none");
     }
-    answer.contains("no incidents") || answer.contains("no incident") || answer.contains("none")
+    if answer.contains("no incidents") || answer.contains("no incident") || answer.contains("none")
+    {
+        return true;
+    }
+    let has_unresolved = facts.incidents.iter().any(|incident| {
+        matches!(
+            incident.status.to_ascii_lowercase().as_str(),
+            "open" | "active" | "pending" | "triggered"
+        )
+    });
+    let says_all_resolved = [
+        "all resolved",
+        "all recovered",
+        "all closed",
+        "all incidents are resolved",
+        "all incidents were resolved",
+        "no open",
+        "none open",
+        "every incident is resolved",
+    ]
+    .iter()
+    .any(|phrase| answer.contains(phrase));
+    has_unresolved && says_all_resolved
 }
 
 fn used_percent(total: Option<f64>, available: Option<f64>) -> Option<f64> {
@@ -3772,6 +3794,12 @@ mod tests {
         assert!(!incident_answer_contradicts_facts(
             "One warning incident is open.",
             &incidents
+        ));
+        let mut mixed_incidents = incidents.clone();
+        mixed_incidents.incidents[0].status = "open".into();
+        assert!(incident_answer_contradicts_facts(
+            "All incidents are resolved.",
+            &mixed_incidents
         ));
     }
 
