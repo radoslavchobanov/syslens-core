@@ -2977,6 +2977,9 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         }
 
         fn is_negation_bridge(token: &str) -> bool {
+            if token.is_ascii() && token.ends_with("ly") {
+                return true;
+            }
             matches!(
                 token,
                 "a" | "an"
@@ -3022,6 +3025,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     | "still"
                     | "the"
                     | "to"
+                    | "too"
                     | "are"
                     | "was"
                     | "were"
@@ -3053,6 +3057,47 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             .is_some_and(|following| following.iter().any(|token| candidates.contains(token)))
     }
 
+    fn has_negative_noun_modifier(tokens: &[&str], index: usize) -> bool {
+        let following = match tokens.get(index + 1..(index + 10).min(tokens.len())) {
+            Some(following) => following,
+            None => return false,
+        };
+        let mut saw_negative = false;
+        for token in following {
+            if matches!(*token, "and" | "but" | "then" | "while") {
+                break;
+            }
+            if matches!(*token, "no" | "none" | "not" | "without" | "zero" | "0") {
+                saw_negative = true;
+                continue;
+            }
+            if saw_negative
+                && matches!(
+                    *token,
+                    "storage"
+                        | "growth"
+                        | "increase"
+                        | "increased"
+                        | "usage"
+                        | "space"
+                        | "size"
+                        | "disk"
+                        | "filesystem"
+                        | "consumption"
+                        | "today"
+                        | "yesterday"
+                        | "period"
+                        | "window"
+                        | "interval"
+                        | "current"
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn has_token_level_causal_claim(clause: &str) -> bool {
         let tokens = tokens(clause);
         let resource_terms = [
@@ -3079,7 +3124,10 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 || matches!(token, "drove" | "lead" | "leads" | "led" | "leading")
         }
         for (index, token) in tokens.iter().enumerate() {
-            if !is_causal_verb(token) || token_is_negated(&tokens, index) {
+            if !is_causal_verb(token)
+                || token_is_negated(&tokens, index)
+                || has_negative_noun_modifier(&tokens, index)
+            {
                 continue;
             }
             if has_following_token(&tokens, index, &resource_terms) {
@@ -3118,6 +3166,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         tokens.iter().enumerate().any(|(index, token)| {
             is_timing_verb(token)
                 && !token_is_negated(&tokens, index)
+                && !has_negative_noun_modifier(&tokens, index)
                 && has_following_token(&tokens, index, &timing_terms)
         })
     }
@@ -3153,6 +3202,64 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             search_from = alias_end;
         }
         occurrences
+    }
+
+    fn segment_introduces_independent_subject(segment: &str) -> bool {
+        fn is_subject_term(token: &str) -> bool {
+            matches!(
+                token,
+                "disk"
+                    | "filesystem"
+                    | "gpu"
+                    | "memory"
+                    | "mount"
+                    | "network"
+                    | "ram"
+                    | "storage"
+                    | "system"
+            )
+        }
+
+        fn is_subject_predicate(token: &str) -> bool {
+            token.starts_with("chang")
+                || token.starts_with("creat")
+                || token.starts_with("decreas")
+                || token.starts_with("grow") && token != "growth"
+                || token.starts_with("increas") && token != "increase"
+                || token.starts_with("observ")
+                || token.starts_with("report")
+                || token.starts_with("show")
+                || matches!(
+                    token,
+                    "are"
+                        | "appears"
+                        | "appeared"
+                        | "did"
+                        | "does"
+                        | "had"
+                        | "has"
+                        | "have"
+                        | "is"
+                        | "saw"
+                        | "see"
+                        | "seen"
+                        | "was"
+                        | "were"
+                        | "very"
+                        | "quite"
+                        | "rather"
+                )
+        }
+
+        let words = tokens(segment);
+        words.iter().enumerate().any(|(index, token)| {
+            is_subject_term(token)
+                && words
+                    .get(index + 1..(index + 4).min(words.len()))
+                    .is_some_and(|following| {
+                        following.iter().any(|word| is_subject_predicate(word))
+                    })
+        })
     }
 
     let file_aliases = facts
@@ -3259,7 +3366,17 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                                     *start >= conjunction_end && *end <= following_end
                                 })
                     });
-                    if has_other_alias_before || has_other_alias_after {
+                    let has_independent_subject_before = segment_introduces_independent_subject(
+                        &answer[preceding_start..conjunction_start],
+                    );
+                    let has_independent_subject_after = segment_introduces_independent_subject(
+                        &answer[conjunction_end..following_end],
+                    );
+                    if has_other_alias_before
+                        || has_other_alias_after
+                        || has_independent_subject_before
+                        || has_independent_subject_after
+                    {
                         boundaries.push(conjunction_start);
                         boundaries.push(conjunction_end);
                     }
@@ -4210,6 +4327,34 @@ mod tests {
             .is_none()
         );
         assert!(
+            grounded_storage_fallback("diagnosis.sqlite showed no growth today.", &facts).is_none()
+        );
+        assert!(
+            grounded_storage_fallback("diagnosis.sqlite saw no increase today.", &facts).is_none()
+        );
+        assert!(
+            grounded_storage_fallback("diagnosis.sqlite showed zero growth today.", &facts)
+                .is_none()
+        );
+        assert!(
+            grounded_storage_fallback("diagnosis.sqlite saw not an increase today.", &facts)
+                .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was not materially responsible for storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 couldn't demonstrably have caused 11 GB of storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
             grounded_storage_fallback(
                 "minecraft-rpg.qcow2 couldn’t possibly have caused 11 GB of storage growth.",
                 &facts
@@ -4257,6 +4402,13 @@ mod tests {
             &facts
         )
         .is_none());
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite is inventory-only while the root filesystem showed growth today.",
+                &facts
+            )
+            .is_none()
+        );
         assert!(
             grounded_storage_fallback(
                 "minecraft-rpg.qcow2 was old but increased by 11 GB today.",
