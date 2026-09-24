@@ -3532,10 +3532,30 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         }
 
         fn has_possible_cause_modal_claim(following: &[&str]) -> bool {
+            let causal_link = following.iter().any(|token| {
+                matches!(
+                    *token,
+                    "cause"
+                        | "causes"
+                        | "caused"
+                        | "responsible"
+                        | "contributor"
+                        | "contributors"
+                        | "attribution"
+                        | "attributable"
+                        | "growth"
+                        | "grow"
+                        | "growing"
+                        | "increase"
+                        | "increased"
+                        | "increasing"
+                )
+            });
             let ruled_out = following
                 .windows(2)
-                .any(|window| window == ["ruled", "out"]);
-            let excluded = following.contains(&"excluded");
+                .any(|window| window == ["ruled", "out"])
+                && causal_link;
+            let excluded = following.contains(&"excluded") && causal_link;
             let partial_explanation = following.iter().enumerate().any(|(index, token)| {
                 matches!(*token, "fully" | "entirely" | "completely" | "solely")
                     && following[index + 1..].iter().any(|candidate| {
@@ -3627,7 +3647,12 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                         .map_or(0, |boundary| boundary + 1);
                     let predicate_uncertain =
                         has_structural_uncertainty(&words[predicate_start..=predicate_index]);
-                    if is_causal_predicate(candidate) {
+                    let nominal_scan_result = *candidate == "results"
+                        && predicate_index
+                            .checked_sub(1)
+                            .and_then(|previous| words.get(previous))
+                            == Some(&"scan");
+                    if is_causal_predicate(candidate) && !nominal_scan_result {
                         return !token_is_negated(&words, predicate_index) && !predicate_uncertain;
                     }
                     is_timing_predicate(candidate)
@@ -5141,6 +5166,27 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "A file cannot explain the increase from the available evidence.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be excluded from the inventory.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be excluded from the sample.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be ruled out from the scan results.",
                 &no_eligible_facts
             )
             .is_none()
