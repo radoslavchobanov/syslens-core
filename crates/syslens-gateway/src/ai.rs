@@ -3044,7 +3044,10 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         }
 
         fn is_emphatic_modifier(token: &str) -> bool {
-            matches!(token, "only" | "just" | "merely" | "simply")
+            matches!(
+                token,
+                "only" | "just" | "merely" | "simply" | "solely" | "exclusively" | "entirely"
+            )
         }
 
         let preceding = &tokens[..index];
@@ -3091,7 +3094,16 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             }
             if token == "not"
                 && following.get(following_index + 1).is_some_and(|modifier| {
-                    matches!(*modifier, "only" | "just" | "merely" | "simply")
+                    matches!(
+                        *modifier,
+                        "only"
+                            | "just"
+                            | "merely"
+                            | "simply"
+                            | "solely"
+                            | "exclusively"
+                            | "entirely"
+                    )
                 })
             {
                 following_index += 2;
@@ -3307,7 +3319,10 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     )
                 })
                 && words.get(index + 2..).is_some_and(|following| {
-                    let is_subordinate_measurement = following.windows(3).any(|window| {
+                    let is_subordinate_measurement = following.windows(2).any(|window| {
+                        matches!(window[0], "is" | "was" | "were")
+                            && matches!(window[1], "measured" | "monitored")
+                    }) || following.windows(3).any(|window| {
                         matches!(window[0], "is" | "was" | "were")
                             && window[1] == "being"
                             && matches!(window[2], "measured" | "monitored")
@@ -4422,6 +4437,27 @@ mod tests {
         );
         assert!(
             grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was not solely responsible for storage growth.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was not exclusively responsible for storage growth.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was not entirely responsible for storage growth.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
                 "minecraft-rpg.qcow2 couldn't demonstrably have caused 11 GB of storage growth.",
                 &facts
             )
@@ -4492,6 +4528,20 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "diagnosis.sqlite increased while root storage was being measured today.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite increased while root storage was measured today.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "diagnosis.sqlite increased while root storage was monitored today.",
                 &facts
             )
             .is_some()
