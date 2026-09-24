@@ -2906,6 +2906,35 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 .next()
                 .unwrap_or(prefix)
                 .trim_end();
+            let prefix_words = clause.split_whitespace().collect::<Vec<_>>();
+            let generic_negation =
+                prefix_words
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .take(5)
+                    .any(|(index, word)| {
+                        let normalized = word.trim_matches(|character: char| {
+                            !character.is_ascii_alphanumeric() && character != '\''
+                        });
+                        (normalized.ends_with("n't")
+                            || matches!(
+                                normalized,
+                                "not"
+                                    | "no"
+                                    | "never"
+                                    | "cannot"
+                                    | "can't"
+                                    | "doesn't"
+                                    | "doesnt"
+                                    | "didn't"
+                                    | "didnt"
+                                    | "without"
+                            ))
+                            && !prefix_words[index + 1..]
+                                .iter()
+                                .any(|following| matches!(*following, "but" | "and" | "while"))
+                    });
             let negated = [
                 " not",
                 " no",
@@ -2925,7 +2954,8 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 " not an",
             ]
             .iter()
-            .any(|negator| clause.ends_with(negator));
+            .any(|negator| clause.ends_with(negator))
+                || generic_negation;
             if !negated {
                 return false;
             }
@@ -2943,8 +2973,9 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
 
     fn token_is_negated(tokens: &[&str], index: usize) -> bool {
         let start = index.saturating_sub(3);
-        tokens[start..index].iter().any(|token| {
-            matches!(
+        let preceding = &tokens[start..index];
+        preceding.iter().enumerate().any(|(offset, token)| {
+            (matches!(
                 *token,
                 "not"
                     | "no"
@@ -2957,7 +2988,10 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     | "didnt"
                     | "didn't"
                     | "without"
-            )
+            ) || token.ends_with("n't"))
+                && !preceding[offset + 1..]
+                    .iter()
+                    .any(|following| matches!(*following, "but" | "and" | "while"))
         })
     }
 
@@ -2992,12 +3026,16 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "led",
             "resulted",
             "attributable",
+            "contributes",
+            "contributing",
             "account",
             "accounts",
             "accounted",
             "drive",
             "drives",
             "drove",
+            "driven",
+            "driving",
         ];
         for (index, token) in tokens.iter().enumerate() {
             if !causal_verbs.contains(token) || token_is_negated(&tokens, index) {
@@ -3006,8 +3044,17 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             if has_following_token(&tokens, index, &resource_terms) {
                 return true;
             }
-            if matches!(*token, "contributed" | "responsible" | "led" | "resulted")
-                && has_following_token(&tokens, index, &["to", "for", "from"])
+            if matches!(
+                *token,
+                "contributed"
+                    | "contributes"
+                    | "contributing"
+                    | "responsible"
+                    | "led"
+                    | "resulted"
+                    | "driven"
+                    | "driving"
+            ) && has_following_token(&tokens, index, &["to", "for", "from", "by"])
             {
                 return true;
             }
@@ -3021,6 +3068,10 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             "happened",
             "created",
             "grew",
+            "increased",
+            "increasing",
+            "decreased",
+            "decreasing",
             "changed",
             "downloaded",
             "modified",
@@ -3041,46 +3092,76 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         })
     }
 
-    facts.file_facts.iter().any(|finding| {
-        if finding.evidence_class.causal_eligible() {
-            return false;
-        }
-        let path = finding.path.to_ascii_lowercase();
-        let basename = path.rsplit('/').next().unwrap_or(path.as_str()).to_owned();
-        let aliases = if basename == path {
-            vec![path]
-        } else {
-            vec![path, basename]
-        };
-        aliases.into_iter().any(|alias| {
-            if alias.is_empty() {
-                return false;
-            }
-            let mut search_from = 0;
-            while let Some(relative) = answer[search_from..].find(&alias) {
-                let alias_start = search_from + relative;
-                let alias_end = alias_start + alias.len();
-                let is_alias_token_character = |character: char| {
-                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-                };
-                let has_left_token = answer[..alias_start]
-                    .chars()
-                    .next_back()
-                    .is_some_and(is_alias_token_character);
-                let has_right_token = match answer[alias_end..].chars().next() {
-                    Some('.') => answer[alias_end + 1..]
-                        .chars()
-                        .next()
-                        .is_some_and(is_alias_token_character),
-                    Some(character) => is_alias_token_character(character),
-                    None => false,
-                };
-                if has_left_token || has_right_token {
-                    search_from = alias_end;
-                    continue;
-                }
+    fn alias_token_character(character: char) -> bool {
+        character.is_alphanumeric() || matches!(character, '_' | '-')
+    }
 
-                let is_claim_boundary = |character: char| ".,;!?:\n".contains(character);
+    fn alias_occurrences(text: &str, alias: &str) -> Vec<(usize, usize)> {
+        if alias.is_empty() {
+            return Vec::new();
+        }
+        let mut occurrences = Vec::new();
+        let mut search_from = 0;
+        while let Some(relative) = text[search_from..].find(alias) {
+            let alias_start = search_from + relative;
+            let alias_end = alias_start + alias.len();
+            let has_left_token = text[..alias_start]
+                .chars()
+                .next_back()
+                .is_some_and(alias_token_character);
+            let has_right_token = match text[alias_end..].chars().next() {
+                Some('.') => text[alias_end + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(alias_token_character),
+                Some(character) => alias_token_character(character),
+                None => false,
+            };
+            if !has_left_token && !has_right_token {
+                occurrences.push((alias_start, alias_end));
+            }
+            search_from = alias_end;
+        }
+        occurrences
+    }
+
+    let file_aliases = facts
+        .file_facts
+        .iter()
+        .enumerate()
+        .flat_map(|(finding_index, finding)| {
+            let path = finding.path.to_ascii_lowercase();
+            let basename = path.rsplit('/').next().unwrap_or(path.as_str()).to_owned();
+            if basename == path {
+                vec![(path, finding_index)]
+            } else {
+                vec![(path, finding_index), (basename, finding_index)]
+            }
+        })
+        .collect::<Vec<_>>();
+    let is_claim_boundary = |character: char| ".,;!?:\n".contains(character);
+    let mut conjunctions = Vec::new();
+    for conjunction in ["but", "while", "and", "however", "although", "yet"] {
+        for (index, _) in answer.match_indices(conjunction) {
+            let before = answer[..index].chars().next_back();
+            let after = answer[index + conjunction.len()..].chars().next();
+            let is_word_boundary =
+                |character: Option<char>| character.is_none_or(|value| !value.is_alphanumeric());
+            if is_word_boundary(before) && is_word_boundary(after) {
+                conjunctions.push((index, index + conjunction.len()));
+            }
+        }
+    }
+
+    for (finding_index, finding) in facts.file_facts.iter().enumerate() {
+        if finding.evidence_class.causal_eligible() {
+            continue;
+        }
+        for (alias, _) in file_aliases
+            .iter()
+            .filter(|(_, owner)| *owner == finding_index)
+        {
+            for (alias_start, alias_end) in alias_occurrences(&answer, alias) {
                 let mut boundaries = answer
                     .char_indices()
                     .filter_map(|(index, character)| {
@@ -3090,20 +3171,35 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     })
                     .flat_map(|(start, end)| [start, end])
                     .collect::<Vec<_>>();
-                for conjunction in ["but", "while", "and", "however", "although", "yet"] {
-                    for (index, _) in answer.match_indices(conjunction) {
-                        if index >= alias_start && index < alias_end {
-                            continue;
-                        }
-                        let before = answer[..index].chars().next_back();
-                        let after = answer[index + conjunction.len()..].chars().next();
-                        let is_word_boundary = |character: Option<char>| {
-                            character.is_none_or(|value| !value.is_alphanumeric())
-                        };
-                        if is_word_boundary(before) && is_word_boundary(after) {
-                            boundaries.push(index);
-                            boundaries.push(index + conjunction.len());
-                        }
+                for &(conjunction_start, conjunction_end) in &conjunctions {
+                    if conjunction_start >= alias_start && conjunction_start < alias_end {
+                        continue;
+                    }
+                    let following_end = boundaries
+                        .iter()
+                        .copied()
+                        .filter(|boundary| *boundary > conjunction_end)
+                        .min()
+                        .or_else(|| {
+                            conjunctions
+                                .iter()
+                                .map(|(start, _)| *start)
+                                .filter(|boundary| *boundary > conjunction_end)
+                                .min()
+                        })
+                        .unwrap_or(answer.len());
+                    let introduces_another_file =
+                        file_aliases.iter().any(|(other_alias, other_owner)| {
+                            *other_owner != finding_index
+                                && alias_occurrences(&answer, other_alias).iter().any(
+                                    |(start, end)| {
+                                        *start >= conjunction_end && *end <= following_end
+                                    },
+                                )
+                        });
+                    if introduces_another_file {
+                        boundaries.push(conjunction_start);
+                        boundaries.push(conjunction_end);
                     }
                 }
                 boundaries.sort_unstable();
@@ -3133,11 +3229,10 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 {
                     return true;
                 }
-                search_from = alias_end;
             }
-            false
-        })
-    })
+        }
+    }
+    false
 }
 
 pub(crate) fn grounded_storage_fallback(answer: &str, facts: &RootStorageFacts) -> Option<String> {
@@ -3959,7 +4054,11 @@ mod tests {
             "minecraft-rpg.qcow2 drove 11 GB of storage growth.",
             "minecraft-rpg.qcow2 grew today.",
             "minecraft-rpg.qcow2 grew by 11 GB today.",
+            "minecraft-rpg.qcow2 increased today.",
+            "minecraft-rpg.qcow2 is increasing during the current period.",
             "minecraft-rpg.qcow2 changed during this period.",
+            "minecraft-rpg.qcow2 is contributing to storage growth.",
+            "growth was driven by minecraft-rpg.qcow2.",
             "The increase is attributable to minecraft-rpg.qcow2.",
             "minecraft-rpg.qcow2 was the source of the increase.",
             "minecraft-rpg.qcow2 was active in the current window.",
@@ -4007,6 +4106,20 @@ mod tests {
             )
             .is_none()
         );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 couldn't possibly have caused 11 GB of storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 wasn't active in the current window.",
+                &facts
+            )
+            .is_none()
+        );
         assert!(grounded_storage_fallback(
             "minecraft-rpg.qcow2 was not the source of the increase and was not active in the current window.",
             &facts
@@ -4036,6 +4149,17 @@ mod tests {
                 "cross-file conjunction was incorrectly rejected: {answer}"
             );
         }
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was old but increased by 11 GB today.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(
+            grounded_storage_fallback("minecraft-rpg.qcow2 was active and grew today.", &facts)
+                .is_some()
+        );
         assert!(grounded_storage_fallback(
             "minecraft-rpg.qcow2 caused 11 GB of storage growth, but verified-current-growth.img is also a likely contributor.",
             &facts
@@ -4095,6 +4219,9 @@ mod tests {
             "é".repeat(64)
         );
         assert!(grounded_storage_fallback(&negative, &facts).is_none());
+        assert!(
+            grounded_storage_fallback("метаданные.img caused storage growth.", &facts).is_none()
+        );
         assert!(grounded_storage_fallback("metadata caused storage growth.", &facts).is_none());
         assert!(grounded_storage_fallback("catalog grew today.", &facts).is_none());
         assert!(grounded_storage_fallback("data caused storage growth.", &facts).is_some());
