@@ -2987,12 +2987,16 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     | "been"
                     | "being"
                     | "changed"
+                    | "clearly"
                     | "created"
                     | "decreased"
                     | "downloaded"
+                    | "directly"
                     | "ever"
+                    | "explicitly"
                     | "grew"
                     | "grown"
+                    | "generally"
                     | "had"
                     | "has"
                     | "have"
@@ -3003,11 +3007,18 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                     | "likely"
                     | "maybe"
                     | "may"
+                    | "merely"
                     | "modified"
                     | "perhaps"
                     | "possibly"
+                    | "potentially"
+                    | "primarily"
                     | "probably"
                     | "really"
+                    | "reasonably"
+                    | "necessarily"
+                    | "simply"
+                    | "solely"
                     | "still"
                     | "the"
                     | "to"
@@ -3093,6 +3104,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 || token.starts_with("download")
                 || token.starts_with("modif")
                 || token.starts_with("active")
+                || matches!(token, "saw" | "see" | "seen" | "show" | "shows" | "showed")
                 || token == "grew"
         }
         let timing_terms = [
@@ -4105,6 +4117,8 @@ mod tests {
             "minecraft-rpg.qcow2 drove 11 GB of storage growth.",
             "minecraft-rpg.qcow2 grew today.",
             "diagnosis.sqlite has grown by 1.2 GB today.",
+            "diagnosis.sqlite saw an increase today.",
+            "diagnosis.sqlite showed growth today.",
             "minecraft-rpg.qcow2 grew by 11 GB today.",
             "minecraft-rpg.qcow2 increased today.",
             "minecraft-rpg.qcow2 is increasing during the current period.",
@@ -4170,6 +4184,27 @@ mod tests {
         assert!(
             grounded_storage_fallback(
                 "minecraft-rpg.qcow2 couldn't possibly have caused 11 GB of storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was not directly responsible for storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 was not primarily responsible for storage growth.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 couldn't reasonably have caused 11 GB of storage growth.",
                 &facts
             )
             .is_none()
