@@ -1034,10 +1034,18 @@ pub(crate) fn authoritative_incident_answer(answer: &str, facts: &IncidentFacts)
 
 pub(crate) fn status_answer_contradicts_facts(answer: &str, facts: &StatusFacts) -> bool {
     let answer = answer.to_ascii_lowercase();
-    facts.recording != "active"
-        && (answer.contains("healthy")
-            || answer.contains("recording is active")
-            || answer.contains("recording is running"))
+    let recording = facts.recording.to_ascii_lowercase();
+    let active_claim = answer.contains("recording is active")
+        || answer.contains("recording is running")
+        || answer.contains("recorder is active")
+        || answer.contains("recorder is running");
+    if recording == "active" {
+        return answer.contains("recording is inactive")
+            || answer.contains("recording is stopped")
+            || answer.contains("recorder is inactive")
+            || answer.contains("recorder is stopped");
+    }
+    active_claim
 }
 
 pub(crate) fn incident_answer_contradicts_facts(answer: &str, facts: &IncidentFacts) -> bool {
@@ -3705,6 +3713,18 @@ mod tests {
         assert!(!status_answer_contradicts_facts(
             "Recording is active.",
             &status
+        ));
+        let healthy_status = StatusFacts {
+            recording: "healthy".into(),
+            ..status.clone()
+        };
+        assert!(!status_answer_contradicts_facts(
+            "The recorder reports healthy and fresh.",
+            &healthy_status
+        ));
+        assert!(status_answer_contradicts_facts(
+            "The recorder is active.",
+            &healthy_status
         ));
         let incidents = incident_facts(&json!({
             "data": {
