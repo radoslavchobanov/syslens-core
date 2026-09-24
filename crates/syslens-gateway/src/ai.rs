@@ -2832,6 +2832,9 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         "accounts for the growth",
         "account for the growth",
         "accounted for the growth",
+        "attributable to",
+        "source of the increase",
+        "was the source of the increase",
         "is the cause",
         "was the cause",
         "most relevant file",
@@ -2845,10 +2848,19 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         "happened yesterday",
         "created yesterday",
         "grew yesterday",
+        "grew today",
+        "changed today",
         "downloaded yesterday",
         "modified yesterday",
+        "modified today",
+        "changed during this period",
+        "during this period",
         "was modified yesterday",
         "during yesterday",
+        "active in the current window",
+        "active during the current window",
+        "in the current window",
+        "during the current window",
         "in the current interval",
         "during the current interval",
         "in the current period",
@@ -2879,6 +2891,9 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 " didn't",
                 " did not",
                 " without",
+                " not active",
+                " not modified",
+                " not changed",
                 " not the",
                 " not a",
                 " not an",
@@ -3663,6 +3678,11 @@ mod tests {
             "minecraft-rpg.qcow2 accounts for the growth.",
             "minecraft-rpg.qcow2 caused storage growth.",
             "minecraft-rpg.qcow2 was modified yesterday.",
+            "minecraft-rpg.qcow2 grew today.",
+            "minecraft-rpg.qcow2 changed during this period.",
+            "The increase is attributable to minecraft-rpg.qcow2.",
+            "minecraft-rpg.qcow2 was the source of the increase.",
+            "minecraft-rpg.qcow2 was active in the current window.",
         ] {
             assert!(
                 grounded_storage_fallback(unsupported_claim, &facts).is_some(),
@@ -3683,6 +3703,18 @@ mod tests {
         );
         assert!(grounded_storage_fallback(
             "minecraft-rpg.qcow2 was not modified yesterday and does not account for the growth.",
+            &facts
+        )
+        .is_none());
+        assert!(
+            grounded_storage_fallback(
+                "minecraft-rpg.qcow2 did not grow today and is not attributable to the increase.",
+                &facts
+            )
+            .is_none()
+        );
+        assert!(grounded_storage_fallback(
+            "minecraft-rpg.qcow2 was not the source of the increase and was not active in the current window.",
             &facts
         )
         .is_none());
