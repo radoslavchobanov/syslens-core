@@ -3370,6 +3370,128 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         })
     }
 
+    fn generic_file_predicate_claim(clause: &str) -> bool {
+        fn is_causal_predicate(token: &str) -> bool {
+            !matches!(token, "contributor" | "contributors")
+                && (token.starts_with("caus")
+                    || token.starts_with("explain")
+                    || token.starts_with("contribut")
+                    || token.starts_with("attribut")
+                    || token.starts_with("account")
+                    || token.starts_with("responsib")
+                    || token.starts_with("result")
+                    || token.starts_with("driv")
+                    || matches!(token, "drove" | "lead" | "leads" | "led" | "leading"))
+        }
+
+        fn is_timing_predicate(token: &str) -> bool {
+            token.starts_with("happen")
+                || token.starts_with("creat")
+                || (token.starts_with("grow") && token != "growth")
+                || (token.starts_with("increas") && token != "increase")
+                || (token.starts_with("decreas") && token != "decrease")
+                || token.starts_with("chang")
+                || token.starts_with("download")
+                || token.starts_with("modif")
+                || token.starts_with("active")
+                || matches!(token, "saw" | "see" | "seen" | "show" | "shows" | "showed")
+        }
+
+        fn is_predicate_boundary(token: &str) -> bool {
+            matches!(
+                token,
+                "and"
+                    | "although"
+                    | "but"
+                    | "however"
+                    | "then"
+                    | "though"
+                    | "unless"
+                    | "while"
+                    | "yet"
+            )
+        }
+
+        let words = tokens(clause);
+        let timing_terms = [
+            "today",
+            "yesterday",
+            "period",
+            "window",
+            "interval",
+            "current",
+        ];
+        words.iter().enumerate().any(|(file_index, token)| {
+            if !matches!(*token, "file" | "files") {
+                return false;
+            }
+            words
+                .iter()
+                .enumerate()
+                .skip(file_index + 1)
+                .take(24)
+                .take_while(|(_, candidate)| !is_predicate_boundary(candidate))
+                .any(|(predicate_index, candidate)| {
+                    if is_causal_predicate(candidate) {
+                        return !token_is_negated(&words, predicate_index);
+                    }
+                    is_timing_predicate(candidate)
+                        && !token_is_negated(&words, predicate_index)
+                        && has_following_token(&words, predicate_index, &timing_terms)
+                })
+        })
+    }
+
+    fn generic_attribution_phrase_is_positive(text: &str, phrase: &str) -> bool {
+        fn is_word_boundary(character: Option<char>) -> bool {
+            character.is_none_or(|value| !value.is_alphanumeric())
+        }
+
+        let mut offset = 0;
+        while let Some(relative) = text[offset..].find(phrase) {
+            let start = offset + relative;
+            let mut prefix_start = start.saturating_sub(160);
+            while !text.is_char_boundary(prefix_start) {
+                prefix_start = prefix_start.saturating_sub(1);
+            }
+            let prefix = &text[prefix_start..start];
+            let clause_prefix = prefix
+                .rsplit(['.', ';', '!', '?', ':'])
+                .next()
+                .unwrap_or(prefix);
+            let mut scoped_start = 0;
+            for conjunction in ["but", "while", "and", "however", "although", "yet"] {
+                for (index, _) in clause_prefix.match_indices(conjunction) {
+                    let before = clause_prefix[..index].chars().next_back();
+                    let after = clause_prefix[index + conjunction.len()..].chars().next();
+                    if is_word_boundary(before) && is_word_boundary(after) {
+                        scoped_start = scoped_start.max(index + conjunction.len());
+                    }
+                }
+            }
+            let scoped_prefix = &clause_prefix[scoped_start..];
+            let explicit_no_file = scoped_prefix.contains("no eligible file")
+                || scoped_prefix.contains("no eligible files")
+                || scoped_prefix.contains("no file")
+                || scoped_prefix.contains("no files");
+            let phrase_end = start + phrase.len();
+            let clause_suffix_end = text[phrase_end..]
+                .find(['.', ';', '!', '?', ':', '\n'])
+                .map(|relative| phrase_end + relative)
+                .unwrap_or(text.len());
+            let clause = &text[prefix_start..clause_suffix_end];
+            let has_file_context = tokens(clause)
+                .iter()
+                .any(|token| matches!(*token, "file" | "files"));
+            let snippet = &text[prefix_start..phrase_end];
+            if has_file_context && !explicit_no_file && !phrase_is_negated(snippet, phrase) {
+                return true;
+            }
+            offset = phrase_end;
+        }
+        false
+    }
+
     let file_aliases = facts
         .file_facts
         .iter()
@@ -3408,6 +3530,41 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             if is_word_boundary(before) && is_word_boundary(after) {
                 conjunctions.push((index, index + conjunction.len()));
             }
+        }
+    }
+
+    if !facts
+        .file_facts
+        .iter()
+        .any(|finding| finding.evidence_class.causal_eligible())
+    {
+        let generic_attribution_phrases = [
+            "likely cause",
+            "likely causes",
+            "likely contributor",
+            "likely contributors",
+            "contributor",
+            "contributors",
+            "probable cause",
+            "probable causes",
+            "root cause",
+            "main contributor",
+            "main file",
+            "primary contributor",
+            "primary file",
+            "strongest file",
+            "key file",
+            "largest contributor",
+            "largest file",
+            "most relevant file",
+            "responsible for",
+        ];
+        if generic_attribution_phrases
+            .iter()
+            .any(|phrase| generic_attribution_phrase_is_positive(&answer, phrase))
+            || generic_file_predicate_claim(&answer)
+        {
+            return true;
         }
     }
 
@@ -4626,6 +4783,34 @@ mod tests {
             &facts
         )
         .is_some());
+
+        let mut no_eligible_facts = facts.clone();
+        for finding in &mut no_eligible_facts.file_facts {
+            finding.evidence_class = StorageFileEvidenceClass::InventoryOnly;
+        }
+        assert!(grounded_storage_fallback(
+            "The likely contributor is the file in /var with 11527761920 bytes allocated, outside the current interval. Limitation: Files outside the current interval are not considered causes.",
+            &no_eligible_facts
+        )
+        .is_some());
+        assert!(
+            grounded_storage_fallback("The file in /var caused the increase.", &no_eligible_facts)
+                .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "No eligible file is a likely contributor.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "Files outside the current interval are not causes.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
 
         let chat_summary = deterministic_storage_chat_summary(&facts);
         assert!(chat_summary.contains("Eligible sampled file contributors"));
