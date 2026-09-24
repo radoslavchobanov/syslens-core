@@ -1082,13 +1082,19 @@ pub(crate) fn incident_answer_contradicts_facts(answer: &str, facts: &IncidentFa
         "all closed",
         "all incidents are resolved",
         "all incidents were resolved",
+        "incidents are resolved",
+        "incidents have been resolved",
         "no open",
         "none open",
         "every incident is resolved",
     ]
     .iter()
     .any(|phrase| answer.contains(phrase));
-    has_unresolved && says_all_resolved
+    has_unresolved
+        && (says_all_resolved
+            || (answer.contains("resolved")
+                && !answer.contains("open")
+                && !answer.contains("unresolved")))
 }
 
 fn used_percent(total: Option<f64>, available: Option<f64>) -> Option<f64> {
@@ -3799,6 +3805,10 @@ mod tests {
         mixed_incidents.incidents[0].status = "open".into();
         assert!(incident_answer_contradicts_facts(
             "All incidents are resolved.",
+            &mixed_incidents
+        ));
+        assert!(incident_answer_contradicts_facts(
+            "The incidents have been resolved.",
             &mixed_incidents
         ));
     }
