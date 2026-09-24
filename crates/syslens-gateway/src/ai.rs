@@ -1635,22 +1635,22 @@ fn rendered_file_candidate(finding: &FileFindingFact) -> String {
 }
 
 #[allow(dead_code)]
-fn append_file_candidates(
+fn append_file_class(
     summary: &mut String,
     findings: &[FileFindingFact],
-    temporal_status: &str,
+    evidence_class: StorageFileEvidenceClass,
     heading: &str,
 ) {
-    let candidates = findings
+    let findings = findings
         .iter()
-        .filter(|finding| finding.temporal_status == temporal_status)
+        .filter(|finding| finding.evidence_class == evidence_class)
         .take(3)
         .map(rendered_file_candidate)
         .collect::<Vec<_>>();
-    if !candidates.is_empty() {
+    if !findings.is_empty() {
         summary.push_str(heading);
         summary.push_str(": ");
-        summary.push_str(&candidates.join("; "));
+        summary.push_str(&findings.join("; "));
         summary.push_str(". ");
     }
 }
@@ -1842,30 +1842,24 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
         );
     }
     if !facts.file_facts.is_empty() {
-        summary.push_str("Sampled-file timing read (descriptive and non-additive): ");
-        append_file_candidates(
+        summary.push_str("Sampled-file provenance read (descriptive and non-additive): ");
+        append_file_class(
             &mut summary,
             &facts.file_facts,
-            "current_interval",
-            "current-period candidates; metadata timestamps fall in the current interval, but timing alone does not prove size growth or causation",
+            StorageFileEvidenceClass::CausalCandidate,
+            "Eligible sampled file contributors (causal_candidate; matched baseline and current-interval timing; candidate only, not proof)",
         );
-        append_file_candidates(
+        append_file_class(
             &mut summary,
             &facts.file_facts,
-            "comparison_interval",
-            "comparison-period candidates; metadata timestamps fall in the comparison interval, so these are historical context, not current-period causation",
+            StorageFileEvidenceClass::InventoryOnly,
+            "Inventory-only sampled file findings (historical or pre-existing; not current-period causal evidence)",
         );
-        append_file_candidates(
+        append_file_class(
             &mut summary,
             &facts.file_facts,
-            "before_comparison",
-            "pre-window candidates; metadata timestamps predate both intervals",
-        );
-        append_file_candidates(
-            &mut summary,
-            &facts.file_facts,
-            "unknown",
-            "timing-unknown candidates; metadata timestamps do not establish when activity occurred",
+            StorageFileEvidenceClass::InsufficientEvidence,
+            "Insufficient-evidence sampled file findings (missing comparable baseline or timing; not causal evidence)",
         );
         summary.push_str(
             "File paths overlap their containing directory and mount totals; never add them to directory attribution. ",
@@ -1882,7 +1876,7 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
             .count();
         let unknown = facts.file_facts.len() - known - growth_from_zero;
         summary.push_str(&format!(
-            "File-baseline confidence: {known} matched comparison sample(s), {growth_from_zero} growth-from-zero candidate(s), and {unknown} candidate(s) with unknown or incomplete baseline; unknown-baseline file deltas are not exact measurements. ",
+            "File-baseline confidence: {known} matched comparison sample(s), {growth_from_zero} growth-from-zero candidate(s), and {unknown} finding(s) with unknown or incomplete baseline; unknown-baseline file deltas are not exact measurements. ",
         ));
     }
     if !facts.current_directory_snapshot.is_empty() {
@@ -1904,7 +1898,7 @@ pub(crate) fn deterministic_storage_summary(facts: &RootStorageFacts) -> String 
     }
     if !facts.file_findings.is_empty() {
         summary.push_str(
-            "Concrete sampled file findings (overlapping and non-additive; do not sum with directory or mount deltas). Temporal status describes metadata timestamp activity only; it does not by itself prove a size change or causation: current_interval has metadata timestamps in the current window, comparison_interval points to metadata activity in the comparison window and is not current-period causation, before_comparison predates both windows, and unknown does not establish timing. Candidates: ",
+            "Concrete sampled file findings (overlapping and non-additive; do not sum with directory or mount deltas). Each finding includes its typed evidence_class and causal_eligible flag. Temporal status describes metadata timestamp activity only; it does not by itself prove a size change or causation: current_interval has metadata timestamps in the current window, comparison_interval points to metadata activity in the comparison window and is not current-period causation, before_comparison predates both windows, and unknown does not establish timing. Findings: ",
         );
         summary.push_str(&facts.file_findings.join("; "));
         summary.push_str(". ");
@@ -2827,6 +2821,19 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         "likely contributor",
         "probable cause",
         "root cause",
+        "caused storage growth",
+        "caused the storage growth",
+        "cause storage growth",
+        "largest contributor",
+        "explains the increase",
+        "explain the increase",
+        "increase came from",
+        "growth came from",
+        "accounts for the growth",
+        "account for the growth",
+        "accounted for the growth",
+        "is the cause",
+        "was the cause",
         "most relevant file",
         "primary file",
         "main file",
@@ -2839,29 +2846,52 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
         "created yesterday",
         "grew yesterday",
         "downloaded yesterday",
+        "modified yesterday",
+        "was modified yesterday",
         "during yesterday",
         "in the current interval",
         "during the current interval",
         "in the current period",
         "during the current period",
     ];
-    let caveat_phrases = [
-        "not caused by",
-        "not a cause",
-        "not causal",
-        "cannot be attributed",
-        "cannot establish",
-        "does not establish",
-        "does not prove",
-        "not prove",
-        "not enough evidence",
-        "insufficient evidence",
-        "unknown baseline",
-        "inventory only",
-        "inventory-only",
-        "not eligible",
-        "predates",
-    ];
+    // Evaluate negation for each positive phrase in its own short clause.
+    // A caveat in an earlier sentence must not suppress a separate positive
+    // claim later in the answer.
+    fn phrase_is_negated(text: &str, phrase: &str) -> bool {
+        let mut offset = 0;
+        while let Some(relative) = text[offset..].find(phrase) {
+            let start = offset + relative;
+            let prefix_start = start.saturating_sub(56);
+            let prefix = &text[prefix_start..start];
+            let clause = prefix
+                .rsplit(['.', ';', '!', '?', ':'])
+                .next()
+                .unwrap_or(prefix)
+                .trim_end();
+            let negated = [
+                " not",
+                " no",
+                " never",
+                " cannot",
+                " can't",
+                " doesn't",
+                " does not",
+                " didn't",
+                " did not",
+                " without",
+                " not the",
+                " not a",
+                " not an",
+            ]
+            .iter()
+            .any(|negator| clause.ends_with(negator));
+            if !negated {
+                return false;
+            }
+            offset = start + phrase.len();
+        }
+        true
+    }
 
     facts.file_facts.iter().any(|finding| {
         if finding.evidence_class.causal_eligible() {
@@ -2887,21 +2917,13 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 context_end += 1;
             }
             let context = &answer[context_start..context_end];
-            let has_caveat = caveat_phrases.iter().any(|phrase| context.contains(phrase));
-            let has_attribution = attribution_phrases.iter().any(|phrase| {
-                if !context.contains(phrase) {
-                    return false;
-                }
-                // Do not reject an explicit negative statement such as
-                // "not caused by ..." merely because it contains the
-                // attribution vocabulary.
-                !matches!(
-                    *phrase,
-                    "caused by" | "cause was" | "caused the" | "responsible for"
-                ) || !context.contains("not ")
-            });
-            let has_timing = timing_phrases.iter().any(|phrase| context.contains(phrase));
-            (has_attribution || has_timing) && !has_caveat
+            let has_unsupported_attribution = attribution_phrases
+                .iter()
+                .any(|phrase| context.contains(phrase) && !phrase_is_negated(context, phrase));
+            let has_unsupported_timing = timing_phrases
+                .iter()
+                .any(|phrase| context.contains(phrase) && !phrase_is_negated(context, phrase));
+            has_unsupported_attribution || has_unsupported_timing
         })
     })
 }
@@ -3634,8 +3656,33 @@ mod tests {
             )
             .is_some()
         );
+        for unsupported_claim in [
+            "minecraft-rpg.qcow2 was the largest contributor.",
+            "minecraft-rpg.qcow2 explains the increase.",
+            "The increase came from minecraft-rpg.qcow2.",
+            "minecraft-rpg.qcow2 accounts for the growth.",
+            "minecraft-rpg.qcow2 caused storage growth.",
+            "minecraft-rpg.qcow2 was modified yesterday.",
+        ] {
+            assert!(
+                grounded_storage_fallback(unsupported_claim, &facts).is_some(),
+                "unsupported claim was accepted: {unsupported_claim}"
+            );
+        }
         assert!(grounded_storage_fallback(
             "minecraft-rpg.qcow2 is inventory-only and cannot establish the cause; its baseline is unknown.",
+            &facts
+        )
+        .is_none());
+        assert!(
+            grounded_storage_fallback(
+                "The baseline is unknown, but minecraft-rpg.qcow2 explains the increase.",
+                &facts
+            )
+            .is_some()
+        );
+        assert!(grounded_storage_fallback(
+            "minecraft-rpg.qcow2 was not modified yesterday and does not account for the growth.",
             &facts
         )
         .is_none());
@@ -3724,23 +3771,26 @@ mod tests {
             "largest nested detail is /var/lib/libvirt/images (+900 bytes); it is inside the first-level attribution and is not additional growth"
         ));
         assert!(summary.contains(
-            "current-period candidates; metadata timestamps fall in the current interval, but timing alone does not prove size growth or causation"
+            "Eligible sampled file contributors (causal_candidate; matched baseline and current-interval timing; candidate only, not proof)"
         ));
         assert!(summary.contains(
             "/var/lib/libvirt/images/minecraft-rpg.qcow2 (temporal_status=current_interval; baseline_status=known; allocated_change=+900 bytes)"
         ));
         assert!(summary.contains(
-            "comparison-period candidates; metadata timestamps fall in the comparison interval, so these are historical context, not current-period causation"
+            "Inventory-only sampled file findings (historical or pre-existing; not current-period causal evidence)"
         ));
-        assert!(summary.contains("temporal_status=comparison_interval"));
-        assert!(
-            summary.contains("pre-window candidates; metadata timestamps predate both intervals")
-        );
+        assert!(summary.contains("minecraft-rpg.qcow2"));
+        assert!(summary.contains("evidence_class=causal_candidate"));
+        assert!(summary.contains("evidence_class=inventory_only"));
         assert!(summary.contains(
-            "timing-unknown candidates; metadata timestamps do not establish when activity occurred"
+            "Insufficient-evidence sampled file findings (missing comparable baseline or timing; not causal evidence)"
         ));
+        assert!(summary.contains("evidence_class=insufficient_evidence"));
+        assert!(!summary.contains("current-period candidates"));
+        assert!(!summary.contains("pre-window candidates"));
+        assert!(!summary.contains("Candidates: "));
         assert!(summary.contains(
-            "File-baseline confidence: 3 matched comparison sample(s), 0 growth-from-zero candidate(s), and 1 candidate(s) with unknown or incomplete baseline"
+            "File-baseline confidence: 3 matched comparison sample(s), 0 growth-from-zero candidate(s), and 1 finding(s) with unknown or incomplete baseline"
         ));
         assert!(summary.contains("File paths overlap their containing directory and mount totals; never add them to directory attribution."));
     }
