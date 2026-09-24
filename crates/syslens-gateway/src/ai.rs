@@ -1043,9 +1043,15 @@ pub(crate) fn status_answer_contradicts_facts(answer: &str, facts: &StatusFacts)
         return answer.contains("recording is inactive")
             || answer.contains("recording is stopped")
             || answer.contains("recorder is inactive")
-            || answer.contains("recorder is stopped");
+            || answer.contains("recorder is stopped")
+            || (answer.contains(" is healthy")
+                && !answer.contains("recording is healthy")
+                && !answer.contains("recorder is healthy"));
     }
     active_claim
+        || (answer.contains(" is healthy")
+            && !answer.contains("recording is healthy")
+            && !answer.contains("recorder is healthy"))
 }
 
 pub(crate) fn incident_answer_contradicts_facts(answer: &str, facts: &IncidentFacts) -> bool {
@@ -3720,6 +3726,10 @@ mod tests {
         };
         assert!(!status_answer_contradicts_facts(
             "The recorder reports healthy and fresh.",
+            &healthy_status
+        ));
+        assert!(status_answer_contradicts_facts(
+            "Acemagic is healthy and SysLens is recording.",
             &healthy_status
         ));
         assert!(status_answer_contradicts_facts(
