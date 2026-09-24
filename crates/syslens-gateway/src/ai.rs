@@ -3531,6 +3531,20 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
             )
         }
 
+        fn has_possible_cause_modal_claim(following: &[&str]) -> bool {
+            let ruled_out = following
+                .windows(2)
+                .any(|window| window == ["ruled", "out"]);
+            let excluded = following.contains(&"excluded");
+            let partial_explanation = following.iter().enumerate().any(|(index, token)| {
+                matches!(*token, "fully" | "entirely" | "completely" | "solely")
+                    && following[index + 1..].iter().any(|candidate| {
+                        is_causal_predicate(candidate) && candidate.starts_with("explain")
+                    })
+            });
+            ruled_out || excluded || partial_explanation
+        }
+
         fn is_timing_predicate(token: &str) -> bool {
             matches!(
                 token,
@@ -3596,11 +3610,7 @@ fn storage_answer_has_unsupported_file_claim(answer: &str, facts: &RootStorageFa
                 .is_some_and(|modal| is_modal_uncertainty(modal))
                 && words
                     .get(file_index + 2..(file_index + 12).min(words.len()))
-                    .is_some_and(|following| {
-                        following
-                            .iter()
-                            .any(|candidate| is_causal_predicate(candidate))
-                    });
+                    .is_some_and(has_possible_cause_modal_claim);
             if file_subject_modal_claim {
                 return true;
             }
@@ -5113,6 +5123,27 @@ mod tests {
                 &no_eligible_facts
             )
             .is_some()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be identified as the cause.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot be attributed to the increase.",
+                &no_eligible_facts
+            )
+            .is_none()
+        );
+        assert!(
+            grounded_storage_fallback(
+                "A file cannot explain the increase from the available evidence.",
+                &no_eligible_facts
+            )
+            .is_none()
         );
 
         let chat_summary = deterministic_storage_chat_summary(&facts);
