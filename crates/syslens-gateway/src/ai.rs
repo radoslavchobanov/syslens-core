@@ -319,7 +319,7 @@ impl Model {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a concise SysLens storage analyst. Use only the authoritative JSON facts. State the measured change, strongest directory/file candidates, temporal status, and key limitation. Do not invent causes. Return plain English in at most 45 words."
+                    "content": "You are a concise SysLens storage analyst. Use only the authoritative JSON facts. State the measured change, name the strongest directory and the most relevant file when present, mention temporal status, and state one key limitation. Do not invent causes. Return plain English in at most 45 words."
                 },
                 {
                     "role": "user",
@@ -890,7 +890,10 @@ pub(crate) fn deterministic_memory_summary(facts: &MemoryFacts) -> String {
         summary.push_str("No positive process-level anonymous-memory growth was observed. ");
     }
     if let Some(finding) = facts.findings.get(1) {
-        summary.push_str(&format!("Additional finding: {}. ", finding));
+        summary.push_str(&format!(
+            "Additional finding: {}. ",
+            finding.trim_end_matches('.')
+        ));
     }
     summary.push_str(
         "Process RssAnon is anonymous resident memory, not private/USS, and does not exactly reconcile physical RAM. ",
